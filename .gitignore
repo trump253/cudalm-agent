@@ -1,0 +1,28 @@
+# Build artifacts
+build/
+build-*/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.cu.o
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated data (weight files + golden outputs). Test SOURCE is committed;
+# only generated artifacts are ignored.
+data/
+out/
+gen/
+*.cudalm
+*.cudalm_golden
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
