@@ -1,0 +1,38 @@
+{
+  "cudalm": "v0.1 decoder block latency breakdown",
+  "device": "NVIDIA GeForce RTX 2080 Ti",
+  "config": {
+    "hidden_size": 1024,
+    "n_heads": 8,
+    "n_kv_heads": 4,
+    "head_dim": 128,
+    "intermediate_size": 2816,
+    "group_size": 128,
+    "max_seq_len": 512
+  },
+  "position": 511,
+  "iters": 100,
+  "warmup": 5,
+  "units": "microseconds (CUDA events)",
+  "stages": [
+    {"stage": "input", "mean_us": 5.848, "min_us": 4.384, "max_us": 7.584, "p50_us": 6.048},
+    {"stage": "rmsnorm1", "mean_us": 5.446, "min_us": 4.096, "max_us": 21.824, "p50_us": 5.344},
+    {"stage": "q_proj", "mean_us": 8.214, "min_us": 8.032, "max_us": 9.504, "p50_us": 8.192},
+    {"stage": "k_proj", "mean_us": 7.961, "min_us": 7.008, "max_us": 8.352, "p50_us": 8.000},
+    {"stage": "v_proj", "mean_us": 8.009, "min_us": 6.848, "max_us": 18.432, "p50_us": 8.064},
+    {"stage": "rope_q", "mean_us": 4.565, "min_us": 4.096, "max_us": 5.728, "p50_us": 4.448},
+    {"stage": "rope_k", "mean_us": 4.268, "min_us": 4.096, "max_us": 5.248, "p50_us": 4.224},
+    {"stage": "kv_write", "mean_us": 3.935, "min_us": 2.880, "max_us": 4.352, "p50_us": 4.032},
+    {"stage": "attention", "mean_us": 41.520, "min_us": 40.960, "max_us": 45.408, "p50_us": 41.376},
+    {"stage": "o_proj", "mean_us": 8.543, "min_us": 8.192, "max_us": 9.760, "p50_us": 8.352},
+    {"stage": "residual1", "mean_us": 4.106, "min_us": 2.944, "max_us": 5.344, "p50_us": 4.096},
+    {"stage": "rmsnorm2", "mean_us": 4.711, "min_us": 4.096, "max_us": 5.952, "p50_us": 4.704},
+    {"stage": "gate_proj", "mean_us": 12.856, "min_us": 12.288, "max_us": 13.984, "p50_us": 12.736},
+    {"stage": "up_proj", "mean_us": 12.845, "min_us": 12.288, "max_us": 14.016, "p50_us": 12.768},
+    {"stage": "silu_mul", "mean_us": 5.055, "min_us": 4.096, "max_us": 6.112, "p50_us": 5.120},
+    {"stage": "down_proj", "mean_us": 10.345, "min_us": 10.144, "max_us": 11.424, "p50_us": 10.272},
+    {"stage": "final_output", "mean_us": 4.164, "min_us": 4.000, "max_us": 5.440, "p50_us": 4.128}
+  ],
+  "total": {"mean_us": 152.391, "min_us": 148.800, "max_us": 167.968, "p50_us": 152.096},
+  "tokens_per_second_mean": 6562.1
+}

@@ -38,12 +38,26 @@ class DecoderBlock {
   // `weights` must outlive the block (non-owning).
   explicit DecoderBlock(const BlockWeights& weights, cudaStream_t stream = 0);
 
+  // Number of timed pipeline stages (M9 latency breakdown); see
+  // stage_names in src/runtime/decoder_block.cpp for the mapping.
+  static constexpr int kNumStages = 17;
+
   // One decode step at 0-based `position`. `x_in` is a device fp16
   // [hidden_size] buffer (the current token's hidden state).
   //
   // Precondition (host-checked, abort on violation):
   // 0 <= position < max_seq_len.
   void forward(int position, const __half* x_in, cudaStream_t stream);
+
+  // Same pipeline as forward(), but records one CUDA-event pair per stage
+  // (2*kNumStages events, caller-created with cudaEventCreate) and stores
+  // the per-stage elapsed time in microseconds into stage_us[kNumStages].
+  // Synchronizes the stream so all event pairs are complete on return.
+  void forwardTimed(int position, const __half* x_in, cudaStream_t stream,
+                    cudaEvent_t* events, float* stage_us);
+
+  // Names of the 17 timed stages, in order (shared with the benchmark).
+  static const char* const* stage_names();
 
   // ---- Stage buffers (device fp16; valid after forward) ----------------
   const __half* stage_input() const { return input_.data<__half>(); }
@@ -75,7 +89,10 @@ class DecoderBlock {
   const KvCache& kv_cache() const { return *kv_; }
   const ModelConfig& config() const { return cfg_; }
 
- private:
+  private:
+  void forwardImpl(int position, const __half* x_in, cudaStream_t stream,
+                   cudaEvent_t* events);
+
   const BlockWeights* w_ = nullptr;
   ModelConfig cfg_{};
   std::unique_ptr<KvCache> kv_;  // KvCache is move-only (no default ctor)

@@ -1,0 +1,49 @@
+# compute-sanitizer memcheck: test_decoder_block (M9 evidence)
+# command: /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck \
+#   ../tests/test_decoder_block block_v01.cudalm block_v01_golden_p0.cudalm block_v01_golden_p7.cudalm
+# host: qwen, 2026-09-22T13:48:17Z, CUDA 11.8, driver 570.172.08, GPU NVIDIA GeForce RTX 2080 Ti
+# git: d557a566c7186a10fa1142fd9c90523f40749e55
+
+========= COMPUTE-SANITIZER
+[PASS] test_decoder_block
+[weights] 18 tensors byte-identical in both goldens
+[golden] block_v01_golden_p0.cudalm
+  stage.input              ok  (max_abs_err=0.000e+00)
+  stage.rmsnorm1           ok  (max_abs_err=0.000e+00)
+  stage.q                  ok  (max_abs_err=1.192e-07)
+  stage.k                  ok  (max_abs_err=1.907e-06)
+  stage.v                  ok  (max_abs_err=0.000e+00)
+  stage.rope_q             ok  (max_abs_err=1.192e-07)
+  stage.rope_k             ok  (max_abs_err=1.907e-06)
+  stage.attention_output   ok  (max_abs_err=0.000e+00)
+  stage.output_projection  ok  (max_abs_err=0.000e+00)
+  stage.residual1          ok  (max_abs_err=0.000e+00)
+  stage.rmsnorm2           ok  (max_abs_err=0.000e+00)
+  stage.gate               ok  (max_abs_err=3.052e-05)
+  stage.up                 ok  (max_abs_err=1.221e-04)
+  stage.silu_gate_mul_up   ok  (max_abs_err=7.629e-06)
+  stage.down               ok  (max_abs_err=6.104e-05)
+  stage.final_output       ok  (max_abs_err=2.441e-04)
+  rope identity            ok  (p=0 rope identity bit-exact)
+  kv state                 ok  (rows 0..0: history bit-exact, position tolerance+copy)
+[golden] PASS (position 0)
+[golden] block_v01_golden_p7.cudalm
+  stage.input              ok  (max_abs_err=0.000e+00)
+  stage.rmsnorm1           ok  (max_abs_err=0.000e+00)
+  stage.q                  ok  (max_abs_err=0.000e+00)
+  stage.k                  ok  (max_abs_err=0.000e+00)
+  stage.v                  ok  (max_abs_err=1.526e-05)
+  stage.rope_q             ok  (max_abs_err=0.000e+00)
+  stage.rope_k             ok  (max_abs_err=0.000e+00)
+  stage.attention_output   ok  (max_abs_err=3.815e-06)
+  stage.output_projection  ok  (max_abs_err=7.629e-06)
+  stage.residual1          ok  (max_abs_err=0.000e+00)
+  stage.rmsnorm2           ok  (max_abs_err=0.000e+00)
+  stage.gate               ok  (max_abs_err=3.052e-05)
+  stage.up                 ok  (max_abs_err=2.441e-04)
+  stage.silu_gate_mul_up   ok  (max_abs_err=6.104e-05)
+  stage.down               ok  (max_abs_err=2.441e-04)
+  stage.final_output       ok  (max_abs_err=2.441e-04)
+  kv state                 ok  (rows 0..7: history bit-exact, position tolerance+copy)
+[golden] PASS (position 7)
+========= ERROR SUMMARY: 0 errors

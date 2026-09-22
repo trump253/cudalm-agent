@@ -108,6 +108,7 @@ function(cudalm_add_test exe name)
 endfunction()
 
 add_subdirectory(tests)
+add_subdirectory(benchmarks)
 
 # Forbidden-dependency guard: the runtime must stay PyTorch/pybind free.
 add_test(NAME forbidden_deps_check
