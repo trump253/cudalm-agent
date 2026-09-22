@@ -20,6 +20,13 @@
 +---------+--------------------------------------------------------------+
 ```
 
+**权重来源（语义）。** 本格式承载的权重是 `tools/` 脚本生成的
+**确定性合成权重（固定种子合成权重，fixed-seed synthetic weights）**：
+v0.1 / v0.1.1 用它验证原生运行时架构（权重容器、加载器、DecoderBlock
+接线）、移植 kernel 集成与逐 stage golden 正确性，与任何真实模型无关。
+真实 HuggingFace safetensors checkpoint 的权重摄入不在 v0.1.1 范围，
+随 v0.2 Qwen3.5 bring-up 完成。
+
 ## 表头（72 字节）
 
 | 偏移 | 大小 | 类型  | 字段             | 取值 / 含义 |
@@ -91,7 +98,12 @@
 - config 通过 `ModelConfig::valid()`
 - （按需）完整 decoder block 张量集齐且形状正确（见下 `BlockWeights`）
 
-## v0.1 decoder block 的张量集
+## decoder block 的张量集（v0.1.1 泛化形状契约）
+
+形状一律以 config 字段表达，**不假设 Q 宽度等于 hidden_size**（v0.1.1）。
+记 `Q = q_proj_out = n_heads·head_dim`（注意 Q 与 H 是**独立**的标量，
+默认 v0.1 配置恰好 Q=H=1024，但契约不要求相等）、
+`kv = kv_proj_out = n_kv·hd`：
 
 | 名称                    | dtype        | 形状 |
 |-----------------------|--------------|-------|
@@ -99,14 +111,14 @@
 | `ffn_norm.weight`     | FP16         | `[H]` |
 | `attn.rope_cos`       | FP16         | `[max_seq_len, head_dim/2]` |
 | `attn.rope_sin`       | FP16         | `[max_seq_len, head_dim/2]` |
-| `attn.q_proj.weight`  | INT4_PACKED  | `[H, H/2]` |
-| `attn.q_proj.scale`   | FP16_SCALE   | `[H, H/128]` |
-| `attn.k_proj.weight`  | INT4_PACKED  | `[n_kv*hd, H/2]` |
-| `attn.k_proj.scale`   | FP16_SCALE   | `[n_kv*hd, H/128]` |
-| `attn.v_proj.weight`  | INT4_PACKED  | `[n_kv*hd, H/2]` |
-| `attn.v_proj.scale`   | FP16_SCALE   | `[n_kv*hd, H/128]` |
-| `attn.o_proj.weight`  | INT4_PACKED  | `[H, H/2]` |
-| `attn.o_proj.scale`   | FP16_SCALE   | `[H, H/128]` |
+| `attn.q_proj.weight`  | INT4_PACKED  | `[Q, H/2]` |
+| `attn.q_proj.scale`   | FP16_SCALE   | `[Q, H/128]` |
+| `attn.k_proj.weight`  | INT4_PACKED  | `[kv, H/2]` |
+| `attn.k_proj.scale`   | FP16_SCALE   | `[kv, H/128]` |
+| `attn.v_proj.weight`  | INT4_PACKED  | `[kv, H/2]` |
+| `attn.v_proj.scale`   | FP16_SCALE   | `[kv, H/128]` |
+| `attn.o_proj.weight`  | INT4_PACKED  | `[H, Q/2]` |
+| `attn.o_proj.scale`   | FP16_SCALE   | `[H, Q/128]` |
 | `mlp.gate_proj.weight`| INT4_PACKED  | `[inter, H/2]` |
 | `mlp.gate_proj.scale` | FP16_SCALE   | `[inter, H/128]` |
 | `mlp.up_proj.weight`  | INT4_PACKED  | `[inter, H/2]` |
@@ -115,7 +127,10 @@
 | `mlp.down_proj.scale` | FP16_SCALE   | `[H, inter/128]` |
 
 （`H = hidden_size`，`hd = head_dim`，`n_kv = n_kv_heads`，
-`inter = intermediate_size`。）
+`Q = q_proj_out = n_heads·head_dim`，`kv = kv_proj_out = n_kv·hd`，
+`inter = intermediate_size`。`ModelConfig::valid()` 要求
+`Q % group_size == 0` 且 `inter % group_size == 0`，不再要求
+`H == n_heads·head_dim`。）
 
 ## INT4 量化契约（承自 CUDALab，仅离线）
 
@@ -166,7 +181,7 @@ block"所需的一切：18 个 block 权重张量（与同种子下 CUDALMW01 �
 | 0      | 8    | 8s    | `magic`        | 字节 `"CUDLMG01"` |
 | 8      | 4    | u32   | `version`      | `1`（未知 → 硬错误） |
 | 12     | 4    | u32   | `flags`        | 保留，必须为 `0` |
-| 16     | 4    | u32   | `n_tensors`    | TensorRecord 数量（v0.1 为 36） |
+| 16     | 4    | u32   | `n_tensors`    | TensorRecord 数量（v0.1 / v0.1.1 为 36） |
 | 20     | 36   | —     | `config`       | ModelConfig 数据块（与 CUDALMW01 相同） |
 | 56     | 4    | i32   | `position`     | 解码位置 `p`，`0 ≤ p < max_seq_len` |
 | 60     | 4    | i32   | `reserved`     | 必须为 `0` |
@@ -186,12 +201,12 @@ block"所需的一切：18 个 block 权重张量（与同种子下 CUDALMW01 �
 |------|---|
 | `stage.input` | `H` |
 | `stage.rmsnorm1` | `H` |
-| `stage.q` | `H` |
-| `stage.k` | `n_kv·hd` |
-| `stage.v` | `n_kv·hd` |
-| `stage.rope_q` | `H` |
-| `stage.rope_k` | `n_kv·hd` |
-| `stage.attention_output` | `H` |
+| `stage.q` | `Q` |
+| `stage.k` | `kv` |
+| `stage.v` | `kv` |
+| `stage.rope_q` | `Q` |
+| `stage.rope_k` | `kv` |
+| `stage.attention_output` | `Q` |
 | `stage.output_projection` | `H` |
 | `stage.residual1` | `H` |
 | `stage.rmsnorm2` | `H` |
@@ -200,6 +215,9 @@ block"所需的一切：18 个 block 权重张量（与同种子下 CUDALMW01 �
 | `stage.silu_gate_mul_up` | `inter` |
 | `stage.down` | `H` |
 | `stage.final_output` | `H` |
+
+（`H`、`Q`、`kv`、`inter` 定义同上；`Q = q_proj_out` 独立于
+`H = hidden_size`。）
 
 3. 两个 KV 状态张量，FP16，形状 `[n_kv·(position+1), head_dim]`，扁平行
    顺序为 **(kv_head, position)** 行优先 — 即 head `h` 在位置 `t` 的行是
