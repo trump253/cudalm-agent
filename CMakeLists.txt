@@ -18,6 +18,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# Keep the build loud: -Wreturn-type caught a real UB (CHECK() `return 1`
+# gave a lambda a deduced `int` return type with a missing return on the
+# happy path — benign at -O0, miscompiled at -O2).
+add_compile_options(-Wall -Wextra -Werror)
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -26,8 +30,11 @@ endif()
 # --------------------------------------------------------------------------
 # CUDA toolkit discovery
 # --------------------------------------------------------------------------
-set(CUDALM_CUDA_HOME "" CACHE PATH "CUDA toolkit root (e.g. /usr/local/cuda-11.8)")
-if(NOT CUDALM_CUDA_HOME)
+# Note: predefining an EMPTY cache variable would make find_path skip its
+# search entirely (the variable is already "defined"), so provide the real
+# default directly and only fall back to a search if that path is absent.
+set(CUDALM_CUDA_HOME "/usr/local/cuda-11.8" CACHE PATH "CUDA toolkit root (e.g. /usr/local/cuda-11.8)")
+if(NOT EXISTS "${CUDALM_CUDA_HOME}/bin/nvcc")
   find_path(CUDALM_CUDA_HOME
             NAMES bin/nvcc
             PATHS /usr/local/cuda-11.8 /usr/local/cuda
@@ -43,7 +50,6 @@ set(CUDA_NVCC_FLAGS
     -std=c++17
     --gpu-architecture=${CUDALM_ARCH}
     -O2
-    -w
     -Xcompiler=-fPIC)
 
 # Compile one .cu translation unit to an object file.

@@ -46,6 +46,15 @@ struct ModelConfig {
     return true;
   }
 
+  bool operator==(const ModelConfig& o) const {
+    return hidden_size == o.hidden_size && n_heads == o.n_heads &&
+           n_kv_heads == o.n_kv_heads && head_dim == o.head_dim &&
+           intermediate_size == o.intermediate_size &&
+           group_size == o.group_size && max_seq_len == o.max_seq_len &&
+           eps == o.eps && rope_theta == o.rope_theta;
+  }
+  bool operator!=(const ModelConfig& o) const { return !(*this == o); }
+
   // The v0.1 fixed test config (see docs/bootstrap_plan_v0.1.md §3).
   static ModelConfig v01_default() {
     ModelConfig c;

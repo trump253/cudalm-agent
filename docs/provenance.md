@@ -23,6 +23,15 @@ any deviation from the upstream body is called out in the table.
 |-------------|----------------------------------|-----------------|--------------------|------------|
 | _(filled in as ports land)_ | | | | |
 
+## Carried contracts (offline tooling, not kernel ports)
+
+Data contracts implemented in offline Python tooling (tools/ never links into
+the runtime):
+
+| CUDALM file | Upstream file (commit `cb6a6a9`) | Contract carried | Notes |
+|-------------|----------------------------------|------------------|-------|
+| `tools/convert_weights.py` (`quantize_w`, `unpack_w`) | `cudalab/int4gemv_quantize.py` (`quantize_w`, `pack_q`, `unpack_w`) | symmetric G=128 group-wise INT4; q ∈ [-7,7]; zero_point=0; `scale=amax/7` computed fp32, stored fp16; round-half-to-even; zero-group safe (scale=0, q≡0); K%128==0; nibble pack low=k=2b / high=k=2b+1 (4-bit two's complement) | Line-for-line port of the offline quantizer; pinned by `convert_weights.py --selftest` (Python) and `test_weights_crosslang` (C++ loads the Python-generated file) |
+
 ## CUDALM-native (no upstream)
 
 These have no CUDALab provenance; they are written from the v0.1 spec:
