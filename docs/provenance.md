@@ -1,48 +1,45 @@
-# CUDALM kernel provenance
+# CUDALM kernel 溯源
 
-CUDALM ports kernels from the upstream CUDALab research repository
-(`/root/code/cuda`). This file records the exact upstream provenance for every
-ported kernel, per the project brief (upstream tag/commit, original kernel,
-CUDALM port commit).
+CUDALM 从上游 CUDALab 研究仓库（`/root/code/cuda`）移植 kernel。本文件按
+项目简报要求，为每个移植 kernel 记录确切的 upstream 溯源（上游
+tag/commit、原始 kernel、CUDALM 移植 commit）。
 
-**Upstream reference (frozen for v0.1):**
+**上游参考（v0.1 冻结）：**
 
-| Item | Value |
+| 项 | 值 |
 |------|-------|
-| Repo | CUDALab (`/root/code/cuda`) |
+| 仓库 | CUDALab（`/root/code/cuda`） |
 | Commit | `cb6a6a9ef76394cc66d272c99aa8697db0a34f1e` |
 | Tag | `v0.7.1` |
-| Role | Upstream kernel research repo (read-only reference; NOT merged into CUDALM) |
+| 角色 | 上游 kernel 研究仓库（只读参考；**不**合并进 CUDALM） |
 
-Ports replace the PyTorch extension host layer (`at::Tensor`, `TORCH_CHECK`,
-`at::cuda::getCurrentCUDAStream`) with CUDALM's native layer (raw pointers,
-`cudaStream_t`, `CUDA_CHECK`). Kernel **math and control flow** are preserved;
-any deviation from the upstream body is called out in the table.
+移植内容是把 PyTorch extension host 层（`at::Tensor`、`TORCH_CHECK`、
+`at::cuda::getCurrentCUDAStream`）替换为 CUDALM 原生层（裸指针、
+`cudaStream_t`、`CUDA_CHECK`）。kernel 的**数学与控制流**保持不变；凡与
+upstream 函数体的任何偏差，均在表中标注。
 
-| CUDALM file | Upstream file (commit `cb6a6a9`) | Original kernel | CUDALM port commit | Deviations |
+| CUDALM 文件 | 上游文件（commit `cb6a6a9`） | 原始 kernel | CUDALM 移植 commit | 偏差 |
 |-------------|----------------------------------|-----------------|--------------------|------------|
-| `src/kernels/rmsnorm.cu`, `include/cudalm/kernels/rmsnorm.h` (`rmsnorm_fp16`) | `kernels/rmsnorm/rmsnorm_v4.cu` (`rmsnorm_v4_half_kernel` + `launch_half` + `v4_precheck` fp16 branch) | `rmsnorm_v4` (v4_vec_reg) fp16 specialization | `80e4a7b` | Mechanical only: PyTorch host layer (`at::Tensor`, `TORCH_CHECK`, `getCurrentCUDAStream`, `C10_CUDA_KERNEL_LAUNCH_CHECK`) replaced by raw pointers + `cudaStream_t` + `CUDALM_PRECONDITION` + `CUDA_CHECK_LAUNCH`; the fp32 specialization is not ported (v0.1 is fp16-only). Kernel math/control flow (256-thread block, register-resident x, `PER = H/256` ∈ {4,8,16,32}, float4/half2 vector loads, warp shfl + `rsqrtf(v/H + eps)`, fp16 RNE store) is preserved 1:1, including the strict pre-check with no scalar fallback |
-| `src/kernels/int4_gemv.cu`, `include/cudalm/kernels/int4_gemv.h` (`int4_gemv`) | `kernels/int4gemv/int4gemv_rowtile4_hx.cu` (`int4gemv_rowtile4_hx_kernel` + `int4gemv_rowtile4_hx_fwd`) + `kernels/int4gemv/int4gemv_common.h` (`int4gemv_unpack_byte`, `U32I4`, `int4gemv_vec_acc_unpack`, `int4gemv_scalar_kernel`, `launch_int4gemv_scalar`, `int4gemv_vec_contract_ok`) | `int4gemv_rowtile4_hx` (W4A16 GEMV) + its scalar fallback (`int4gemv_baseline` core) | `ca1e8e4` | Mechanical only: PyTorch host layer replaced by raw pointers + `cudaStream_t` + `CUDALM_PRECONDITION` + `CUDA_CHECK_LAUNCH`; `int64_t` dims → `int` (loop bounds only, no math effect); `int4gemv_vec_contract_ok` inlined into the host entry. Kernel math/control flow preserved 1:1 — R=4 row tile, 128-thread block, strided v loop, 4× LDG.128 x fragments held as `__half2[16]`, single-group lemma `g = v>>2`, 32 nibble unpack + 32 (MUL+FFMA) per row, shfl 5-step + `shared[4][4]` + shfl 2-step reduction; scalar fallback (256-thread, one block/row) and the 16B-alignment contract (fall back, never reject) preserved |
-| `src/kernels/rope.cu`, `include/cudalm/kernels/rope.h` (`rope_fp16`) | `kernels/rope/rope_v3_half2.cu` (`rope_v3_half2_kernel<__half>` + `rope_v3_half2_scalar_kernel` + `rope_v3_half2_fwd` fp16 branch) + `kernels/rope/rope_common.h` (interleaved-pair operator contract, `el_to_float`/`el_from_float<__half>`) | `rope_v3_half2` fp16 specialization (interleaved-pair RoPE) | `d46142f` | Mechanical only: PyTorch host layer replaced by raw pointers + `cudaStream_t` + `CUDALM_PRECONDITION` + `CUDA_CHECK_LAUNCH`; the fp32 template branch (`T = float`) is not ported (v0.1 is fp16-only), so the kernel is de-templated to its `__half` branch verbatim; the `el_to_float`/`el_from_float` helpers are inlined into the file. Kernel math/control flow preserved 1:1 — 1 thread/pair, per-row `positions[m]` table lookup, interleaved pairs `a*c - b*s` / `a*s + b*c` in fp32, packed path (4B `__half2` load + `__floats2half2_rn` + 4B store), scalar fallback (all 2B accesses, per-value RNE), and the v0.4.1 base-pointer alignment contract (fall back, never reject) preserved |
+| `src/kernels/rmsnorm.cu`、`include/cudalm/kernels/rmsnorm.h`（`rmsnorm_fp16`） | `kernels/rmsnorm/rmsnorm_v4.cu`（`rmsnorm_v4_half_kernel` + `launch_half` + `v4_precheck` fp16 分支） | `rmsnorm_v4`（v4_vec_reg）fp16 特化 | `80e4a7b` | 仅机械性替换：PyTorch host 层（`at::Tensor`、`TORCH_CHECK`、`getCurrentCUDAStream`、`C10_CUDA_KERNEL_LAUNCH_CHECK`）换为裸指针 + `cudaStream_t` + `CUDALM_PRECONDITION` + `CUDA_CHECK_LAUNCH`；fp32 特化不移植（v0.1 仅 fp16）。kernel 数学/控制流 1:1 保留（256 线程块、寄存器驻留 x、`PER = H/256` ∈ {4,8,16,32}、float4/half2 向量加载、warp shfl + `rsqrtf(v/H + eps)`、fp16 RNE 存储），包括"严格前置检查、无标量回退"的契约 |
+| `src/kernels/int4_gemv.cu`、`include/cudalm/kernels/int4_gemv.h`（`int4_gemv`） | `kernels/int4gemv/int4gemv_rowtile4_hx.cu`（`int4gemv_rowtile4_hx_kernel` + `int4gemv_rowtile4_hx_fwd`）+ `kernels/int4gemv/int4gemv_common.h`（`int4gemv_unpack_byte`、`U32I4`、`int4gemv_vec_acc_unpack`、`int4gemv_scalar_kernel`、`launch_int4gemv_scalar`、`int4gemv_vec_contract_ok`） | `int4gemv_rowtile4_hx`（W4A16 GEMV）+ 其标量回退（`int4gemv_baseline` 核心） | `ca1e8e4` | 仅机械性替换：PyTorch host 层换为裸指针 + `cudaStream_t` + `CUDALM_PRECONDITION` + `CUDA_CHECK_LAUNCH`；`int64_t` 维度 → `int`（仅循环边界，无数学影响）；`int4gemv_vec_contract_ok` 内联进 host 入口。kernel 数学/控制流 1:1 保留 —— R=4 行分块、128 线程块、strided v 循环、4× LDG.128 x 片段存于 `__half2[16]`、单组引理 `g = v>>2`、每行 32 次 nibble 解包 + 32 次 (MUL+FFMA)、shfl 5 步 + `shared[4][4]` + shfl 2 步归约；标量回退（256 线程、一行一块）与 16B 对齐契约（回退、从不拒绝）均保留 |
+| `src/kernels/rope.cu`、`include/cudalm/kernels/rope.h`（`rope_fp16`） | `kernels/rope/rope_v3_half2.cu`（`rope_v3_half2_kernel<__half>` + `rope_v3_half2_scalar_kernel` + `rope_v3_half2_fwd` fp16 分支）+ `kernels/rope/rope_common.h`（交错对算子契约、`el_to_float`/`el_from_float<__half>`） | `rope_v3_half2` fp16 特化（交错对 RoPE） | `d46142f` | 仅机械性替换：PyTorch host 层换为裸指针 + `cudaStream_t` + `CUDALM_PRECONDITION` + `CUDA_CHECK_LAUNCH`；fp32 模板分支（`T = float`）不移植（v0.1 仅 fp16），故 kernel 去模板化为其 `__half` 分支原文；`el_to_float`/`el_from_float` 辅助函数内联进本文件。kernel 数学/控制流 1:1 保留 —— 每对 1 线程、按行查 `positions[m]` 表、交错对 `a*c - b*s` / `a*s + b*c` 以 fp32 计算、打包路径（4B `__half2` 加载 + `__floats2half2_rn` + 4B 存储）、标量回退（全 2B 访问、逐值 RNE）、v0.4.1 基址对齐契约（回退、从不拒绝）均保留 |
 
-## Carried contracts (offline tooling, not kernel ports)
+## 承接的契约（离线工具，非 kernel 移植）
 
-Data contracts implemented in offline Python tooling (tools/ never links into
-the runtime):
+在离线 Python 工具中实现的数据契约（tools/ 绝不链接进运行时）：
 
-| CUDALM file | Upstream file (commit `cb6a6a9`) | Contract carried | Notes |
+| CUDALM 文件 | 上游文件（commit `cb6a6a9`） | 承接的契约 | 说明 |
 |-------------|----------------------------------|------------------|-------|
-| `tools/convert_weights.py` (`quantize_w`, `unpack_w`) | `cudalab/int4gemv_quantize.py` (`quantize_w`, `pack_q`, `unpack_w`) | symmetric G=128 group-wise INT4; q ∈ [-7,7]; zero_point=0; `scale=amax/7` computed fp32, stored fp16; round-half-to-even; zero-group safe (scale=0, q≡0); K%128==0; nibble pack low=k=2b / high=k=2b+1 (4-bit two's complement) | Line-for-line port of the offline quantizer; pinned by `convert_weights.py --selftest` (Python) and `test_weights_crosslang` (C++ loads the Python-generated file) |
+| `tools/convert_weights.py`（`quantize_w`、`unpack_w`） | `cudalab/int4gemv_quantize.py`（`quantize_w`、`pack_q`、`unpack_w`） | 对称 G=128 分组 INT4；q ∈ [-7,7]；zero_point=0；`scale=amax/7` 以 fp32 计算、fp16 存储；四舍六入五成双（round-half-to-even）；零组安全（scale=0，q≡0）；K%128==0；nibble 打包 low=k=2b / high=k=2b+1（4 位补码） | 离线量化器的逐行移植；由 `convert_weights.py --selftest`（Python）与 `test_weights_crosslang`（C++ 加载 Python 生成的文件）钉死 |
 
-## CUDALM-native (no upstream)
+## CUDALM 原生（无上游）
 
-These have no CUDALab provenance; they are written from the v0.1 spec:
-`cuda_check.h`, `device_buffer.h`, `tensor.h`, `model_config.h`, weight
-format/loader, KV cache, attention pipeline, elementwise ops (add,
-silu_mul), and the decoder-block wiring (`decoder_block.h/.cpp`, code
-commit `beeebb6`) plus its end-to-end golden test
-(`tests/cuda/test_decoder_block.cpp`), the per-stage CUDA-event timing API
-(`DecoderBlock::forwardTimed` / `stage_names`, code commit `bc7e430`), and
-the latency benchmark (`benchmarks/bench_decoder_block.cpp`) with its
-memcheck evidence (`benchmarks/sanitizer_decoder_block.txt`) and result
-JSONs (`benchmarks/results/`).
+以下内容没有 CUDALab 溯源，按 v0.1 规范新写：`cuda_check.h`、
+`device_buffer.h`、`tensor.h`、`model_config.h`、权重格式/加载器、
+KV 缓存、注意力流水线、逐元素算子（add、silu_mul）、decoder block 接线
+（`decoder_block.h/.cpp`，代码 commit `beeebb6`）及其端到端黄金测试
+（`tests/cuda/test_decoder_block.cpp`）、逐 stage CUDA 事件计时 API
+（`DecoderBlock::forwardTimed` / `stage_names`，代码 commit `bc7e430`）、
+时延 benchmark（`benchmarks/bench_decoder_block.cpp`）及其 memcheck 证据
+（`benchmarks/sanitizer_decoder_block.txt`）与结果 JSON
+（`benchmarks/results/`）。
