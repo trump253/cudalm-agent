@@ -38,4 +38,7 @@ the runtime):
 
 These have no CUDALab provenance; they are written from the v0.1 spec:
 `cuda_check.h`, `device_buffer.h`, `tensor.h`, `model_config.h`, weight
-format/loader, KV cache, attention pipeline, elementwise ops (add, silu_mul).
+format/loader, KV cache, attention pipeline, elementwise ops (add,
+silu_mul), and the decoder-block wiring (`decoder_block.h/.cpp`, code
+commit `beeebb6`) plus its end-to-end golden test
+(`tests/cuda/test_decoder_block.cpp`).
