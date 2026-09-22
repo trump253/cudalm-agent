@@ -1,7 +1,9 @@
 # CUDALM weight file format (`.cudalm`) — v1
 
 A small, **deterministic, versioned, bounds-checked** binary container for a
-single decoder block's weights. Written by `tools/convert_weights.py`
+single decoder block's weights (CUDALMW01), plus the golden-reference
+container (CUDLMG01, see the second section of this document). The weight
+file is written by `tools/convert_weights.py`
 (Python, offline), read by `src/runtime/weight_loader.cpp` (pure C++, no
 PyTorch). This document is the single source of truth; the C++ loader and the
 Python writer both implement it and are cross-checked by tests.
@@ -137,3 +139,117 @@ q[n,k]    = clamp(round(W[n,k] / scale[n,g]), -7, 7)   (round-half-to-even)
 
 Quantization + packing happen **only** in the offline Python converter, never
 in the runtime.
+
+# CUDALM golden reference file format (`.cudalm`, CUDLMG01) — v1
+
+The golden container embeds, in one file, everything the runtime needs to
+reproduce one decoder block at one decode position: the 18 block weight
+tensors (identical bytes to the CUDALMW01 weight file for the same seed),
+the decode position, all 16 stage tensors of the reference simulation, and
+the two KV-state tensors. Written by `tools/generate_golden.py` (Python,
+offline), read by `src/runtime/golden_loader.cpp` (pure C++, no PyTorch).
+
+It reuses the CUDALMW01 record format verbatim (TensorRecord, payload
+alignment, validation rules) and differs only in the header: **80 bytes**
+instead of 72, magic `"CUDLMG01"`, with two extra 32-bit fields after the
+config blob.
+
+```
++---------+--------------------------------------------------------------+
+| Header  |  fixed, 80 bytes                                            |
++---------+--------------------------------------------------------------+
+| Table   |  n_tensors × TensorRecord (variable length, packed)          |
++---------+--------------------------------------------------------------+
+| Payload |  tensor byte blobs, each 16-byte aligned                     |
++---------+--------------------------------------------------------------+
+```
+
+## Header (80 bytes)
+
+| Offset | Size | Type  | Field          | Value / meaning |
+|-------:|-----:|-------|----------------|-----------------|
+| 0      | 8    | 8s    | `magic`        | bytes `"CUDLMG01"` |
+| 8      | 4    | u32   | `version`      | `1` (unknown → hard error) |
+| 12     | 4    | u32   | `flags`        | reserved, must be `0` |
+| 16     | 4    | u32   | `n_tensors`    | number of TensorRecords (36 for v0.1) |
+| 20     | 36   | —     | `config`       | ModelConfig blob (identical to CUDALMW01) |
+| 56     | 4    | i32   | `position`     | decode position `p`, `0 ≤ p < max_seq_len` |
+| 60     | 4    | i32   | `reserved`     | must be `0` |
+| 64     | 8    | u64   | `table_offset` | offset of table from file start (== 80) |
+| 72     | 8    | u64   | `payload_offset` | offset of payload from file start |
+
+`payload_offset` is `80 + table_size` rounded **up** to a multiple of 16
+(zero-filled gap); the same region-alignment and overlap rules as CUDALMW01
+apply.
+
+## Tensor set (36 tensors, table order)
+
+1. The 18 block weight tensors, exactly the CUDALMW01 set above (same
+   names, dtypes, shapes, byte blobs).
+2. The 16 stage tensors, all **FP16**, all shape `[1, X]`:
+
+| Name | X |
+|------|---|
+| `stage.input` | `H` |
+| `stage.rmsnorm1` | `H` |
+| `stage.q` | `H` |
+| `stage.k` | `n_kv·hd` |
+| `stage.v` | `n_kv·hd` |
+| `stage.rope_q` | `H` |
+| `stage.rope_k` | `n_kv·hd` |
+| `stage.attention_output` | `H` |
+| `stage.output_projection` | `H` |
+| `stage.residual1` | `H` |
+| `stage.rmsnorm2` | `H` |
+| `stage.gate` | `inter` |
+| `stage.up` | `inter` |
+| `stage.silu_gate_mul_up` | `inter` |
+| `stage.down` | `H` |
+| `stage.final_output` | `H` |
+
+3. The two KV-state tensors, FP16, shape `[n_kv·(position+1), head_dim]`,
+   flat row order **(kv_head, position)** row-major — i.e. head `h`'s row at
+   position `t` is flat row `h·(position+1) + t`:
+
+| Name |
+|------|
+| `kv.k_state` (row at each position is the RoPE'd k) |
+| `kv.v_state` (row at each position is the projected v) |
+
+## Reference math contract (what the C++ block must mirror)
+
+- All arithmetic in **fp32**; an **fp16 cast at every stage boundary** (the
+  stored stage tensors *are* the contract — kernels must produce the same
+  stage granularity and dtypes).
+- W4A16 linear: `y = (q × scale_fp16_as_fp32) @ x_fp32 → fp16`. The **stored
+  fp16 scale** is the contract (not a recomputed fp32 `amax/7`).
+- RMSNorm: `x · rsqrt(mean(x²) + eps) · w → fp16` (fp32 accum).
+- RoPE: interleaved pairs (CUDALab `rope_v3_half2` convention):
+  `y[2i] = a·c − b·s`, `y[2i+1] = a·s + b·c`, cos/sin read from the fp16
+  tables at row `position`.
+- Decode attention over cache rows `0..position`, stable softmax in fp32,
+  `scale = 1/√head_dim`; GQA: query head `h` reads kv head
+  `h · n_kv_heads / n_heads`.
+- `silu_gate_mul_up = silu(gate)·up` in fp32 → fp16.
+- Residuals: fp32 add of two fp16 rows → fp16.
+
+**KV history (p > 0):** positions `0..p−1` are filled by running seeded
+random hidden states (`0.05·randn(1,H)`, fp16, `history_seed`) through
+attn_norm → k/v projections → RoPE; the file embeds the full cache after the
+write at `p`. Therefore, for **any** position, the cache row at `position`
+equals `stage.rope_k` / `stage.v` bit-for-bit (validated by the tests).
+
+**Pinned p=0 invariants** (bit-exact, checked in
+`tests/cpu/test_golden_file.cpp`): cos row 0 == 1 and sin row 0 == 0 exactly,
+so `stage.rope_q == stage.q` and `stage.rope_k == stage.k` bit-for-bit; and
+softmax over one element is exactly 1, so each query head's
+`stage.attention_output` row equals its GQA kv head's `stage.v` row
+bit-for-bit.
+
+## Comparison tolerance (test contract)
+
+Kernels are compared stage-by-stage against the golden fp16 rows with
+`|a − r| ≤ atol + rtol·|r|`, `atol = rtol = 1e-2`
+(`include/cudalm/stage_compare.h`) — one order of magnitude looser than fp16
+ulp (~9.8e-4) to absorb reassociation differences, tight enough to catch any
+wrong-stage / wrong-index bug.

@@ -1,19 +1,27 @@
-"""CUDALM `.cudalm` binary container (v1) — Python reader/writer.
+"""CUDALM binary containers (v1) — Python reader/writer.
 
 Single source of truth: docs/weight_format.md. This module and
-`include/cudalm/weight_format.h` + `src/runtime/weight_loader.cpp` implement
-the same layout and are cross-checked by tests (Python selftest + the C++
-`test_weights_crosslang`).
+`include/cudalm/weight_format.h` + `src/runtime/weight_loader.cpp` (weights)
+and `include/cudalm/golden_loader.h` + `src/runtime/golden_loader.cpp`
+(golden) implement the same layout and are cross-checked by tests (Python
+selftests + the C++ `test_weights_crosslang` / `test_golden_file`).
 
 Stdlib only (no torch, no numpy) so it can be imported from any tool.
 
-Layout (all integers little-endian):
-    Header 72 B = magic(8) | version u32 | flags u32 | n_tensors u32
-                    | config blob (36 B) | table_offset u64 (=72)
-                    | payload_offset u64 (16B-aligned)
-    Table   n_tensors x TensorRecord (packed)
-    Payload tensor blobs in table order, each region 16B-aligned
-            (offsets measured from payload start)
+Two containers share the record/payload layout; only the header differs:
+
+  Weight  `.cudalm`  magic CUDLMW01, header 72 B
+    magic(8) | version u32 | flags u32 | n_tensors u32
+    | config blob (36 B) | table_offset u64 (=72) | payload_offset u64
+
+  Golden  `.cudalm`  magic CUDLMG01, header 80 B (adds decode state)
+    magic(8) | version u32 | flags u32 | n_tensors u32
+    | config blob (36 B) | position i32 | reserved i32 (=0)
+    | table_offset u64 (=80) | payload_offset u64
+
+  Table   n_tensors x TensorRecord (packed, identical in both)
+  Payload tensor blobs in table order, each region 16B-aligned
+          (offsets measured from payload start)
 """
 from __future__ import annotations
 
@@ -24,10 +32,17 @@ from typing import Dict, List, Optional, Sequence, Tuple
 # Constants (mirror include/cudalm/weight_format.h)
 # ---------------------------------------------------------------------------
 MAGIC = b"CUDLMW01"
+GOLDEN_MAGIC = b"CUDLMG01"
 VERSION = 1
 FLAGS_RESERVED = 0
 CONFIG_BYTES = 36
+# Weight header: magic(8)|version(4)|flags(4)|n_tensors(4)|config(36)
+#                |table_offset(8)|payload_offset(8) = 72 B
 HEADER_BYTES = 72
+# Golden header adds |position i32|reserved i32| after the config blob,
+# pushing the offsets to 64/72 and the header size to 80 B.
+GOLDEN_EXTRA_BYTES = 8
+GOLDEN_HEADER_BYTES = HEADER_BYTES + GOLDEN_EXTRA_BYTES  # 80
 PAYLOAD_ALIGN = 16
 MAX_NAME_LEN = 255
 MAX_DIM = 10000000
@@ -176,15 +191,25 @@ class TensorRecord:
 # ---------------------------------------------------------------------------
 # Writer
 # ---------------------------------------------------------------------------
-class WeightFileWriter:
-    """Deterministic writer. Tensors are placed in table order; each region
-    start is 16B-aligned relative to the payload start; the payload base is
-    16B-aligned (gap zero-filled)."""
+class _ContainerWriter:
+    """Shared deterministic container writer (weight + golden containers).
 
-    def __init__(self, cfg: ModelConfig) -> None:
+    Tensors are placed in table order; each region start is 16B-aligned
+    relative to the payload start; the payload base is 16B-aligned (gap
+    zero-filled). The header is `magic | version u32 | flags u32 |
+    n_tensors u32 | config blob (36 B) | middle | table_offset u64 |
+    payload_offset u64`; `middle` is empty for weight files and holds the
+    golden `position i32 | reserved i32` pair for golden files."""
+
+    def __init__(self, cfg: ModelConfig, magic: bytes, middle: bytes) -> None:
         if not cfg.valid():
             raise ConfigError("invalid ModelConfig")
         self.cfg = cfg
+        self.magic = bytes(magic)
+        if len(self.magic) != 8:
+            raise ConfigError("magic must be exactly 8 bytes")
+        self.middle = bytes(middle)
+        self.header_bytes = 56 + len(self.middle) + 16
         self.records: List[TensorRecord] = []
         self._seen = set()
 
@@ -222,15 +247,16 @@ class WeightFileWriter:
 
         # Pass 2: table bytes.
         table = b"".join(r.encode() for r in self.records)
-        payload_off = HEADER_BYTES + len(table)
+        payload_off = self.header_bytes + len(table)
         while payload_off % PAYLOAD_ALIGN != 0:
             payload_off += 1
 
         out = bytearray()
-        out += MAGIC
+        out += self.magic
         out += struct.pack("<III", VERSION, FLAGS_RESERVED, len(self.records))
         out += self.cfg.to_blob()
-        out += struct.pack("<QQ", HEADER_BYTES, payload_off)
+        out += self.middle
+        out += struct.pack("<QQ", self.header_bytes, payload_off)
         out += table
         out += b"\x00" * (payload_off - len(out))  # zero gap
         cur = 0
@@ -245,154 +271,275 @@ class WeightFileWriter:
         return bytes(out)
 
 
+class WeightFileWriter(_ContainerWriter):
+    """Writer for `.cudalm` weight files (magic CUDLMW01, 72 B header)."""
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__(cfg, MAGIC, b"")
+
+
+class GoldenFileWriter(_ContainerWriter):
+    """Writer for golden-reference files (magic CUDLMG01, 80 B header).
+
+    The header carries the decode `position` (i32, >= 0) plus one reserved
+    i32 that must stay zero."""
+
+    def __init__(self, cfg: ModelConfig, position: int) -> None:
+        position = int(position)
+        if position < 0:
+            raise ConfigError("position must be >= 0")
+        super().__init__(cfg, GOLDEN_MAGIC,
+                         struct.pack("<ii", position, 0))
+        self.position = position
+
+
 # ---------------------------------------------------------------------------
 # Reader
 # ---------------------------------------------------------------------------
+def _parse_container(raw: bytes, magic: bytes, middle_size: int, label: str):
+    """Parse + fully validate a container (weight or golden).
+
+    Mirrors WeightFile::load / GoldenFile::load in the C++ runtime.
+    Returns (cfg, middle_bytes, records, payload_offset)."""
+    n = len(raw)
+    header_bytes = 56 + middle_size + 16
+    if n < header_bytes:
+        raise ConfigError(f"{label}: file smaller than header ({header_bytes} bytes)")
+    if raw[0:8] != magic:
+        raise ConfigError(f"{label}: bad magic")
+    version, flags, n_tensors = struct.unpack_from("<III", raw, 8)
+    if version != VERSION:
+        raise ConfigError(f"{label}: unsupported version {version}")
+    if flags != 0:
+        raise ConfigError(f"{label}: flags must be 0")
+    if not (1 <= n_tensors <= MAX_TENSORS):
+        raise ConfigError(f"{label}: n_tensors out of range")
+    cfg = ModelConfig.from_blob(raw[20:20 + CONFIG_BYTES])
+    if not cfg.valid():
+        raise ConfigError(f"{label}: config blob is invalid")
+    middle = raw[56:56 + middle_size]
+    table_off, payload_off = struct.unpack_from("<QQ", raw, 56 + middle_size)
+    if table_off != header_bytes:
+        raise ConfigError(f"{label}: table_offset must be {header_bytes}")
+    if not (table_off <= payload_off <= n):
+        raise ConfigError(f"{label}: payload_offset out of range")
+    if payload_off % PAYLOAD_ALIGN != 0:
+        raise ConfigError(f"{label}: payload_offset not 16B aligned")
+
+    seen = set()
+    regions: List[Tuple[int, int]] = []
+    records: List[TensorRecord] = []
+    pos = table_off
+    for i in range(n_tensors):
+        if pos + 4 > payload_off:
+            raise ConfigError("table runs past payload")
+        (name_len,) = struct.unpack_from("<I", raw, pos)
+        pos += 4
+        if not (1 <= name_len <= MAX_NAME_LEN):
+            raise ConfigError("tensor name_len out of range")
+        if pos + name_len > payload_off:
+            raise ConfigError("table runs past payload")
+        name = raw[pos:pos + name_len]
+        if not all(0x21 <= b <= 0x7E for b in name):
+            raise ConfigError("tensor name not printable ASCII")
+        name = name.decode("ascii")
+        pos += name_len
+        if name in seen:
+            raise ConfigError(f"duplicate tensor name: {name}")
+        seen.add(name)
+        if pos + 18 > payload_off:
+            raise ConfigError("table runs past payload")
+        dtype, ndim = struct.unpack_from("<BB", raw, pos)
+        pos += 2
+        if dtype not in _ELEMENT_BYTES:
+            raise ConfigError(f"bad dtype in record for {name}")
+        if ndim not in (1, 2):
+            raise ConfigError(f"bad ndim in record for {name}")
+        dims = list(struct.unpack_from(f"<{ndim}I", raw, pos))
+        pos += 4 * ndim
+        for d in dims:
+            if not (1 <= d <= MAX_DIM):
+                raise ConfigError(f"bad dim value in record for {name}")
+        if pos + 17 > payload_off:
+            raise ConfigError("table runs past payload")
+        offset, byte_size, align = struct.unpack_from("<QQB", raw, pos)
+        pos += 17
+        if any(raw[pos + r] != 0 for r in range(7)):
+            raise ConfigError(f"reserved bytes nonzero in {name}")
+        pos += 7
+
+        rec = TensorRecord(name, dtype, dims, offset, byte_size, align)
+        if byte_size != rec.expected_bytes:
+            raise ConfigError(f"byte_size/shape mismatch for {name}")
+        if offset + byte_size > n - payload_off:
+            raise ConfigError(f"payload region out of bounds for {name}")
+        region_addr = payload_off + offset
+        if region_addr % PAYLOAD_ALIGN != 0:
+            raise ConfigError(f"payload region not 16B aligned for {name}")
+        if not (1 <= align <= 16) or (align & (align - 1)) != 0:
+            raise ConfigError(f"bad align field for {name}")
+        if region_addr % align != 0:
+            raise ConfigError(f"align field violated for {name}")
+        rec.data = bytes(raw[region_addr:region_addr + byte_size])
+        regions.append((offset, byte_size))
+        records.append(rec)
+
+    if pos > payload_off:
+        raise ConfigError("table runs past payload")
+    regions.sort()
+    for i in range(1, len(regions)):
+        prev_end = regions[i - 1][0] + regions[i - 1][1]
+        if regions[i][0] < prev_end:
+            raise ConfigError("payload regions overlap")
+
+    return cfg, bytes(middle), records, payload_off
+
+
+# ---------------------------------------------------------------------------
+# Expected tensor sets (single source of truth; mirrored in the C++ runtime)
+# ---------------------------------------------------------------------------
+def block_tensor_expectations(cfg: ModelConfig):
+    """The 18 decoder-block weight tensors: (name, dtype, dims) tuples."""
+    H, hd, nkv, inter = cfg.hidden_size, cfg.head_dim, cfg.n_kv_heads, cfg.intermediate_size
+    return [
+        ("attn_norm.weight", DT_FP16, (H,)),
+        ("ffn_norm.weight", DT_FP16, (H,)),
+        ("attn.rope_cos", DT_FP16, (cfg.max_seq_len, hd // 2)),
+        ("attn.rope_sin", DT_FP16, (cfg.max_seq_len, hd // 2)),
+        ("attn.q_proj.weight", DT_INT4_PACKED, (H, H // 2)),
+        ("attn.q_proj.scale", DT_FP16_SCALE, (H, H // 128)),
+        ("attn.k_proj.weight", DT_INT4_PACKED, (nkv * hd, H // 2)),
+        ("attn.k_proj.scale", DT_FP16_SCALE, (nkv * hd, H // 128)),
+        ("attn.v_proj.weight", DT_INT4_PACKED, (nkv * hd, H // 2)),
+        ("attn.v_proj.scale", DT_FP16_SCALE, (nkv * hd, H // 128)),
+        ("attn.o_proj.weight", DT_INT4_PACKED, (H, H // 2)),
+        ("attn.o_proj.scale", DT_FP16_SCALE, (H, H // 128)),
+        ("mlp.gate_proj.weight", DT_INT4_PACKED, (inter, H // 2)),
+        ("mlp.gate_proj.scale", DT_FP16_SCALE, (inter, H // 128)),
+        ("mlp.up_proj.weight", DT_INT4_PACKED, (inter, H // 2)),
+        ("mlp.up_proj.scale", DT_FP16_SCALE, (inter, H // 128)),
+        ("mlp.down_proj.weight", DT_INT4_PACKED, (H, inter // 2)),
+        ("mlp.down_proj.scale", DT_FP16_SCALE, (H, inter // 128)),
+    ]
+
+
+def golden_tensor_expectations(cfg: ModelConfig, position: int):
+    """The 18 golden tensors: 16 stage outputs + the full KV state after the
+    write at `position`. Stages are flat batch-1 rows [1, X] in the exact
+    layout the runtime produces (see docs/weight_format.md)."""
+    H, hd, nkv, inter = cfg.hidden_size, cfg.head_dim, cfg.n_kv_heads, cfg.intermediate_size
+    kv_rows = nkv * (position + 1)
+    return [
+        ("stage.input", DT_FP16, (1, H)),
+        ("stage.rmsnorm1", DT_FP16, (1, H)),
+        ("stage.q", DT_FP16, (1, H)),
+        ("stage.k", DT_FP16, (1, nkv * hd)),
+        ("stage.v", DT_FP16, (1, nkv * hd)),
+        ("stage.rope_q", DT_FP16, (1, H)),
+        ("stage.rope_k", DT_FP16, (1, nkv * hd)),
+        ("stage.attention_output", DT_FP16, (1, H)),
+        ("stage.output_projection", DT_FP16, (1, H)),
+        ("stage.residual1", DT_FP16, (1, H)),
+        ("stage.rmsnorm2", DT_FP16, (1, H)),
+        ("stage.gate", DT_FP16, (1, inter)),
+        ("stage.up", DT_FP16, (1, inter)),
+        ("stage.silu_gate_mul_up", DT_FP16, (1, inter)),
+        ("stage.down", DT_FP16, (1, H)),
+        ("stage.final_output", DT_FP16, (1, H)),
+        ("kv.k_state", DT_FP16, (kv_rows, hd)),
+        ("kv.v_state", DT_FP16, (kv_rows, hd)),
+    ]
+
+
+def _check_expectations(find, expectations, label: str) -> None:
+    for name, dtype, dims in expectations:
+        r = find(name)
+        if r is None:
+            raise ConfigError(f"{label}: missing tensor: {name}")
+        if r.dtype != dtype:
+            raise ConfigError(f"{label}: dtype mismatch for {name}")
+        if tuple(r.dims) != tuple(dims):
+            raise ConfigError(
+                f"{label}: shape mismatch for {name}: {r.dims} != {list(dims)}")
+
+
+def check_block_tensors(cfg: ModelConfig, find) -> None:
+    """Validate the 18 block weight tensors. `find`: name -> record|None."""
+    if cfg is None:
+        raise ConfigError("not parsed")
+    if cfg.group_size != 128:
+        raise ConfigError("block requires group_size == 128")
+    _check_expectations(find, block_tensor_expectations(cfg), "block")
+
+
+def check_golden_tensors(cfg: ModelConfig, find, position: int) -> None:
+    """Validate weights + all golden tensors for the given position."""
+    check_block_tensors(cfg, find)
+    _check_expectations(find, golden_tensor_expectations(cfg, position),
+                        "golden")
+
+
 class ParsedWeightFile:
-    """Validated in-memory view of a `.cudalm` file."""
+    """Validated in-memory view of a `.cudalm` weight file."""
 
     def __init__(self, raw: bytes) -> None:
         self.raw = raw
         self.cfg: Optional[ModelConfig] = None
         self.records: List[TensorRecord] = []
         self.payload_offset: int = 0
-        self._parse()
-
-    # -- parsing + full validation (mirror WeightFile::load) ----------------
-    def _parse(self) -> None:
-        raw = self.raw
-        n = len(raw)
-        if n < HEADER_BYTES:
-            raise ConfigError("file smaller than header (72 bytes)")
-        if raw[0:8] != MAGIC:
-            raise ConfigError("bad magic")
-        version, flags, n_tensors = struct.unpack_from("<III", raw, 8)
-        if version != VERSION:
-            raise ConfigError(f"unsupported version {version}")
-        if flags != 0:
-            raise ConfigError("flags must be 0")
-        if not (1 <= n_tensors <= MAX_TENSORS):
-            raise ConfigError("n_tensors out of range")
-        self.cfg = ModelConfig.from_blob(raw[20:20 + CONFIG_BYTES])
-        if not self.cfg.valid():
-            raise ConfigError("config blob is invalid")
-        table_off, payload_off = struct.unpack_from("<QQ", raw, 56)
-        if table_off != HEADER_BYTES:
-            raise ConfigError("table_offset must be 72")
-        if not (table_off <= payload_off <= n):
-            raise ConfigError("payload_offset out of range")
-        if payload_off % PAYLOAD_ALIGN != 0:
-            raise ConfigError("payload_offset not 16B aligned")
+        cfg, _middle, records, payload_off = _parse_container(
+            raw, MAGIC, 0, "weight")
+        self.cfg = cfg
+        self.records = records
         self.payload_offset = payload_off
 
-        seen = set()
-        regions: List[Tuple[int, int]] = []
-        pos = table_off
-        for i in range(n_tensors):
-            if pos + 4 > payload_off:
-                raise ConfigError("table runs past payload")
-            (name_len,) = struct.unpack_from("<I", raw, pos)
-            pos += 4
-            if not (1 <= name_len <= MAX_NAME_LEN):
-                raise ConfigError("tensor name_len out of range")
-            if pos + name_len > payload_off:
-                raise ConfigError("table runs past payload")
-            name = raw[pos:pos + name_len]
-            if not all(0x21 <= b <= 0x7E for b in name):
-                raise ConfigError("tensor name not printable ASCII")
-            name = name.decode("ascii")
-            pos += name_len
-            if name in seen:
-                raise ConfigError(f"duplicate tensor name: {name}")
-            seen.add(name)
-            if pos + 18 > payload_off:
-                raise ConfigError("table runs past payload")
-            dtype, ndim = struct.unpack_from("<BB", raw, pos)
-            pos += 2
-            if dtype not in _ELEMENT_BYTES:
-                raise ConfigError(f"bad dtype in record for {name}")
-            if ndim not in (1, 2):
-                raise ConfigError(f"bad ndim in record for {name}")
-            dims = list(struct.unpack_from(f"<{ndim}I", raw, pos))
-            pos += 4 * ndim
-            for d in dims:
-                if not (1 <= d <= MAX_DIM):
-                    raise ConfigError(f"bad dim value in record for {name}")
-            if pos + 17 > payload_off:
-                raise ConfigError("table runs past payload")
-            offset, byte_size, align = struct.unpack_from("<QQB", raw, pos)
-            pos += 17
-            if any(raw[pos + r] != 0 for r in range(7)):
-                raise ConfigError(f"reserved bytes nonzero in {name}")
-            pos += 7
-
-            rec = TensorRecord(name, dtype, dims, offset, byte_size, align)
-            if byte_size != rec.expected_bytes:
-                raise ConfigError(f"byte_size/shape mismatch for {name}")
-            if offset + byte_size > n - payload_off:
-                raise ConfigError(f"payload region out of bounds for {name}")
-            region_addr = payload_off + offset
-            if region_addr % PAYLOAD_ALIGN != 0:
-                raise ConfigError(f"payload region not 16B aligned for {name}")
-            if not (1 <= align <= 16) or (align & (align - 1)) != 0:
-                raise ConfigError(f"bad align field for {name}")
-            if region_addr % align != 0:
-                raise ConfigError(f"align field violated for {name}")
-            rec.data = bytes(raw[region_addr:region_addr + byte_size])
-            regions.append((offset, byte_size))
-            self.records.append(rec)
-
-        if pos > payload_off:
-            raise ConfigError("table runs past payload")
-        regions.sort()
-        for i in range(1, len(regions)):
-            prev_end = regions[i - 1][0] + regions[i - 1][1]
-            if regions[i][0] < prev_end:
-                raise ConfigError("payload regions overlap")
-
-    # -- convenience ---------------------------------------------------------
     def find(self, name: str) -> Optional[TensorRecord]:
         for r in self.records:
             if r.name == name:
                 return r
         return None
 
-    # -- decoder-block tensor set (mirror validate_block_tensors) -----------
     def validate_block_tensors(self) -> None:
-        c = self.cfg
-        if c is None:
-            raise ConfigError("not parsed")
-        if c.group_size != 128:
-            raise ConfigError("block requires group_size == 128")
-        H, hd, nkv, inter = c.hidden_size, c.head_dim, c.n_kv_heads, c.intermediate_size
-        expects = [
-            ("attn_norm.weight", DT_FP16, (H,)),
-            ("ffn_norm.weight", DT_FP16, (H,)),
-            ("attn.rope_cos", DT_FP16, (c.max_seq_len, hd // 2)),
-            ("attn.rope_sin", DT_FP16, (c.max_seq_len, hd // 2)),
-            ("attn.q_proj.weight", DT_INT4_PACKED, (H, H // 2)),
-            ("attn.q_proj.scale", DT_FP16_SCALE, (H, H // 128)),
-            ("attn.k_proj.weight", DT_INT4_PACKED, (nkv * hd, H // 2)),
-            ("attn.k_proj.scale", DT_FP16_SCALE, (nkv * hd, H // 128)),
-            ("attn.v_proj.weight", DT_INT4_PACKED, (nkv * hd, H // 2)),
-            ("attn.v_proj.scale", DT_FP16_SCALE, (nkv * hd, H // 128)),
-            ("attn.o_proj.weight", DT_INT4_PACKED, (H, H // 2)),
-            ("attn.o_proj.scale", DT_FP16_SCALE, (H, H // 128)),
-            ("mlp.gate_proj.weight", DT_INT4_PACKED, (inter, H // 2)),
-            ("mlp.gate_proj.scale", DT_FP16_SCALE, (inter, H // 128)),
-            ("mlp.up_proj.weight", DT_INT4_PACKED, (inter, H // 2)),
-            ("mlp.up_proj.scale", DT_FP16_SCALE, (inter, H // 128)),
-            ("mlp.down_proj.weight", DT_INT4_PACKED, (H, inter // 2)),
-            ("mlp.down_proj.scale", DT_FP16_SCALE, (H, inter // 128)),
-        ]
-        for name, dtype, dims in expects:
-            r = self.find(name)
-            if r is None:
-                raise ConfigError(f"missing tensor: {name}")
-            if r.dtype != dtype:
-                raise ConfigError(f"dtype mismatch for {name}")
-            if tuple(r.dims) != tuple(dims):
-                raise ConfigError(f"shape mismatch for {name}: {r.dims} != {list(dims)}")
+        check_block_tensors(self.cfg, self.find)
+
+
+class ParsedGoldenFile:
+    """Validated in-memory view of a CUDLMG01 golden-reference file.
+
+    Holds config, decode `position`, and every embedded tensor (weights,
+    stage outputs, KV state)."""
+
+    def __init__(self, raw: bytes) -> None:
+        self.raw = raw
+        self.cfg: Optional[ModelConfig] = None
+        self.records: List[TensorRecord] = []
+        self.payload_offset: int = 0
+        self.position = 0
+        cfg, middle, records, payload_off = _parse_container(
+            raw, GOLDEN_MAGIC, GOLDEN_EXTRA_BYTES, "golden")
+        position, reserved = struct.unpack("<ii", middle)
+        if reserved != 0:
+            raise ConfigError("golden: reserved header field must be 0")
+        if position < 0:
+            raise ConfigError("golden: position must be >= 0")
+        if position >= cfg.max_seq_len:
+            raise ConfigError("golden: position must be < max_seq_len")
+        self.cfg = cfg
+        self.records = records
+        self.payload_offset = payload_off
+        self.position = position
+
+    def find(self, name: str) -> Optional[TensorRecord]:
+        for r in self.records:
+            if r.name == name:
+                return r
+        return None
+
+    def validate_block_tensors(self) -> None:
+        check_block_tensors(self.cfg, self.find)
+
+    def validate_golden_tensors(self) -> None:
+        check_golden_tensors(self.cfg, self.find, self.position)
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +548,11 @@ class ParsedWeightFile:
 def read_file(path: str) -> ParsedWeightFile:
     with open(path, "rb") as f:
         return ParsedWeightFile(f.read())
+
+
+def read_golden_file(path: str) -> ParsedGoldenFile:
+    with open(path, "rb") as f:
+        return ParsedGoldenFile(f.read())
 
 
 def write_file(path: str, data: bytes) -> None:

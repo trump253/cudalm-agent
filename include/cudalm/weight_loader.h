@@ -20,14 +20,6 @@
 
 namespace cudalm {
 
-// Simple non-exceptional status for host-side file operations.
-struct Status {
-  bool ok = true;
-  std::string message;
-  static Status ok_status() { return Status{true, ""}; }
-  static Status error(std::string msg) { return Status{false, std::move(msg)}; }
-};
-
 struct WeightTensorInfo {
   std::string name;
   Dtype dtype = Dtype::kFp16;

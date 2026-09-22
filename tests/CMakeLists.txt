@@ -43,6 +43,50 @@ if(CUDALM_PYTHON3)
            COMMAND test_weights_crosslang ${CUDALM_CROSSLANG_WEIGHTS})
   set_tests_properties(test_weights_crosslang PROPERTIES
     FIXTURES_REQUIRED cudalm_weights)
+
+  # --- Golden-reference cross-language tests ---------------------------------
+  # tools/generate_golden.py (torch, offline) emits CUDLMG01 golden files for
+  # position 0 and position 7 (non-trivial KV history); test_golden_file loads
+  # them with the PyTorch-free C++ loader and pins the tensor set + invariants.
+  set(CUDALM_GOLDEN_P0 ${CMAKE_BINARY_DIR}/data/block_v01_golden_p0.cudalm)
+  set(CUDALM_GOLDEN_P7 ${CMAKE_BINARY_DIR}/data/block_v01_golden_p7.cudalm)
+
+  add_custom_command(
+    OUTPUT ${CUDALM_GOLDEN_P0}
+    COMMAND ${CUDALM_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/generate_golden.py
+            --out ${CUDALM_GOLDEN_P0} --position 0
+    DEPENDS ${CMAKE_SOURCE_DIR}/tools/generate_golden.py
+            ${CMAKE_SOURCE_DIR}/tools/convert_weights.py
+            ${CMAKE_SOURCE_DIR}/tools/common/binfmt.py
+    COMMENT "generate_golden: generating ${CUDALM_GOLDEN_P0}"
+    VERBATIM)
+  add_custom_command(
+    OUTPUT ${CUDALM_GOLDEN_P7}
+    COMMAND ${CUDALM_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/generate_golden.py
+            --out ${CUDALM_GOLDEN_P7} --position 7
+    DEPENDS ${CMAKE_SOURCE_DIR}/tools/generate_golden.py
+            ${CMAKE_SOURCE_DIR}/tools/convert_weights.py
+            ${CMAKE_SOURCE_DIR}/tools/common/binfmt.py
+    COMMENT "generate_golden: generating ${CUDALM_GOLDEN_P7}"
+    VERBATIM)
+  add_custom_target(gen_golden_weights
+    DEPENDS ${CUDALM_GOLDEN_P0} ${CUDALM_GOLDEN_P7})
+
+  add_test(NAME gen_golden_weights
+            COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target gen_golden_weights)
+  set_tests_properties(gen_golden_weights PROPERTIES FIXTURES_SETUP cudalm_golden)
+
+  # Python-side golden selftest (determinism, container round-trip,
+  # p=0 identity invariants, history usage at p=7).
+  add_test(NAME test_golden_python_selftest
+            COMMAND ${CUDALM_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/generate_golden.py --selftest)
+
+  add_executable(test_golden_file cpu/test_golden_file.cpp)
+  target_link_libraries(test_golden_file PRIVATE cudalm)
+  add_test(NAME test_golden_file
+            COMMAND test_golden_file ${CUDALM_GOLDEN_P0} ${CUDALM_GOLDEN_P7})
+  set_tests_properties(test_golden_file PROPERTIES
+    FIXTURES_REQUIRED cudalm_golden)
 else()
   message(STATUS "python3 not found: cross-language weight tests disabled")
 endif()

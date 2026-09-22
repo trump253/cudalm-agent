@@ -18,6 +18,16 @@
 #include "cudalm/tensor.h"
 
 namespace cudalm {
+
+// Simple non-exceptional status for host-side file operations.
+// (Shared by the weight and golden loaders.)
+struct Status {
+  bool ok = true;
+  std::string message;
+  static Status ok_status() { return Status{true, ""}; }
+  static Status error(std::string msg) { return Status{false, std::move(msg)}; }
+};
+
 namespace wfmt {
 
 // ---------------------------------------------------------------------------
