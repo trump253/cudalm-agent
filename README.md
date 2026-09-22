@@ -135,8 +135,9 @@ bash scripts/check_no_torch.sh
 - [x] CUDA 事件逐 stage 时延分解；p=0 / p=511 JSON 已提交
 - [x] 运行时不依赖 PyTorch/Python（守卫脚本，Python 仅在 `tools/`）
 - [x] 逐文件溯源已记录（上游移植 + 原生清单）
-- [x] 工作树干净；全部证据产物已提交；remote 尚未配置（挂载说明见交付
-      报告）；无 force push
+- [x] 工作树干净；全部证据产物已提交；remote `origin`
+      （`github.com/trump253/cudalm-agent`，SSH 传输）已配置，`main`
+      已推送；无 force push
 
 **停止（STOP）。** 按任务简报要求，开发在 v0.1 之后停止。以上内容均不
 超出单个 decoder block 的范围。
