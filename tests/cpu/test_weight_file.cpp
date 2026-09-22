@@ -112,20 +112,21 @@ std::vector<std::uint8_t> build_file(const ModelConfig& cfg,
 }
 
 std::vector<Rec> block_recs(const ModelConfig& c) {
-  const int H = c.hidden_size, hd = c.head_dim, nkv = c.n_kv_heads, inter = c.intermediate_size;
+  const int H = c.hidden_size, hd = c.head_dim, inter = c.intermediate_size;
+  const int qo = c.q_proj_out(), kv = c.kv_proj_out();
   return {
       {"attn_norm.weight",  Dtype::kFp16,        {H}},
       {"ffn_norm.weight",   Dtype::kFp16,        {H}},
       {"attn.rope_cos",     Dtype::kFp16,        {c.max_seq_len, hd / 2}},
       {"attn.rope_sin",     Dtype::kFp16,        {c.max_seq_len, hd / 2}},
-      {"attn.q_proj.weight", Dtype::kInt4Packed, {H, H / 2}},
-      {"attn.q_proj.scale",  Dtype::kFp16Scale,  {H, H / 128}},
-      {"attn.k_proj.weight", Dtype::kInt4Packed, {nkv * hd, H / 2}},
-      {"attn.k_proj.scale",  Dtype::kFp16Scale,  {nkv * hd, H / 128}},
-      {"attn.v_proj.weight", Dtype::kInt4Packed, {nkv * hd, H / 2}},
-      {"attn.v_proj.scale",  Dtype::kFp16Scale,  {nkv * hd, H / 128}},
-      {"attn.o_proj.weight", Dtype::kInt4Packed, {H, H / 2}},
-      {"attn.o_proj.scale",  Dtype::kFp16Scale,  {H, H / 128}},
+      {"attn.q_proj.weight", Dtype::kInt4Packed, {qo, H / 2}},
+      {"attn.q_proj.scale",  Dtype::kFp16Scale,  {qo, H / 128}},
+      {"attn.k_proj.weight", Dtype::kInt4Packed, {kv, H / 2}},
+      {"attn.k_proj.scale",  Dtype::kFp16Scale,  {kv, H / 128}},
+      {"attn.v_proj.weight", Dtype::kInt4Packed, {kv, H / 2}},
+      {"attn.v_proj.scale",  Dtype::kFp16Scale,  {kv, H / 128}},
+      {"attn.o_proj.weight", Dtype::kInt4Packed, {H, qo / 2}},
+      {"attn.o_proj.scale",  Dtype::kFp16Scale,  {H, qo / 128}},
       {"mlp.gate_proj.weight", Dtype::kInt4Packed, {inter, H / 2}},
       {"mlp.gate_proj.scale",  Dtype::kFp16Scale,  {inter, H / 128}},
       {"mlp.up_proj.weight",   Dtype::kInt4Packed, {inter, H / 2}},
@@ -176,6 +177,37 @@ int main() {
     CHECK(ok);
   }
   CHECK(wf.validate_block_tensors().ok);
+
+  // ---- generalized projection-shape config (v0.1.1) ----------------------
+  // q_proj_out (2048) != hidden_size (1024): loader validation and the
+  // weight-file contract must not assume Q width == H.
+  const ModelConfig gc = ModelConfig::v011_general_test();
+  CHECK(gc.valid());
+  CHECK(gc.q_proj_out() != gc.hidden_size);  // 2048 != 1024
+  {
+    // qo not a multiple of 128 -> invalid (o_proj K contract)
+    ModelConfig bad1 = gc;
+    bad1.head_dim = 100;  // qo = 1600, 1600 % 128 != 0
+    CHECK(!bad1.valid());
+  }
+  {
+    const std::vector<Rec> grecs = block_recs(gc);
+    std::vector<std::uint8_t> gfile = build_file(gc, grecs);
+    write_tmp(path, gfile);
+    WeightFile gw;
+    Status gs = WeightFile::load(path, &gw);
+    CHECK(gs.ok);
+    if (!gs.ok) { std::fprintf(stderr, "  general load: %s\n", gs.message.c_str()); return 1; }
+    CHECK(gw.config() == gc);
+    CHECK(gw.validate_block_tensors().ok);
+    if (!gw.validate_block_tensors().ok) return 1;
+    const WeightTensorInfo* qw = gw.find("attn.q_proj.weight");
+    CHECK(qw != nullptr && qw->dims[0] == gc.q_proj_out()
+          && qw->dims[1] == gc.hidden_size / 2);
+    const WeightTensorInfo* ow = gw.find("attn.o_proj.weight");
+    CHECK(ow != nullptr && ow->dims[0] == gc.hidden_size
+          && ow->dims[1] == gc.q_proj_out() / 2);
+  }
 
   // ---- int4 pack/unpack contract over the full domain --------------------
   for (int lo = -8; lo <= 7; ++lo) {

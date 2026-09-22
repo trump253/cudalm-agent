@@ -26,11 +26,13 @@ Determinism: torch.manual_seed(seed) with a fixed draw order; the same
 
 Usage:
   python3 tools/convert_weights.py --out data/block_v01.cudalm [--seed 20250922]
+  python3 tools/convert_weights.py --out out.cudalm --config '{"n_heads": 16}'
   python3 tools/convert_weights.py --selftest        # no torch GPU needed
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -119,13 +121,18 @@ def unpack_w(W_packed):
 # Generation
 # ---------------------------------------------------------------------------
 def projection_shapes(cfg):
-    """name -> (N, K) for the seven W4A16 projections (in block order)."""
-    H, hd, nkv, inter = cfg.hidden_size, cfg.head_dim, cfg.n_kv_heads, cfg.intermediate_size
+    """name -> (N, K) for the seven W4A16 projections (in block order).
+
+    Shape contract (docs/weight_format.md): q_proj (q_proj_out, H),
+    k/v_proj (kv_proj_out, H), o_proj (H, q_proj_out), MLP unchanged.
+    Q width is independent of hidden_size (v0.1.1)."""
+    H, inter = cfg.hidden_size, cfg.intermediate_size
+    qo, kv = cfg.q_proj_out(), cfg.kv_proj_out()
     return {
-        "attn.q_proj": (H, H),
-        "attn.k_proj": (nkv * hd, H),
-        "attn.v_proj": (nkv * hd, H),
-        "attn.o_proj": (H, H),
+        "attn.q_proj": (qo, H),
+        "attn.k_proj": (kv, H),
+        "attn.v_proj": (kv, H),
+        "attn.o_proj": (H, qo),
         "mlp.gate_proj": (inter, H),
         "mlp.up_proj": (inter, H),
         "mlp.down_proj": (H, inter),
@@ -192,6 +199,29 @@ def build_file(cfg, seed) -> bytes:
     for name, dtype, dims, blob in records:
         w.add(name, dtype, dims, blob)
     return w.build(), stats
+
+
+# ---------------------------------------------------------------------------
+# Config override (v0.1.1: generalized projection-shape test config)
+# ---------------------------------------------------------------------------
+def parse_config_override(s: str) -> "binfmt.ModelConfig":
+    """Parse a `--config` JSON override into a ModelConfig.
+
+    Accepts a JSON object with any subset of the 9 ModelConfig fields
+    (e.g. `{"n_heads": 16, "n_kv_heads": 8}`); unspecified fields come from
+    the v0.1 default. The result must satisfy ModelConfig.valid()."""
+    obj = json.loads(s)
+    if not isinstance(obj, dict):
+        raise ValueError("--config must be a JSON object")
+    base = binfmt.ModelConfig.v01_default()
+    allowed = set(base.__slots__)
+    for k, v in obj.items():
+        if k not in allowed:
+            raise ValueError(f"unknown config field: {k!r}")
+        setattr(base, k, v)
+    if not base.valid():
+        raise ValueError(f"config override is invalid: {base!r}")
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +314,31 @@ def selftest() -> int:
             _check(bool((nz | (qmax == 0)).all()),
                    f"file {pname}: zero-scale group with nonzero q")
 
+    # -- generalized projection-shape config (v0.1.1) ------------------------
+    # q_proj_out (2048) != H (1024): the generator, reader, and shape
+    # expectations must not assume Q width == H.
+    cfgg = binfmt.ModelConfig.v011_general_test()
+    _check(cfgg.q_proj_out() != cfgg.hidden_size, "general config: qo != H")
+    _check(cfgg.valid(), "general config valid")
+    with tempfile.TemporaryDirectory() as td:
+        pathg = os.path.join(td, "general.cudalm")
+        blobg, _ = build_file(cfgg, 20250922)
+        blobg2, _ = build_file(cfgg, 20250922)
+        _check(blobg == blobg2, "general config: determinism")
+        binfmt.write_file(pathg, blobg)
+        pg = binfmt.read_file(pathg)
+        _check(pg.cfg == cfgg, "general config round-trip")
+        pg.validate_block_tensors()
+        _check(pg.find("attn.q_proj.weight").dims
+               == [cfgg.q_proj_out(), cfgg.hidden_size // 2],
+               "general q_proj dims [qo, H/2]")
+        _check(pg.find("attn.k_proj.weight").dims
+               == [cfgg.kv_proj_out(), cfgg.hidden_size // 2],
+               "general k_proj dims [kv, H/2]")
+        _check(pg.find("attn.o_proj.weight").dims
+               == [cfgg.hidden_size, cfgg.q_proj_out() // 2],
+               "general o_proj dims [H, qo/2]")
+
     for name, st in stats.items():
         print(f"  {name:<16s} N={st['N']:>5d} K={st['K']:>5d} "
               f"max|q|={st['max_abs_q']} zero_groups={st['n_zero_groups']} "
@@ -297,13 +352,22 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", default="data/block_v01.cudalm")
     ap.add_argument("--seed", type=int, default=20250922)
+    ap.add_argument("--config", default=None,
+                    help="JSON object overriding ModelConfig fields "
+                         "(e.g. '{\"n_heads\": 16, \"n_kv_heads\": 8}'); "
+                         "defaults to the v0.1 config")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
 
     if a.selftest:
         return selftest()
 
-    cfg = binfmt.ModelConfig.v01_default()
+    try:
+        cfg = (parse_config_override(a.config) if a.config
+               else binfmt.ModelConfig.v01_default())
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     blob, stats = build_file(cfg, a.seed)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     binfmt.write_file(a.out, blob)

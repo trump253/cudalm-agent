@@ -324,7 +324,7 @@ def selftest() -> int:
         # GQA kv head's v row (softmax over one element is exactly 1)
         g0 = binfmt.read_golden_file(paths[0])
         a0 = cw._bytes_to_tensor(g0.find("stage.attention_output").data,
-                                 torch.float16, (1, cfg.hidden_size))
+                                 torch.float16, (1, cfg.q_proj_out()))
         v0 = cw._bytes_to_tensor(g0.find("stage.v").data, torch.float16,
                                  (1, cfg.n_kv_heads * cfg.head_dim))
         hd = cfg.head_dim
@@ -337,7 +337,7 @@ def selftest() -> int:
         # compare query head 0 against its kv head's v row
         g7 = binfmt.read_golden_file(paths[7])
         a7 = cw._bytes_to_tensor(g7.find("stage.attention_output").data,
-                                 torch.float16, (1, cfg.hidden_size))
+                                 torch.float16, (1, cfg.q_proj_out()))
         v7 = cw._bytes_to_tensor(g7.find("stage.v").data, torch.float16,
                                  (1, cfg.n_kv_heads * cfg.head_dim))
         _check(not torch.equal(a7[:, 0:hd], v7[:, 0:hd]),
@@ -362,18 +362,27 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=20250922)
     ap.add_argument("--history-seed", type=int, default=None,
                     help="defaults to seed + 1")
+    ap.add_argument("--config", default=None,
+                    help="JSON object overriding ModelConfig fields "
+                         "(same as convert_weights.py --config)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
 
     if a.selftest:
         return selftest()
 
-    hseed = a.history_seed if a.history_seed is not None else a.seed + 1
-    if a.position < 0 or a.position >= binfmt.ModelConfig.v01_default().max_seq_len:
-        print(f"position {a.position} out of range", file=sys.stderr)
+    try:
+        cfg = (cw.parse_config_override(a.config) if a.config
+               else binfmt.ModelConfig.v01_default())
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
         return 2
 
-    cfg = binfmt.ModelConfig.v01_default()
+    hseed = a.history_seed if a.history_seed is not None else a.seed + 1
+    if a.position < 0 or a.position >= cfg.max_seq_len:
+        print(f"position {a.position} out of range [0, {cfg.max_seq_len})",
+              file=sys.stderr)
+        return 2
     recs, summary = generate(cfg, a.position, a.seed, hseed)
     w = binfmt.GoldenFileWriter(cfg, a.position)
     for name, dtype, dims, blob_r in recs:

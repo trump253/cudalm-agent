@@ -180,24 +180,28 @@ Status GoldenFile::validate_block_tensors() const {
   if (c.group_size != 128)
     return Status::error("block requires group_size == 128");
   const int H = c.hidden_size;
+  const int qo = c.q_proj_out();
+  const int kv = c.kv_proj_out();
   const int hd = c.head_dim;
-  const int nkv = c.n_kv_heads;
   const int inter = c.intermediate_size;
 
+  // Shape contract (docs/weight_format.md): q_proj (q_proj_out, H),
+  // k/v_proj (kv_proj_out, H), o_proj (H, q_proj_out) — Q width is
+  // independent of hidden_size (v0.1.1).
   struct Expect { const char* name; Dtype dtype; std::int64_t d0; std::int64_t d1; };
   const Expect expects[] = {
       {"attn_norm.weight",  Dtype::kFp16,        H, -1},
       {"ffn_norm.weight",   Dtype::kFp16,        H, -1},
       {"attn.rope_cos",     Dtype::kFp16,        c.max_seq_len, hd / 2},
       {"attn.rope_sin",     Dtype::kFp16,        c.max_seq_len, hd / 2},
-      {"attn.q_proj.weight", Dtype::kInt4Packed, H, H / 2},
-      {"attn.q_proj.scale",  Dtype::kFp16Scale,  H, H / 128},
-      {"attn.k_proj.weight", Dtype::kInt4Packed, nkv * hd, H / 2},
-      {"attn.k_proj.scale",  Dtype::kFp16Scale,  nkv * hd, H / 128},
-      {"attn.v_proj.weight", Dtype::kInt4Packed, nkv * hd, H / 2},
-      {"attn.v_proj.scale",  Dtype::kFp16Scale,  nkv * hd, H / 128},
-      {"attn.o_proj.weight", Dtype::kInt4Packed, H, H / 2},
-      {"attn.o_proj.scale",  Dtype::kFp16Scale,  H, H / 128},
+      {"attn.q_proj.weight", Dtype::kInt4Packed, qo, H / 2},
+      {"attn.q_proj.scale",  Dtype::kFp16Scale,  qo, H / 128},
+      {"attn.k_proj.weight", Dtype::kInt4Packed, kv, H / 2},
+      {"attn.k_proj.scale",  Dtype::kFp16Scale,  kv, H / 128},
+      {"attn.v_proj.weight", Dtype::kInt4Packed, kv, H / 2},
+      {"attn.v_proj.scale",  Dtype::kFp16Scale,  kv, H / 128},
+      {"attn.o_proj.weight", Dtype::kInt4Packed, H, qo / 2},
+      {"attn.o_proj.scale",  Dtype::kFp16Scale,  H, qo / 128},
       {"mlp.gate_proj.weight", Dtype::kInt4Packed, inter, H / 2},
       {"mlp.gate_proj.scale",  Dtype::kFp16Scale,  inter, H / 128},
       {"mlp.up_proj.weight",   Dtype::kInt4Packed, inter, H / 2},
@@ -227,22 +231,25 @@ Status GoldenFile::validate_golden_tensors() const {
 
   const ModelConfig& c = config_;
   const int H = c.hidden_size;
+  const int qo = c.q_proj_out();
+  const int kv = c.kv_proj_out();
   const int hd = c.head_dim;
-  const int nkv = c.n_kv_heads;
   const int inter = c.intermediate_size;
   const std::int64_t kv_rows = static_cast<std::int64_t>(c.n_kv_heads) * (position_ + 1);
 
   // The 18 golden tensors (mirrors binfmt.golden_tensor_expectations).
+  // Q-path stages (q/rope_q/attention_output) are q_proj_out wide; KV-path
+  // stages (k/rope_k) are kv_proj_out wide — independent of hidden_size.
   struct Expect { const char* name; std::int64_t d0; std::int64_t d1; };
   const Expect expects[] = {
       {"stage.input",              H, -1},
       {"stage.rmsnorm1",           H, -1},
-      {"stage.q",                  H, -1},
-      {"stage.k",                  nkv * hd, -1},
-      {"stage.v",                  nkv * hd, -1},
-      {"stage.rope_q",             H, -1},
-      {"stage.rope_k",             nkv * hd, -1},
-      {"stage.attention_output",   H, -1},
+      {"stage.q",                  qo, -1},
+      {"stage.k",                  kv, -1},
+      {"stage.v",                  kv, -1},
+      {"stage.rope_q",             qo, -1},
+      {"stage.rope_k",             kv, -1},
+      {"stage.attention_output",   qo, -1},
       {"stage.output_projection",  H, -1},
       {"stage.residual1",          H, -1},
       {"stage.rmsnorm2",           H, -1},

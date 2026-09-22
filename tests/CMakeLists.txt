@@ -104,6 +104,56 @@ if(CUDALM_PYTHON3)
                     ${CUDALM_GOLDEN_P0} ${CUDALM_GOLDEN_P7})
   set_tests_properties(test_decoder_block PROPERTIES
     FIXTURES_REQUIRED "cudalm_weights;cudalm_golden")
+
+  # --- Generalized projection-shape test (v0.1.1) --------------------------
+  # H=1024, n_heads=16, head_dim=128 -> q_proj_out=2048 != H; n_kv_heads=8
+  # -> kv_proj_out=1024. Proves the runtime, loaders, and tools no longer
+  # assume Q width == hidden_size. Same binary as test_decoder_block: the
+  # test is fully config-driven from the fixture files.
+  set(CUDALM_GENERAL_CONFIG
+      "{\"hidden_size\":1024,\"n_heads\":16,\"n_kv_heads\":8,\"head_dim\":128,\"intermediate_size\":2816,\"group_size\":128,\"max_seq_len\":512}")
+  set(CUDALM_GENERAL_WEIGHTS ${CMAKE_BINARY_DIR}/data/block_v01_general.cudalm)
+  set(CUDALM_GENERAL_GOLDEN_P0 ${CMAKE_BINARY_DIR}/data/block_v01_general_golden_p0.cudalm)
+  set(CUDALM_GENERAL_GOLDEN_P7 ${CMAKE_BINARY_DIR}/data/block_v01_general_golden_p7.cudalm)
+
+  add_custom_command(
+    OUTPUT ${CUDALM_GENERAL_WEIGHTS}
+    COMMAND ${CUDALM_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/convert_weights.py
+            --out ${CUDALM_GENERAL_WEIGHTS} --config ${CUDALM_GENERAL_CONFIG}
+    DEPENDS ${CMAKE_SOURCE_DIR}/tools/convert_weights.py
+            ${CMAKE_SOURCE_DIR}/tools/common/binfmt.py
+    COMMENT "convert_weights: generating ${CUDALM_GENERAL_WEIGHTS}"
+    VERBATIM)
+  add_custom_command(
+    OUTPUT ${CUDALM_GENERAL_GOLDEN_P0}
+    COMMAND ${CUDALM_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/generate_golden.py
+            --out ${CUDALM_GENERAL_GOLDEN_P0} --position 0
+            --config ${CUDALM_GENERAL_CONFIG}
+    DEPENDS ${CUDALM_GENERAL_WEIGHTS}
+    COMMENT "generate_golden: generating ${CUDALM_GENERAL_GOLDEN_P0}"
+    VERBATIM)
+  add_custom_command(
+    OUTPUT ${CUDALM_GENERAL_GOLDEN_P7}
+    COMMAND ${CUDALM_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/generate_golden.py
+            --out ${CUDALM_GENERAL_GOLDEN_P7} --position 7
+            --config ${CUDALM_GENERAL_CONFIG}
+    DEPENDS ${CUDALM_GENERAL_WEIGHTS}
+    COMMENT "generate_golden: generating ${CUDALM_GENERAL_GOLDEN_P7}"
+    VERBATIM)
+  add_custom_target(gen_general_weights
+    DEPENDS ${CUDALM_GENERAL_WEIGHTS}
+            ${CUDALM_GENERAL_GOLDEN_P0} ${CUDALM_GENERAL_GOLDEN_P7})
+
+  add_test(NAME gen_general_weights
+            COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target gen_general_weights)
+  set_tests_properties(gen_general_weights PROPERTIES
+    FIXTURES_SETUP cudalm_weights_general)
+
+  add_test(NAME test_decoder_block_general
+            COMMAND test_decoder_block ${CUDALM_GENERAL_WEIGHTS}
+                    ${CUDALM_GENERAL_GOLDEN_P0} ${CUDALM_GENERAL_GOLDEN_P7})
+  set_tests_properties(test_decoder_block_general PROPERTIES
+    FIXTURES_REQUIRED cudalm_weights_general)
 else()
   message(STATUS "python3 not found: cross-language weight tests disabled")
 endif()

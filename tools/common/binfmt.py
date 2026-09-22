@@ -105,6 +105,12 @@ class ModelConfig:
         return cls(h, nh, nkv, hd, inter, g, msl, eps, theta)
 
     # -- semantics (mirror ModelConfig::valid in model_config.h) ------------
+    def q_proj_out(self) -> int:
+        return self.n_heads * self.head_dim
+
+    def kv_proj_out(self) -> int:
+        return self.n_kv_heads * self.head_dim
+
     def valid(self) -> bool:
         if self.hidden_size <= 0 or self.n_heads <= 0 or self.n_kv_heads <= 0:
             return False
@@ -114,13 +120,16 @@ class ModelConfig:
             return False
         if self.n_heads % self.n_kv_heads != 0:
             return False
-        if self.hidden_size % self.head_dim != 0:
+        if self.head_dim % 2 != 0:
             return False
+        # W4A16 GEMV: every GEMV K must be a multiple of group_size (128).
+        # K values: H (q/k/v/gate/up), q_proj_out (o_proj), inter (down).
+        # NOTE: hidden_size == n_heads * head_dim is NOT required (v0.1.1).
         if self.hidden_size % self.group_size != 0:
             return False
-        if self.intermediate_size % self.group_size != 0:
+        if self.q_proj_out() % self.group_size != 0:
             return False
-        if self.head_dim % 2 != 0:
+        if self.intermediate_size % self.group_size != 0:
             return False
         return True
 
@@ -134,6 +143,16 @@ class ModelConfig:
     def v01_default(cls) -> "ModelConfig":
         return ModelConfig(
             hidden_size=1024, n_heads=8, n_kv_heads=4, head_dim=128,
+            intermediate_size=2816, group_size=128, max_seq_len=512,
+            eps=cls._f32(1e-5), rope_theta=cls._f32(10000.0),
+        )
+
+    @classmethod
+    def v011_general_test(cls) -> "ModelConfig":
+        # v0.1.1 generalized shape test: q_proj_out = 16*128 = 2048 !=
+        # H = 1024 — proves the plumbing no longer assumes Q width == H.
+        return ModelConfig(
+            hidden_size=1024, n_heads=16, n_kv_heads=8, head_dim=128,
             intermediate_size=2816, group_size=128, max_seq_len=512,
             eps=cls._f32(1e-5), rope_theta=cls._f32(10000.0),
         )
@@ -399,21 +418,26 @@ def _parse_container(raw: bytes, magic: bytes, middle_size: int, label: str):
 # Expected tensor sets (single source of truth; mirrored in the C++ runtime)
 # ---------------------------------------------------------------------------
 def block_tensor_expectations(cfg: ModelConfig):
-    """The 18 decoder-block weight tensors: (name, dtype, dims) tuples."""
-    H, hd, nkv, inter = cfg.hidden_size, cfg.head_dim, cfg.n_kv_heads, cfg.intermediate_size
+    """The 18 decoder-block weight tensors: (name, dtype, dims) tuples.
+
+    Shape contract (docs/weight_format.md): q_proj (q_proj_out, H),
+    k/v_proj (kv_proj_out, H), o_proj (H, q_proj_out) — Q width is
+    independent of hidden_size (v0.1.1)."""
+    H, hd, inter = cfg.hidden_size, cfg.head_dim, cfg.intermediate_size
+    qo, kv = cfg.q_proj_out(), cfg.kv_proj_out()
     return [
         ("attn_norm.weight", DT_FP16, (H,)),
         ("ffn_norm.weight", DT_FP16, (H,)),
         ("attn.rope_cos", DT_FP16, (cfg.max_seq_len, hd // 2)),
         ("attn.rope_sin", DT_FP16, (cfg.max_seq_len, hd // 2)),
-        ("attn.q_proj.weight", DT_INT4_PACKED, (H, H // 2)),
-        ("attn.q_proj.scale", DT_FP16_SCALE, (H, H // 128)),
-        ("attn.k_proj.weight", DT_INT4_PACKED, (nkv * hd, H // 2)),
-        ("attn.k_proj.scale", DT_FP16_SCALE, (nkv * hd, H // 128)),
-        ("attn.v_proj.weight", DT_INT4_PACKED, (nkv * hd, H // 2)),
-        ("attn.v_proj.scale", DT_FP16_SCALE, (nkv * hd, H // 128)),
-        ("attn.o_proj.weight", DT_INT4_PACKED, (H, H // 2)),
-        ("attn.o_proj.scale", DT_FP16_SCALE, (H, H // 128)),
+        ("attn.q_proj.weight", DT_INT4_PACKED, (qo, H // 2)),
+        ("attn.q_proj.scale", DT_FP16_SCALE, (qo, H // 128)),
+        ("attn.k_proj.weight", DT_INT4_PACKED, (kv, H // 2)),
+        ("attn.k_proj.scale", DT_FP16_SCALE, (kv, H // 128)),
+        ("attn.v_proj.weight", DT_INT4_PACKED, (kv, H // 2)),
+        ("attn.v_proj.scale", DT_FP16_SCALE, (kv, H // 128)),
+        ("attn.o_proj.weight", DT_INT4_PACKED, (H, qo // 2)),
+        ("attn.o_proj.scale", DT_FP16_SCALE, (H, qo // 128)),
         ("mlp.gate_proj.weight", DT_INT4_PACKED, (inter, H // 2)),
         ("mlp.gate_proj.scale", DT_FP16_SCALE, (inter, H // 128)),
         ("mlp.up_proj.weight", DT_INT4_PACKED, (inter, H // 2)),
@@ -427,17 +451,18 @@ def golden_tensor_expectations(cfg: ModelConfig, position: int):
     """The 18 golden tensors: 16 stage outputs + the full KV state after the
     write at `position`. Stages are flat batch-1 rows [1, X] in the exact
     layout the runtime produces (see docs/weight_format.md)."""
-    H, hd, nkv, inter = cfg.hidden_size, cfg.head_dim, cfg.n_kv_heads, cfg.intermediate_size
-    kv_rows = nkv * (position + 1)
+    H, hd, inter = cfg.hidden_size, cfg.head_dim, cfg.intermediate_size
+    qo, kv = cfg.q_proj_out(), cfg.kv_proj_out()
+    kv_rows = cfg.n_kv_heads * (position + 1)
     return [
         ("stage.input", DT_FP16, (1, H)),
         ("stage.rmsnorm1", DT_FP16, (1, H)),
-        ("stage.q", DT_FP16, (1, H)),
-        ("stage.k", DT_FP16, (1, nkv * hd)),
-        ("stage.v", DT_FP16, (1, nkv * hd)),
-        ("stage.rope_q", DT_FP16, (1, H)),
-        ("stage.rope_k", DT_FP16, (1, nkv * hd)),
-        ("stage.attention_output", DT_FP16, (1, H)),
+        ("stage.q", DT_FP16, (1, qo)),
+        ("stage.k", DT_FP16, (1, kv)),
+        ("stage.v", DT_FP16, (1, kv)),
+        ("stage.rope_q", DT_FP16, (1, qo)),
+        ("stage.rope_k", DT_FP16, (1, kv)),
+        ("stage.attention_output", DT_FP16, (1, qo)),
         ("stage.output_projection", DT_FP16, (1, H)),
         ("stage.residual1", DT_FP16, (1, H)),
         ("stage.rmsnorm2", DT_FP16, (1, H)),
