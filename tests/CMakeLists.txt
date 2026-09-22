@@ -92,6 +92,18 @@ if(CUDALM_PYTHON3)
             COMMAND test_golden_file ${CUDALM_GOLDEN_P0} ${CUDALM_GOLDEN_P7})
   set_tests_properties(test_golden_file PROPERTIES
     FIXTURES_REQUIRED cudalm_golden)
+
+  # --- End-to-end decoder block golden test (M8) ----------------------------
+  # Runs DecoderBlock::forward at position 0 and position 7 and compares all
+  # 16 stage tensors (tolerance 1e-2) + KV states (bit-exact) against the
+  # CUDLMG01 goldens, plus the p=0 rope-identity invariants.
+  add_executable(test_decoder_block cuda/test_decoder_block.cpp)
+  target_link_libraries(test_decoder_block PRIVATE cudalm)
+  add_test(NAME test_decoder_block
+            COMMAND test_decoder_block ${CUDALM_CROSSLANG_WEIGHTS}
+                    ${CUDALM_GOLDEN_P0} ${CUDALM_GOLDEN_P7})
+  set_tests_properties(test_decoder_block PROPERTIES
+    FIXTURES_REQUIRED "cudalm_weights;cudalm_golden")
 else()
   message(STATUS "python3 not found: cross-language weight tests disabled")
 endif()
