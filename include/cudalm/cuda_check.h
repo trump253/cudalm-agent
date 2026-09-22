@@ -46,3 +46,18 @@ namespace cudalm {
 // Check for launch errors after a kernel launch (`<<<>>>` itself cannot be
 // checked directly). Must be the first CUDA check after a launch.
 #define CUDA_CHECK_LAUNCH() CUDA_CHECK(cudaGetLastError())
+
+// Host-side contract precondition for kernels (shape/alignment), i.e. not a
+// CUDA call. Same fatal-and-abort model as CUDA_CHECK: v0.1 has no
+// error-returning path. `msg` is a string literal describing the contract.
+#define CUDALM_PRECONDITION(cond, msg)                                  \
+  do {                                                                  \
+    if (!(cond)) {                                                      \
+      std::fprintf(stderr,                                              \
+                   "[cudalm] precondition violated: %s\n"               \
+                   "  expression : %s\n"                                \
+                   "  file       : %s:%d\n",                            \
+                   (msg), #cond, __FILE__, __LINE__);                   \
+      std::abort();                                                     \
+    }                                                                   \
+  } while (0)
