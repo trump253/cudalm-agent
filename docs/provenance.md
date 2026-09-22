@@ -21,7 +21,7 @@ any deviation from the upstream body is called out in the table.
 
 | CUDALM file | Upstream file (commit `cb6a6a9`) | Original kernel | CUDALM port commit | Deviations |
 |-------------|----------------------------------|-----------------|--------------------|------------|
-| _(filled in as ports land)_ | | | | |
+| `src/kernels/rmsnorm.cu`, `include/cudalm/kernels/rmsnorm.h` (`rmsnorm_fp16`) | `kernels/rmsnorm/rmsnorm_v4.cu` (`rmsnorm_v4_half_kernel` + `launch_half` + `v4_precheck` fp16 branch) | `rmsnorm_v4` (v4_vec_reg) fp16 specialization | `80e4a7b` | Mechanical only: PyTorch host layer (`at::Tensor`, `TORCH_CHECK`, `getCurrentCUDAStream`, `C10_CUDA_KERNEL_LAUNCH_CHECK`) replaced by raw pointers + `cudaStream_t` + `CUDALM_PRECONDITION` + `CUDA_CHECK_LAUNCH`; the fp32 specialization is not ported (v0.1 is fp16-only). Kernel math/control flow (256-thread block, register-resident x, `PER = H/256` ∈ {4,8,16,32}, float4/half2 vector loads, warp shfl + `rsqrtf(v/H + eps)`, fp16 RNE store) is preserved 1:1, including the strict pre-check with no scalar fallback |
 
 ## Carried contracts (offline tooling, not kernel ports)
 
