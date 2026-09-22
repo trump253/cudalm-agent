@@ -41,4 +41,8 @@ These have no CUDALab provenance; they are written from the v0.1 spec:
 format/loader, KV cache, attention pipeline, elementwise ops (add,
 silu_mul), and the decoder-block wiring (`decoder_block.h/.cpp`, code
 commit `beeebb6`) plus its end-to-end golden test
-(`tests/cuda/test_decoder_block.cpp`).
+(`tests/cuda/test_decoder_block.cpp`), the per-stage CUDA-event timing API
+(`DecoderBlock::forwardTimed` / `stage_names`, code commit `bc7e430`), and
+the latency benchmark (`benchmarks/bench_decoder_block.cpp`) with its
+memcheck evidence (`benchmarks/sanitizer_decoder_block.txt`) and result
+JSONs (`benchmarks/results/`).
