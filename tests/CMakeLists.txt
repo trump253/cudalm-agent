@@ -10,6 +10,7 @@ cudalm_add_test(test_cuda_smoke test_cuda_smoke cuda/test_cuda_smoke.cpp)
 cudalm_add_test(test_elementwise_rmsnorm test_elementwise_rmsnorm cuda/test_elementwise_rmsnorm.cpp)
 cudalm_add_test(test_int4_gemv test_int4_gemv cuda/test_int4_gemv.cpp)
 cudalm_add_test(test_rope test_rope cuda/test_rope.cpp)
+cudalm_add_test(test_kv_cache test_kv_cache cuda/test_kv_cache.cpp)
 
 # --- Cross-language weight-file tests (Python tools -> C++ loader) ------------
 # tools/convert_weights.py (torch, offline) emits data/block_v01.cudalm into
