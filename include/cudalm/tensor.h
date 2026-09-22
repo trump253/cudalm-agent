@@ -20,6 +20,7 @@ enum class Dtype : std::uint8_t {
   kInt4Packed = 2,  // 1 byte per 2 elements (packed)
   kFp16Scale = 3,   // 2 bytes per element (group scale)
   kFp32 = 4,        // 4 bytes per element
+  kBf16 = 5,        // 2 bytes per element (v0.2, .cudalm v2 only)
 };
 
 // Bytes per logical element. For kInt4Packed this returns 1 (the shape is
@@ -33,6 +34,8 @@ inline std::size_t dtype_element_bytes(Dtype d) {
       return 1;
     case Dtype::kFp32:
       return 4;
+    case Dtype::kBf16:
+      return 2;
   }
   return 0;
 }
@@ -43,6 +46,7 @@ inline const char* dtype_name(Dtype d) {
     case Dtype::kInt4Packed: return "int4_packed";
     case Dtype::kFp16Scale: return "fp16_scale";
     case Dtype::kFp32: return "fp32";
+    case Dtype::kBf16: return "bf16";
   }
   return "unknown";
 }

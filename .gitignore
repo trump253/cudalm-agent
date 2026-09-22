@@ -22,6 +22,11 @@ gen/
 *.cudalm
 *.cudalm_golden
 
+# Official model checkpoints — never tracked (see docs/qwen35_architecture.md
+# §1.1; files live in /root/models/ outside this repo).
+models/
+*.safetensors
+
 # Editors
 .vscode/
 .idea/

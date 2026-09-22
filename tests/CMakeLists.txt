@@ -5,6 +5,10 @@
 cudalm_add_test(test_bootstrap_cpu test_bootstrap_cpu cpu/test_bootstrap_cpu.cpp)
 cudalm_add_test(test_weight_file_cpu test_weight_file_cpu cpu/test_weight_file.cpp)
 
+# v0.2: Qwen3.5 hybrid-decoder configuration contract (pinned 0.8B values,
+# derived dims, hybrid schedule, validity rules, 88-byte config blob).
+cudalm_add_test(test_qwen35_config test_qwen35_config cpu/test_qwen35_config.cpp)
+
 # --- CUDA tests ---------------------------------------------------------------
 cudalm_add_test(test_cuda_smoke test_cuda_smoke cuda/test_cuda_smoke.cpp)
 cudalm_add_test(test_elementwise_rmsnorm test_elementwise_rmsnorm cuda/test_elementwise_rmsnorm.cpp)
@@ -19,6 +23,20 @@ cudalm_add_test(test_attention test_attention cuda/test_attention.cpp)
 # loader and pins the quantization/RoPE invariants. Python is a tool-only
 # dependency; when it is absent the cross-language tests are skipped.
 find_program(CUDALM_PYTHON3 NAMES python3)
+# Tool python: prefers the standalone venv (torch + safetensors + numpy);
+# falls back to system python3 (stdlib-only tools still work there).
+find_program(CUDALM_TOOL_PYTHON3 NAMES python3 HINTS /root/py311/venv/bin)
+if(NOT CUDALM_TOOL_PYTHON3)
+  set(CUDALM_TOOL_PYTHON3 ${CUDALM_PYTHON3})
+endif()
+if(CUDALM_TOOL_PYTHON3)
+  execute_process(
+    COMMAND ${CUDALM_TOOL_PYTHON3} -c "import torch, safetensors, numpy"
+    RESULT_VARIABLE CUDALM_TOOL_PY_ROI_OK
+    OUTPUT_QUIET ERROR_QUIET)
+else()
+  set(CUDALM_TOOL_PY_ROI_OK 1)
+endif()
 
 if(CUDALM_PYTHON3)
   set(CUDALM_CROSSLANG_WEIGHTS ${CMAKE_BINARY_DIR}/data/block_v01.cudalm)
@@ -154,6 +172,56 @@ if(CUDALM_PYTHON3)
                     ${CUDALM_GENERAL_GOLDEN_P0} ${CUDALM_GENERAL_GOLDEN_P7})
   set_tests_properties(test_decoder_block_general PROPERTIES
     FIXTURES_REQUIRED cudalm_weights_general)
+
+  # --- v0.2: .cudalm v2 container cross-language format test -----------------
+  # tests/fixtures/gen_v2_format.py (stdlib Python, tools/common/cudalm_v2.py)
+  # emits one fully valid synthetic file + 13 corruption cases; the C++ reader
+  # must accept exactly the valid one. Stdlib-only, so system python3 suffices.
+  set(CUDALM_V2_FORMAT_DIR ${CMAKE_BINARY_DIR}/data/v2format)
+  add_custom_command(
+    OUTPUT ${CUDALM_V2_FORMAT_DIR}/valid.cudalm
+    COMMAND ${CUDALM_PYTHON3} ${CMAKE_SOURCE_DIR}/tests/fixtures/gen_v2_format.py
+            ${CUDALM_V2_FORMAT_DIR}
+    DEPENDS ${CMAKE_SOURCE_DIR}/tests/fixtures/gen_v2_format.py
+            ${CMAKE_SOURCE_DIR}/tools/common/cudalm_v2.py
+    COMMENT "gen_v2_format: generating ${CUDALM_V2_FORMAT_DIR}"
+    VERBATIM)
+  add_custom_target(gen_v2_format_fixture DEPENDS ${CUDALM_V2_FORMAT_DIR}/valid.cudalm)
+
+  add_test(NAME gen_v2_format_fixture
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target gen_v2_format_fixture)
+  set_tests_properties(gen_v2_format_fixture PROPERTIES FIXTURES_SETUP cudalm_v2_format)
+
+  add_executable(test_cudalm_v2_format cpu/test_cudalm_v2_format.cpp)
+  target_link_libraries(test_cudalm_v2_format PRIVATE cudalm)
+  add_test(NAME test_cudalm_v2_format
+           COMMAND test_cudalm_v2_format ${CUDALM_V2_FORMAT_DIR})
+  set_tests_properties(test_cudalm_v2_format PROPERTIES
+    FIXTURES_REQUIRED cudalm_v2_format)
+
+  # --- v0.2: Qwen3.5 real-checkpoint ingestion (torch tool python) -----------
+  # Requires the pinned checkpoint in /root/models (never committed) and a
+  # tool python with torch + safetensors + numpy. The test self-skips (77)
+  # when the checkpoint is absent.
+  if(CUDALM_TOOL_PY_ROI_OK EQUAL 0)
+    add_test(NAME test_convert_qwen35_selftest
+             COMMAND ${CUDALM_TOOL_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/convert_qwen35.py
+                     --selftest)
+
+    add_executable(test_qwen35_ingestion_real cpu/test_qwen35_ingestion_real.cpp)
+    target_link_libraries(test_qwen35_ingestion_real PRIVATE cudalm)
+    add_test(NAME test_qwen35_ingestion_real
+             COMMAND test_qwen35_ingestion_real
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_microstack.cudalm
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR})
+    set_tests_properties(test_qwen35_ingestion_real PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 900)
+  else()
+    message(STATUS "tool python lacks torch/safetensors/numpy: "
+                   "qwen35 ingestion tests disabled")
+  endif()
 else()
   message(STATUS "python3 not found: cross-language weight tests disabled")
 endif()

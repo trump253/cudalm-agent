@@ -23,7 +23,7 @@ backlog).
 | model repo | `Qwen/Qwen3.5-0.8B-Base` |
 | revision | branch `main`, commit `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68` |
 | config.json sha256 | `b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204` |
-| model.safetensors | `model.safetensors-00001-of-00001.safetensors`, 1,746,942,600 bytes, sha256 recorded in `data/qwen35/provenance.json` after download |
+| model.safetensors | `model.safetensors-00001-of-00001.safetensors`, 1,746,942,600 bytes, sha256 `c2b1e5a17d9c1e27685d92ed9b382911ebb99955ecd89052d1721241adfbab6c` (also written into every converted `.cudalm` v2 file's `checkpoint_sha256` metadata) |
 | weight index | `model.safetensors.index.json`, 488 tensors, `total_size = 1746882752` |
 | transfer channel | `https://hf-mirror.com` (huggingface.co unreachable from this environment; mirror is transport only — fact source is the official repo) |
 | local path | `/root/models/Qwen3.5-0.8B-Base/` (never committed to Git) |
@@ -122,7 +122,7 @@ type: DN DN DN FA DN DN DN FA DN DN DN FA DN DN DN FA DN DN DN FA DN DN DN FA
 | 4 | Full attention: plain q/k/v + RoPE + causal GQA + o_proj | + q/k per-head RMSNorm (zero-centered, over head_dim=256) **before** RoPE; q_proj outputs fused `[q; gate]` (out = 2·n_heads·head_dim); attention output **× sigmoid(gate)** before o_proj; scaling = head_dim^-0.5 = 1/16; softmax in fp32 | **NEW** `Qwen35FullAttentionLayer`; KV-cache layout [n_kv_heads, seq, head_dim] (same spirit as v0.1.1 KvCache) |
 | 5 | No linear-attention primitive | Gated DeltaNet: in_proj_qkv/z/b/a, depthwise causal conv1d (k=4, depthwise, no bias) with persistent conv state, delta-rule recurrence with persistent [16,128,128] fp32 state, gated RMSNorm, out_proj | **NEW** `Qwen35DeltaNetLayer` + `Qwen35DeltaState` |
 | 6 | Single attention type, one `DecoderBlock` | Hybrid schedule 18×DeltaNet + 6×FullAttention; per-layer type dispatch | **NEW** `Qwen35Config` + hybrid micro-stack (v0.2: 4-layer minimum) |
-| 7 | `.cudalm` v1: one block, fp16 + int4, rope tables | v2: architecture id, Qwen35Config blob, layer schedule, arbitrary named tensor table with bf16 dtype, bounds/unique-name validation; **v1 stays immutable** | **NEW** v2 format; v1 loader untouched |
+| 7 | `.cudalm` v1: one block, fp16 + int4, rope tables | v2: architecture id, Qwen35Config blob, layer schedule, arbitrary named tensor table with bf16/fp32 dtypes, bounds/unique-name validation; **v1 stays immutable** | **NEW** v2 format; v1 loader untouched |
 | 8 | W4A16 G=128 from **fp16** source weights | Same packed contract (q∈[-7,7], fp16 scale = amax/7, low nibble = k=2b) but source dtype is **bf16**; scale still stored fp16 (GEMV contract unchanged) | **EXTEND** quantizer (accept bf16); KEEP packed layout + GEMV |
 | 9 | 7 GEMVs per block (q,k,v,o,gate,up,down) | Full-attn layers: same 7 (q_proj N=4096!); DeltaNet layers: in_proj_qkv (N=6144), in_proj_z (N=2048), in_proj_b/in_proj_a (N=16), out_proj (N=1024). All K dims are multiples of 128 ✓ | **EXTEND** GEMV usage (N=16 rows is legal: K=1024) |
 | 10 | KV cache only | + DeltaNet conv state [conv_dim=6144, 3] + recurrent state [16, 128, 128] fp32 per linear layer | **NEW** state ownership |
@@ -161,8 +161,8 @@ DeltaNet layer `i ∉ {3,7,11,15,19,23}` (`linear_attn.*`):
 | `linear_attn.in_proj_b.weight` | [16, 1024] | beta (update gate) input |
 | `linear_attn.conv1d.weight` | [6144, 1, 4] | depthwise causal conv, no bias; kept **bf16** (not a GEMV) |
 | `linear_attn.dt_bias` | [16] | kept bf16 |
-| `linear_attn.A_log` | [16] | kept bf16 |
-| `linear_attn.norm.weight` | [128] | gated RMSNorm weight (plain, init ones) |
+| `linear_attn.A_log` | [16] | **fp32** in the official checkpoint (verified in safetensors header, all 18 DeltaNet layers); v2 pass-through fp32; official code computes `A_log.float().exp()` so the decay math is fp32 regardless |
+| `linear_attn.norm.weight` | [128] | gated RMSNorm weight (plain, init ones); **fp32** in the official checkpoint; v2 pass-through fp32 |
 | `linear_attn.out_proj.weight` | [1024, 2048] | |
 
 Every layer (both types):
@@ -203,8 +203,12 @@ layer) → packed int4 + fp16 scale, G=128 symmetric, source dtype bf16:
 | in_proj_b / in_proj_a | 16 | 1024 | ✓ |
 | out_proj (deltanet) | 1024 | 2048 | ✓ |
 
-Non-GEMV bf16 tensors (norms, conv1d, dt_bias, A_log, embed_tokens): stored
-bf16 in the v2 file, unmodified.
+Non-GEMV bf16 tensors (layernorms, q/k_norm, conv1d, dt_bias,
+embed_tokens): stored bf16 in the v2 file, unmodified. Two tensors are
+stored fp32 in the official checkpoint — `linear_attn.A_log` [16] and
+`linear_attn.norm.weight` [128] (per-head gated-norm weight) — and are
+stored fp32 in the v2 file, unmodified. (dtype ground truth read from the
+checkpoint's safetensors header, consistent across all 24 layers.)
 
 Quantization (extends v1 contract, bf16 source):
 `scale32 = amax(group)/7` (fp32); `q = clamp(round-half-to-even(W/scale32),
@@ -253,16 +257,19 @@ y = (x_f32 · rsqrt(mean(x_f32²) + eps) · (1 + w_f32)).to(input_dtype)
 
 ### 6.2 Gated RMSNorm (`Qwen3_5RMSNormGated`) — DeltaNet output only
 
-Exact official dtype flow (bf16 model), x and gate have last dim 128:
+Exact official dtype flow, x and gate have last dim 128:
 
 ```
-1. n    = (x.to(f32) · rsqrt(mean(x.to(f32)²) + eps)).to(bf16)
-2. a    = (w_bf16 · n)                     # bf16 multiply, w plain (init ones)
-3. y    = (a.to(f32) · silu(gate.to(f32))).to(bf16)
+1. n = (x.to(f32) · rsqrt(mean(x.to(f32)²) + eps)).to(bf16)
+2. a = w · n                                # w = norm.weight (stored fp32)
+3. y = (a · silu(gate.to(f32))).to(bf16)
 ```
-Note the two internal bf16 roundings (after the norm, after the weight
-multiply) — the CUDA kernel must mirror them exactly, not just the fp32
-ideal.
+`w` is stored **fp32** in the official checkpoint, so step 2 in the official
+torch code promotes to fp32 (the only internal rounding is the bf16 cast in
+step 1); had the loader cast `w` to bf16, step 2 would be a bf16 multiply.
+The Phase B golden reference pins which case the runtime must match (the v2
+file keeps `w` fp32 byte-exact either way). The CUDA kernel must mirror the
+pinned flow's rounding points exactly, not just the fp32 ideal.
 
 ---
 
