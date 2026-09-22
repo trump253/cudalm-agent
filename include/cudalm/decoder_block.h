@@ -42,6 +42,12 @@ class DecoderBlock {
   // stage_names in src/runtime/decoder_block.cpp for the mapping.
   static constexpr int kNumStages = 17;
 
+  // Events required by forwardTimed(): 2 per stage plus one start/stop
+  // pair around the ENTIRE forward's GPU work (whole-block timing;
+  // covers the host-side position-vector construct + H2D copy that falls
+  // between stages).
+  static constexpr int kNumTimingEvents = 2 * kNumStages + 2;
+
   // One decode step at 0-based `position`. `x_in` is a device fp16
   // [hidden_size] buffer (the current token's hidden state).
   //
@@ -49,12 +55,19 @@ class DecoderBlock {
   // 0 <= position < max_seq_len.
   void forward(int position, const __half* x_in, cudaStream_t stream);
 
-  // Same pipeline as forward(), but records one CUDA-event pair per stage
-  // (2*kNumStages events, caller-created with cudaEventCreate) and stores
-  // the per-stage elapsed time in microseconds into stage_us[kNumStages].
+  // Same pipeline as forward(), but records CUDA events and stores elapsed
+  // times in microseconds:
+  //   * one event pair per stage -> stage_us[kNumStages]
+  //   * one event pair around the entire forward's GPU work ->
+  //     *whole_block_us. This is the true whole-block GPU time: it spans
+  //     from before stage 0 to after the final stage, so it includes GPU
+  //     work that is NOT covered by any single stage (notably the
+  //     position-vector H2D copy enqueued between the input and rmsnorm
+  //     stages). Summing stage_us[] alone UNDERCOUNTS the block.
+  // `events` must hold kNumTimingEvents caller-created events (cudaEventCreate).
   // Synchronizes the stream so all event pairs are complete on return.
   void forwardTimed(int position, const __half* x_in, cudaStream_t stream,
-                    cudaEvent_t* events, float* stage_us);
+                    cudaEvent_t* events, float* stage_us, float* whole_block_us);
 
   // Names of the 17 timed stages, in order (shared with the benchmark).
   static const char* const* stage_names();

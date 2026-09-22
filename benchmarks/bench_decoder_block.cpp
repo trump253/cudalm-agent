@@ -1,8 +1,21 @@
-// CUDALM — decoder-block latency breakdown benchmark (M9). CUDALM-native.
+// CUDALM — decoder-block latency breakdown benchmark (M9, v0.1.1 schema).
+// CUDALM-native.
 //
-// Measures one DecoderBlock::forward step with CUDA events (one start/stop
-// pair per pipeline stage via DecoderBlock::forwardTimed) and writes a JSON
-// report with per-stage mean/min/max/p50 (microseconds) plus the total.
+// Measures one DecoderBlock::forward step with CUDA events via
+// DecoderBlock::forwardTimed and writes a JSON report with three timing
+// views (all microseconds):
+//   * stages:            one start/stop event pair per pipeline stage
+//   * stage_sum_us:      sum of the 17 per-stage event durations per iter;
+//                        EXCLUDES GPU work no stage covers (the position
+//                        vector construct + H2D copy enqueued between
+//                        stages)
+//   * whole_block_gpu_us: one event pair around the ENTIRE forward's GPU
+//                        work; the true whole-block GPU time
+//   * host_api_wall_us:  CPU wall-clock around the forwardTimed() call
+//                        (includes the stream sync)
+// One decode step of ONE decoder block is NOT a model token: the rate
+// metric is therefore block_steps_per_second_mean, based on
+// whole_block_gpu_us (see docs + README).
 //
 // Usage:
 //   bench_decoder_block <block_v01.cudalm> <position> [iters] [out.json]
@@ -16,6 +29,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -114,43 +128,77 @@ int main(int argc, char** argv) {
 
   DecoderBlock block(weights, stream);
 
-  // Events: 2 per stage.
-  std::vector<cudaEvent_t> events(DecoderBlock::kNumStages * 2);
+  // Events: 2 per stage + the whole-block pair.
+  std::vector<cudaEvent_t> events(DecoderBlock::kNumTimingEvents);
   for (auto& e : events) CUDA_CHECK(cudaEventCreate(&e));
   std::vector<float> stage_us(DecoderBlock::kNumStages);
   std::vector<std::vector<float>> samples(DecoderBlock::kNumStages,
                                           std::vector<float>(iters));
 
+  std::vector<float> whole_us(iters);  // whole-block GPU time per iter
+  std::vector<float> wall_us(iters);   // host wall-clock per iter
+
   const int warmup = 5;
   for (int i = 0; i < warmup; ++i) {
-    block.forwardTimed(position, dx, stream, events.data(), stage_us.data());
+    float wb = 0.f;
+    block.forwardTimed(position, dx, stream, events.data(), stage_us.data(),
+                       &wb);
   }
   for (int i = 0; i < iters; ++i) {
-    block.forwardTimed(position, dx, stream, events.data(), stage_us.data());
+    const auto t0 = std::chrono::steady_clock::now();
+    block.forwardTimed(position, dx, stream, events.data(), stage_us.data(),
+                       &whole_us[i]);
+    const auto t1 = std::chrono::steady_clock::now();
+    wall_us[i] =
+        std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(
+            t1 - t0)
+            .count();
     for (int s = 0; s < DecoderBlock::kNumStages; ++s)
       samples[s][i] = stage_us[s];
   }
 
   // Stats per stage.
   std::vector<StageStats> stats(DecoderBlock::kNumStages);
-  double total_mean = 0.0, total_min = 1e30, total_max = 0.0;
-  std::vector<float> totals(iters);
+
+  // stage_sum_us: per-iter sum of the 17 per-stage event durations.
+  // EXCLUDES GPU work no stage covers (the position-vector H2D copy
+  // enqueued between stages) — a breakdown subtotal, not the block
+  // latency.
+  std::vector<float> stage_sums(iters);
   for (int i = 0; i < iters; ++i) {
     float t = 0.f;
     for (int s = 0; s < DecoderBlock::kNumStages; ++s) t += samples[s][i];
-    totals[i] = t;
+    stage_sums[i] = t;
   }
-  std::sort(totals.begin(), totals.end());
+  std::vector<float> ss_sorted = stage_sums;
+  std::sort(ss_sorted.begin(), ss_sorted.end());
+  double ss_mean = 0.0, ss_min = 1e30, ss_max = 0.0;
   for (int i = 0; i < iters; ++i) {
-    total_mean += totals[i];
-    total_min = std::min(total_min, static_cast<double>(totals[i]));
-    total_max = std::max(total_max, static_cast<double>(totals[i]));
+    ss_mean += stage_sums[i];
+    ss_min = std::min(ss_min, static_cast<double>(stage_sums[i]));
+    ss_max = std::max(ss_max, static_cast<double>(stage_sums[i]));
   }
-  total_mean /= iters;
+  ss_mean /= iters;
+
+  // whole_block_gpu_us / host_api_wall_us: mean/min/max/p50.
+  struct Metric { double mean; double min; double max; float p50; };
+  auto metric = [&](const std::vector<float>& v) -> Metric {
+    std::vector<float> s = v;
+    std::sort(s.begin(), s.end());
+    double m = 0.0, mn = 1e30, mx = 0.0;
+    for (int i = 0; i < iters; ++i) {
+      m += v[i];
+      mn = std::min(mn, static_cast<double>(v[i]));
+      mx = std::max(mx, static_cast<double>(v[i]));
+    }
+    return Metric{m / iters, mn, mx, s[iters / 2]};
+  };
+  const Metric wb = metric(whole_us);
+  const Metric wl = metric(wall_us);
 
   std::vector<std::string> lines;
   lines.push_back("{");
-  lines.push_back("  \"cudalm\": \"v0.1 decoder block latency breakdown\",");
+  lines.push_back("  \"cudalm\": \"v0.1.1 decoder block latency breakdown\",");
   lines.push_back("  \"device\": \"" + json_escape(prop.name) + "\",");
   {
     lines.push_back("  \"config\": {");
@@ -170,7 +218,8 @@ int main(int argc, char** argv) {
   lines.push_back("  \"position\": " + std::to_string(position) + ",");
   lines.push_back("  \"iters\": " + std::to_string(iters) + ",");
   lines.push_back("  \"warmup\": " + std::to_string(warmup) + ",");
-  lines.push_back("  \"units\": \"microseconds (CUDA events)\",");
+  lines.push_back("  \"units\": \"microseconds (stages + whole_block_gpu: "
+                  "CUDA events; host_api_wall: CPU wall-clock)\",");
   lines.push_back("  \"stages\": [");
   const char* const* names = DecoderBlock::stage_names();
   for (int s = 0; s < DecoderBlock::kNumStages; ++s) {
@@ -197,17 +246,50 @@ int main(int argc, char** argv) {
   {
     char buf[256];
     std::snprintf(buf, sizeof(buf),
-                  "  \"total\": {\"mean_us\": %.3f, \"min_us\": %.3f, "
-                  "\"max_us\": %.3f, \"p50_us\": %.3f},",
-                  total_mean, total_min, total_max,
-                  static_cast<double>(totals[iters / 2]));
+                  "  \"stage_sum_us\": {\"mean_us\": %.3f, \"min_us\": "
+                  "%.3f, \"max_us\": %.3f, \"p50_us\": %.3f},",
+                  ss_mean, ss_min, ss_max,
+                  static_cast<double>(ss_sorted[iters / 2]));
     lines.push_back(buf);
   }
   {
-    char buf[128];
+    char buf[256];
     std::snprintf(buf, sizeof(buf),
-                  "  \"tokens_per_second_mean\": %.1f",
-                  1e6 / total_mean);
+                  "  \"whole_block_gpu_us\": {\"mean_us\": %.3f, "
+                  "\"min_us\": %.3f, \"max_us\": %.3f, \"p50_us\": %.3f},",
+                  wb.mean, wb.min, wb.max,
+                  static_cast<double>(wb.p50));
+    lines.push_back(buf);
+  }
+  {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "  \"host_api_wall_us\": {\"mean_us\": %.3f, \"min_us\": "
+                  "%.3f, \"max_us\": %.3f, \"p50_us\": %.3f},",
+                  wl.mean, wl.min, wl.max,
+                  static_cast<double>(wl.p50));
+    lines.push_back(buf);
+  }
+  lines.push_back("  \"timing_semantics\": {");
+  lines.push_back("    \"stage_sum_us\": \"sum of the 17 per-stage CUDA-"
+                  "event durations; excludes GPU work no stage covers "
+                  "(position-vector construct + H2D copy), NOT a "
+                  "whole-block latency\",");
+  lines.push_back("    \"whole_block_gpu_us\": \"one CUDA-event pair around "
+                  "the entire forward GPU work; true whole-block GPU "
+                  "time\",");
+  lines.push_back("    \"host_api_wall_us\": \"CPU wall-clock around the "
+                  "forwardTimed() call, including stream "
+                  "synchronization\"");
+  lines.push_back("  },");
+  {
+    char buf[128];
+    // One decode step of ONE decoder block is not a model token; the rate
+    // is per whole-block GPU step (v0.1.1 rename of the old
+    // tokens_per_second_mean).
+    std::snprintf(buf, sizeof(buf),
+                  "  \"block_steps_per_second_mean\": %.1f",
+                  1e6 / wb.mean);
     lines.push_back(buf);
   }
   lines.push_back("}");

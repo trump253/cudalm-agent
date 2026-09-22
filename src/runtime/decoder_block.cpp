@@ -10,8 +10,10 @@
 // so the KV write happens before the attention call.
 //
 // M9: forwardTimed() records one CUDA-event pair per stage (17 stages)
-// for the block latency breakdown; forward() is the same pipeline with
-// events == nullptr (no event traffic).
+// for the block latency breakdown, plus one pair (events[2*kNumStages]
+// / [2*kNumStages+1]) around the entire forward's GPU work — the true
+// whole-block GPU time, which includes work no stage covers (v0.1.1);
+// forward() is the same pipeline with events == nullptr (no event traffic).
 
 #include "cudalm/decoder_block.h"
 
@@ -29,8 +31,9 @@ namespace cudalm {
 namespace {
 std::size_t halves_bytes(std::size_t n) { return n * sizeof(__half); }
 
-// Record event #idx (0..2*kNumStages-1) if timing is active. Stage s
-// runs between events[2s] (recorded before) and events[2s+1] (after).
+// Record event #idx if timing is active. Stage s runs between events[2s]
+// (recorded before) and events[2s+1] (after). The whole-block pair uses
+// idx = 2*kNumStages (start) and 2*kNumStages+1 (end).
 inline void rec(cudaEvent_t* events, int idx, cudaStream_t stream) {
   if (events != nullptr) CUDA_CHECK(cudaEventRecord(events[idx], stream));
 }
@@ -84,7 +87,7 @@ void DecoderBlock::forward(int position, const __half* x_in,
 
 void DecoderBlock::forwardTimed(int position, const __half* x_in,
                                 cudaStream_t stream, cudaEvent_t* events,
-                                float* stage_us) {
+                                float* stage_us, float* whole_block_us) {
   forwardImpl(position, x_in, stream, events);
   CUDA_CHECK(cudaStreamSynchronize(stream));
   for (int i = 0; i < kNumStages; ++i) {
@@ -92,6 +95,12 @@ void DecoderBlock::forwardTimed(int position, const __half* x_in,
     CUDA_CHECK(cudaEventElapsedTime(&ms, events[2 * i], events[2 * i + 1]));
     stage_us[i] = ms * 1000.0f;  // cudaEventElapsedTime is ms; API is us.
   }
+  // Whole-block pair: spans all GPU work enqueued by this forward,
+  // including the inter-stage position H2D copy the stage pairs miss.
+  float wms = 0.f;
+  CUDA_CHECK(cudaEventElapsedTime(&wms, events[2 * kNumStages],
+                                  events[2 * kNumStages + 1]));
+  *whole_block_us = wms * 1000.0f;
 }
 
 void DecoderBlock::forwardImpl(int position, const __half* x_in,
@@ -105,6 +114,11 @@ void DecoderBlock::forwardImpl(int position, const __half* x_in,
   const int n_heads = cfg_.n_heads;
   const int n_kv = cfg_.n_kv_heads;
   const int inter = cfg_.intermediate_size;
+
+  // Whole-block timing start: everything this forward enqueues on the
+  // stream (all 17 stages + the inter-stage position H2D copy) falls
+  // between this event and the end event recorded at the bottom.
+  rec(events, 2 * kNumStages, stream);
 
   // 0) stage.input
   rec(events, 0, stream);
@@ -210,6 +224,9 @@ void DecoderBlock::forwardImpl(int position, const __half* x_in,
   add_fp16(res1_.data<__half>(), down_.data<__half>(), final_.data<__half>(),
            H, stream);
   rec(events, 33, stream);
+
+  // Whole-block timing end (matches the start event above).
+  rec(events, 2 * kNumStages + 1, stream);
 }
 
 }  // namespace cudalm
