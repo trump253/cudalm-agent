@@ -230,6 +230,13 @@ From pinned `Qwen3_5TextRotaryEmbedding` + `apply_rotary_pos_emb`:
   `emb = [freqs(32), freqs(32)]` (64 = 2×32);
   `x_rot = x[0:64]`; `q' = q_rot·cos + rotate_half(q_rot)·sin` where
   `rotate_half(z) = [-z[32:64], z[0:32]]`; dims 64..255 pass through unchanged
+- **Per-element frequency map (locked):** element `d` (0..63) of the rotated
+  part uses `freqs[d % 32]` and pairs with element `d ± 32` across the
+  halves — the replicated layout of `emb = cat(freqs, freqs)`. This is NOT
+  the interleaved `(2j, 2j+1)`-share-`freqs[j]` convention. The p=0 identity
+  holds under either convention; only the p>0 golden gate distinguishes
+  them (the interleaved indexing was caught there and fixed in
+  `qwen35_partial_rope_bf16` before Phase B sign-off)
 - cos/sin computed in **fp32**, then **cast to bf16** before the multiply
   (official: `cos.to(dtype=x.dtype)`); the q·cos + rot·sin addition happens in
   bf16
@@ -412,16 +419,62 @@ no-torch.
    q/k after norm, after RoPE, attention gate/output, DeltaNet conv state /
    g / beta / recurrent state (before+after), FFN outputs, final output, KV
    state
-6. writes a `CUDLMG02`-style golden container (same spirit as CUDLMG01)
+6. writes a `CUDLMG02` golden container (see below)
 
 **A/B split (hard gate vs report):**
 - A. runtime correctness: CUDALM runtime (quantized weights + golden-seeded
   states) vs this golden — HARD GATE
 - B. quantization fidelity: official bf16 weights vs quantized reference
-  (max_abs, RMSE, cosine per weight tensor + layer outputs) — REPORT ONLY
+  (max_abs, RMSE, cosine per weight tensor + layer outputs) — REPORT ONLY,
+  written to a sibling `.fidelity.json` and never mixed into the runtime
+  error numbers
 
 Provenance recorded in the golden: repo, revision, transformers commit,
 transformers version, input seed, positions, dtype, fast-path=off.
+
+### 11.1 CUDLMG02 container (locked)
+
+`magic "CUDLMG02"` | u32 version=1 | u32 flags=0 | u32 n_tensors |
+u32 _pad | 88 B Qwen35Config blob | i32 position | i32 layer_idx |
+i32 input_seed | i32 _reserved | u64 table_offset (=144) |
+u64 payload_offset (16 B-aligned). The table REGION is
+`[table_offset, payload_offset)`: the n records occupy its front and the
+remaining bytes are zero padding (the header carries **no** `table_size`
+field, unlike the v2 weight container; readers parse exactly n records and
+require the rest to be zero). Each record: `name_len u8 | name |
+dtype u8 | ndim u8 | pad u16 | dims i64[8] | offset u64 | byte_size u64 |
+align u8 | pad u8`. Payload tensor blobs follow in table order, offsets from
+`payload_offset`, each 16 B-aligned.
+
+Tensors (23 stage tensors + KV state), all bf16 unless noted:
+`stage.{input,rmsnorm1,q_gate,q,att_gate,k,v,q_norm,k_norm,rope_q,rope_k,
+attention_raw,attention_gated,o_proj,residual1,rmsnorm2,mlp_gate,mlp_up,
+silu_mul,mlp_down,final_output}` plus `kv.k_state` / `kv.v_state` with
+`[n_kv*(position+1), head_dim]` row order `(kv_head, position)` — the
+history rows are what the runtime seeds its cache from, so the KV round-trip
+is checked bit-exact.
+
+**Oracle rounding contract** (mirrored 1:1 by the runtime, this is why the
+hard gate is bit-exact at p=0 and within 1 bf16 ulp at p>0): GEMV = fp32
+accumulate → one bf16 RNE; zero-centered RMSNorm = all-fp32 chain → one bf16
+cast; RoPE = cos/sin fp32→bf16 **before** the multiply, then per element
+three bf16 roundings `bf16(x·cos_b)`, `bf16(rot·sin_b)`, `bf16(sum)`;
+attention = bf16 QK matmul (fp32 acc → bf16) × `1/16` (bf16) → fp32
+max-subtract softmax → bf16 → bf16 PV (fp32 acc → bf16); silu = fp32
+`x/(1+exp(-x))` rounded to bf16 **first**, then bf16 multiply; sigmoid the
+same. The QuantLinear in the oracle is an fp32 dequant matmul → one bf16
+cast, so quantization fidelity stays OUT of the hard gate.
+
+**p=0 invariants (bit-exact):** rope_q == q_norm and rope_k == k_norm
+(RoPE at position 0 is the identity vs its inputs, not vs raw q/k); each
+attention_raw head-h row == the v row of KV head `h // num_key_value_groups`
+(probs = [1] exactly); KV rows == the stage copies.
+
+**Stage tolerance:** the C++ `compare_bf16_stages` uses atol=rtol=1e-2.
+The oracle and the runtime agree to ~1 bf16 ulp after each rounding; the
+tolerance absorbs fp32 re-association inside the GEMV/attention matmuls and
+≤1-ulp libm vs torch `cosf/sinf` differences, while still catching any
+O(1) wiring or dtype bug. See `include/cudalm/stage_compare.h`.
 
 ## 12. Milestones
 
@@ -446,3 +499,74 @@ transformers version, input seed, positions, dtype, fast-path=off.
 | conv state shape (kernel-1 = 3) vs docstring `d_conv` | docstring in pinned source is imprecise; empirical layout from `torch_causal_conv1d_update` is authoritative: [conv_dim, 3] |
 | q_proj fused [q;gate] layout misread | pinned source: `view(-1, head_dim*2)` then `chunk(2, dim=-1)` → per-head q then gate; verified against checkpoint shape 4096 |
 | state seeding across quantized vs bf16 reference | golden builds states from the SAME quantized weights the runtime uses (no mixed-state contamination) |
+
+---
+
+## 14. Phase B completion record (Qwen3.5 Full Attention)
+
+Phase B is **DONE** and sign-off-verified. Scope = the Qwen3.5-specific BF16
+runtime path for one full-attention layer (layers 3/7/11/15/19/23), real
+checkpoint weights, real-checkpoint golden PASS at p=0 and p>0 with
+non-zero KV history. DeltaNet (Phase C) and the hybrid micro-stack (Phase D)
+are **NOT started**.
+
+### 14.1 What landed
+
+- `int4_gemv_bf16` (`.h`/`.cu`) — port of the v0.1 `int4_gemv` rowtile4
+  kernel with a BF16 activation/output path (W4A16 G=128, q∈[-7,7], FP16
+  scale, FP32 accumulate, one bf16 RNE store). CUDA 11.8 has no
+  `__bfloat1622float2`, so a `bf162_to_float2` helper is used.
+- `qwen35_kernels` (`.h`/`.cu`) — native BF16 kernels: `qwen35_rmsnorm_zc_bf16`
+  (zero-centered `x·(1+w)`), `qwen35_split_q_gate_bf16`, `qwen35_partial_rope_bf16`
+  (replicated-freq §5, fp32 cos/sin table → bf16 at the multiply),
+  `qwen35_kv_write_bf16`, `qwen35_attention_decode_bf16` (scores/softmax/PV,
+  bf16 matmuls with fp32 accumulate, exact `1/16` scaling), and
+  `qwen35_add_bf16` / `qwen35_silu_mul_bf16` / `qwen35_gate_mul_bf16`.
+- `Qwen35KvCache` (`.h`/`.cpp`) — BF16 `[n_kv, max_seq, head_dim]` cache,
+  K = post-RoPE rows, V = raw rows; `k_mut()/v_mut()` for test seeding.
+- `Qwen35FullAttentionLayer` (`.h`/`.cpp`) — the 21-stage decode layer with
+  `forward` / `forwardTimed` (21 stage event pairs + whole-layer pair),
+  owns the KV cache + buffers + fp32 rope table (host libm, bit-identical to
+  the CPU golden).
+- `golden_loader_v2` (`.h`/`.cpp`) + `tools/common/golden_v2.py` — the
+  CUDLMG02 C++/Python pair (§11.1), byte-for-byte round-trip.
+- `tools/generate_qwen35_golden.py` — the oracle (pinned transformers, real
+  checkpoint, shared quantizer) + `--selftest` (synthetic weights, no
+  checkpoint) + `--fidelity-report`.
+
+### 14.2 Sign-off evidence (this run)
+
+- `test_qwen35_full_attention_golden` (layer 3, seed 20260209):
+  - p=0: all 21 stages OK, **worst max_abs_err = 6.1e-05**, p=0 invariants
+    bit-exact, KV pos-row copy invariants OK.
+  - p=5 (5-row non-zero KV history): all 21 stages OK,
+    **worst max_abs_err = 4.9e-04**, KV history bit-exact, pos-row
+    invariants OK.
+- Kernel unit tests: `test_int4_gemv_bf16` and `test_qwen35_kernels` all
+  bit-exact / 0-error (RoPE vs the exact-rounding CPU reference, attention
+  p=0 == v row, p=4 0-error).
+- Full `ctest`: **27/27 PASS** (old v0.1/v0.1.1 regression + Phase A
+  ingestion + Phase B unit + Phase B golden).
+- `compute-sanitizer --tool memcheck`: **0 errors** — kernel + GEMV unit
+  tests, and the full layer via the bench at p=0 and p=5 (same memory
+  surface as the golden test's C++ phase; evidence + the golden-test
+  launcher-hang note in `benchmarks/sanitizer_qwen35_full_attention.txt`).
+- `scripts/check_no_torch.sh`: **CLEAN** (no torch/pybind in include/ src/).
+- Quantization fidelity (REPORT ONLY, not the gate): per-weight cosine
+  ≈ 0.991–0.993, layer-output cosine ≈ 0.982
+  (`build/data/qwen35_golden_l3_p0.cudalm.fidelity.json`).
+
+### 14.3 Latency (RTX 2080 Ti, sm_75, 100 iters, report only)
+
+Archived under `benchmarks/results/`:
+
+| position | whole_layer_gpu_us (mean) | layer_steps_per_second_mean |
+|---|---|---|
+| p=0  | ≈ 205.6 | ≈ 4865 |
+| p=5  | ≈ 208.2 | ≈ 4803 |
+
+No performance tuning was done in Phase B (out of scope by design); these
+numbers are the correctness-verified baseline for Phase D's benchmark view.
+
+**STOP after Phase B** — per the handoff brief. Do not start Phase C
+(DeltaNet) automatically.

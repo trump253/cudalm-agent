@@ -13,6 +13,11 @@ cudalm_add_test(test_qwen35_config test_qwen35_config cpu/test_qwen35_config.cpp
 cudalm_add_test(test_cuda_smoke test_cuda_smoke cuda/test_cuda_smoke.cpp)
 cudalm_add_test(test_elementwise_rmsnorm test_elementwise_rmsnorm cuda/test_elementwise_rmsnorm.cpp)
 cudalm_add_test(test_int4_gemv test_int4_gemv cuda/test_int4_gemv.cpp)
+# v0.2 Phase B: W4A16 GEMV bf16 specialization (Qwen3.5 path) + the bf16
+# Qwen3.5 kernel family (zero-centered RMSNorm, fused q/gate split, partial
+# rotate-half RoPE, bf16 KV write/decode attention, bf16 elementwise).
+cudalm_add_test(test_int4_gemv_bf16 test_int4_gemv_bf16 cuda/test_int4_gemv_bf16.cpp)
+cudalm_add_test(test_qwen35_kernels test_qwen35_kernels cuda/test_qwen35_kernels.cpp)
 cudalm_add_test(test_rope test_rope cuda/test_rope.cpp)
 cudalm_add_test(test_kv_cache test_kv_cache cuda/test_kv_cache.cpp)
 cudalm_add_test(test_attention test_attention cuda/test_attention.cpp)
@@ -218,6 +223,36 @@ if(CUDALM_PYTHON3)
                      ${CMAKE_SOURCE_DIR})
     set_tests_properties(test_qwen35_ingestion_real PROPERTIES
       SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+    # --- v0.2 Phase B: Qwen3.5 full-attention golden gate (layer 3) ---------
+    # tools/generate_qwen35_golden.py --selftest: synthetic-weights container
+    # round-trip + reference-pipeline invariants (no checkpoint needed, but
+    # requires the pinned-transformers tool python; self-skips 77 if the
+    # installed transformers is not the pinned commit).
+    add_test(NAME test_qwen35_golden_python_selftest
+             COMMAND ${CUDALM_TOOL_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/generate_qwen35_golden.py
+                     --selftest)
+    set_tests_properties(test_qwen35_golden_python_selftest PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+    # HARD GATE: native runtime vs quantized PyTorch reference. The test
+    # converts layer 3 from the real pinned checkpoint, generates CUDLMG02
+    # goldens at p=0 and p=5 (seeded, non-zero KV history at p=5), runs
+    # Qwen35FullAttentionLayer and compares all 21 stages + KV state.
+    # Self-skips (77) when the checkpoint is absent.
+    add_executable(test_qwen35_full_attention_golden
+                   cuda/test_qwen35_full_attention_golden.cpp)
+    target_link_libraries(test_qwen35_full_attention_golden PRIVATE cudalm)
+    add_test(NAME test_qwen35_full_attention_golden
+             COMMAND test_qwen35_full_attention_golden
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_l3.cudalm
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CMAKE_BINARY_DIR}/data/qwen35_golden_l3_p0.cudalm
+                     ${CMAKE_BINARY_DIR}/data/qwen35_golden_l3_p5.cudalm
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR})
+    set_tests_properties(test_qwen35_full_attention_golden PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
   else()
     message(STATUS "tool python lacks torch/safetensors/numpy: "
                    "qwen35 ingestion tests disabled")

@@ -1,0 +1,50 @@
+{
+  "cudalm": "v0.2 Phase B Qwen3.5 full-attention layer 3 latency breakdown",
+  "device": "NVIDIA GeForce RTX 2080 Ti",
+  "config": {
+    "hidden_size": 1024,
+    "n_heads": 8,
+    "n_kv_heads": 2,
+    "head_dim": 256,
+    "intermediate_size": 3584,
+    "group_size": 128,
+    "activation_dtype": "bf16",
+    "max_seq_len": 262144
+  },
+  "position": 5,
+  "iters": 100,
+  "warmup": 5,
+  "units": "microseconds (stages + whole_layer_gpu: CUDA events; host_api_wall: CPU wall-clock)",
+  "stages": [
+    {"stage": "input", "mean_us": 5.224961, "min_us": 4.096000, "max_us": 7.648000, "p50_us": 5.088000},
+    {"stage": "rmsnorm1", "mean_us": 5.520961, "min_us": 4.128000, "max_us": 6.176000, "p50_us": 5.728000},
+    {"stage": "q_gate_proj", "mean_us": 14.781449, "min_us": 14.271999, "max_us": 26.335999, "p50_us": 14.528000},
+    {"stage": "q_gate_split", "mean_us": 4.206080, "min_us": 3.968000, "max_us": 14.336000, "p50_us": 4.096000},
+    {"stage": "k_proj", "mean_us": 8.186560, "min_us": 7.072000, "max_us": 9.472000, "p50_us": 8.192000},
+    {"stage": "v_proj", "mean_us": 8.242880, "min_us": 8.096000, "max_us": 9.247999, "p50_us": 8.192000},
+    {"stage": "q_norm", "mean_us": 4.840321, "min_us": 4.096000, "max_us": 5.888000, "p50_us": 4.704000},
+    {"stage": "k_norm", "mean_us": 4.674880, "min_us": 4.096000, "max_us": 5.792000, "p50_us": 4.608000},
+    {"stage": "rope_q", "mean_us": 4.287040, "min_us": 4.096000, "max_us": 5.312000, "p50_us": 4.224000},
+    {"stage": "rope_k", "mean_us": 4.319680, "min_us": 4.096000, "max_us": 12.288000, "p50_us": 4.160000},
+    {"stage": "kv_write", "mean_us": 3.995520, "min_us": 2.880000, "max_us": 4.288000, "p50_us": 4.096000},
+    {"stage": "attention", "mean_us": 20.319355, "min_us": 19.072001, "max_us": 20.671999, "p50_us": 20.480000},
+    {"stage": "gate_mul", "mean_us": 4.864321, "min_us": 4.096000, "max_us": 5.984000, "p50_us": 4.864000},
+    {"stage": "o_proj", "mean_us": 9.725120, "min_us": 8.480000, "max_us": 10.240000, "p50_us": 9.792000},
+    {"stage": "residual1", "mean_us": 4.173120, "min_us": 4.096000, "max_us": 5.152000, "p50_us": 4.128000},
+    {"stage": "rmsnorm2", "mean_us": 4.632322, "min_us": 4.096000, "max_us": 5.696000, "p50_us": 4.608000},
+    {"stage": "gate_proj", "mean_us": 14.067523, "min_us": 12.927999, "max_us": 14.495999, "p50_us": 14.240001},
+    {"stage": "up_proj", "mean_us": 14.046082, "min_us": 12.927999, "max_us": 14.432000, "p50_us": 14.144000},
+    {"stage": "silu_mul", "mean_us": 4.916161, "min_us": 4.096000, "max_us": 6.112000, "p50_us": 4.896000},
+    {"stage": "down_proj", "mean_us": 12.262403, "min_us": 11.168000, "max_us": 16.000000, "p50_us": 12.288000},
+    {"stage": "final_output", "mean_us": 4.239041, "min_us": 4.096000, "max_us": 5.312000, "p50_us": 4.128000}
+  ],
+  "stage_sum_us": {"mean_us": 161.525761, "min_us": 158.400001, "max_us": 172.096000},
+  "whole_layer_gpu_us": {"mean_us": 208.186523, "min_us": 204.991989, "max_us": 229.376007, "p50_us": 207.104004},
+  "host_api_wall_us": {"mean_us": 228.759537, "min_us": 225.044998, "max_us": 250.574005, "p50_us": 227.020996},
+  "timing_semantics": {
+    "stage_sum_us": "sum of the 21 per-stage CUDA-event durations; excludes GPU work no stage covers (RoPE-table H2D copy), NOT a whole-layer latency",
+    "whole_layer_gpu_us": "one CUDA-event pair around the entire forward GPU work; true whole-layer GPU time",
+    "host_api_wall_us": "CPU wall-clock around the forwardTimed() call, including stream synchronization"
+  },
+  "layer_steps_per_second_mean": 4803.384885
+}
