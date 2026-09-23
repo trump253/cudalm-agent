@@ -344,7 +344,9 @@ y    = W_out @ out                              # [1024]
 
 **Order-of-operations invariants (golden-verified):** decay → delta update →
 output from updated state; conv state updated BEFORE conv output read; g
-computed in fp32 from bf16 params; A_log/dt_bias read in bf16 then cast fp32.
+computed in fp32; A_log is stored fp32 in the checkpoint (used directly,
+`A_log.float()` in official code is a no-op), dt_bias stored bf16 → cast
+fp32.
 
 ---
 
