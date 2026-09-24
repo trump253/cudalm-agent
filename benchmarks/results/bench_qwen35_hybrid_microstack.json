@@ -1,0 +1,52 @@
+{
+  "cudalm": "v0.2 Phase D Qwen3.5 hybrid micro-stack (layers 0-3) baseline decode-step latency",
+  "device": "NVIDIA GeForce RTX 2080 Ti",
+  "config": {
+    "hidden_size": 1024,
+    "num_layers": 4,
+    "layer_pattern": "3x Gated DeltaNet (0,1,2) + 1x full attention (3)",
+    "activation_dtype": "bf16",
+    "max_seq_len": 262144
+  },
+  "iters": 100,
+  "warmup": 5,
+  "units": "microseconds (per_layer/stage_layer_sum/whole_microstack_gpu: CUDA events; host_api_wall: CPU wall-clock)",
+  "cases": [
+    {
+      "label": "p0",
+      "position": 0,
+      "state": "fresh zero state (full-attention context depth 1)",
+      "stage_layer_sum_us": {"mean_us": 395.615326, "min_us": 390.847961, "max_us": 428.928009, "p50_us": 393.631989},
+      "per_layer_gpu_us": [
+        {"layer": "layer0_deltanet", "mean_us": 106.117470, "min_us": 102.591995, "max_us": 132.287994, "p50_us": 104.959999},
+        {"layer": "layer1_deltanet", "mean_us": 102.961594, "min_us": 101.120003, "max_us": 107.936005, "p50_us": 102.495995},
+        {"layer": "layer2_deltanet", "mean_us": 102.110069, "min_us": 100.351997, "max_us": 110.592003, "p50_us": 101.919998},
+        {"layer": "layer3_full_attn", "mean_us": 84.426208, "min_us": 82.687996, "max_us": 96.320000, "p50_us": 83.968002}
+      ],
+    "whole_microstack_gpu_us": {"mean_us": 405.539886, "min_us": 400.608002, "max_us": 444.415985, "p50_us": 403.423981},
+    "host_api_wall_us": {"mean_us": 415.311157, "min_us": 410.096985, "max_us": 453.447998, "p50_us": 412.959015},
+      "microstack_steps_per_second_mean": 2465.848695
+    },
+    {
+      "label": "p512",
+      "position": 512,
+      "state": "sequential (positions 0..deep-1 decoded; full-attention context depth deep+1)",
+      "stage_layer_sum_us": {"mean_us": 425.495514, "min_us": 421.375977, "max_us": 446.656006, "p50_us": 424.223999},
+      "per_layer_gpu_us": [
+        {"layer": "layer0_deltanet", "mean_us": 105.844513, "min_us": 103.423996, "max_us": 128.447998, "p50_us": 104.704002},
+        {"layer": "layer1_deltanet", "mean_us": 102.693436, "min_us": 101.024002, "max_us": 108.863998, "p50_us": 102.399994},
+        {"layer": "layer2_deltanet", "mean_us": 101.818565, "min_us": 100.351997, "max_us": 117.056000, "p50_us": 101.407997},
+        {"layer": "layer3_full_attn", "mean_us": 115.138916, "min_us": 114.175995, "max_us": 121.695999, "p50_us": 114.880005}
+      ],
+    "whole_microstack_gpu_us": {"mean_us": 435.309540, "min_us": 431.776001, "max_us": 456.703979, "p50_us": 433.919983},
+    "host_api_wall_us": {"mean_us": 445.223541, "min_us": 440.687012, "max_us": 466.656006, "p50_us": 443.250000},
+      "microstack_steps_per_second_mean": 2297.215909
+    }
+  ],
+  "timing_semantics": {
+    "stage_layer_sum_us": "sum of the 4 per-layer CUDA-event durations (the layers are non-overlapping by construction); excludes inter-layer gaps and host enqueue time, NOT a whole-step latency",
+    "whole_microstack_gpu_us": "one CUDA-event pair around the entire 4-layer forward; a device-timeline interval covering the GPU work enqueued within it (all four layers) plus any device idle while the host enqueues; NOT a direct measurement of host CPU work (see host_api_wall_us)",
+    "host_api_wall_us": "CPU wall-clock around the forwardTimed() call, including stream synchronization",
+    "microstack_steps_per_second_mean": "1e6 / whole_microstack_gpu_us.mean_us; a micro-stack decode step is FOUR layers, NOT a full-model token (the model has 24 layers), so this is reported as steps, never tokens/s"
+  }
+}

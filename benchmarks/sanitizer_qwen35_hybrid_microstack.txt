@@ -1,0 +1,51 @@
+# compute-sanitizer memcheck — CUDALM v0.2 Phase D (Qwen3.5 hybrid micro-stack)
+#
+# Host: RTX 2080 Ti (sm_75), CUDA 11.8, single device (CUDA_VISIBLE_DEVICES=0)
+# Tool: /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck
+#        --error-exitcode 99
+#
+# Scope: the full Qwen35HybridMicroStack memory surface — the real checkpoint
+# layers 0-3 run as a 0 -> 1 -> 2 -> 3 chain, each layer owning its OWN
+# persistent state:
+#   * DeltaNet 0/1/2 : conv_state bf16 [6144,3] + recurrent_state fp32
+#                       [16,128,128] (in-place update every step) + 22 stage
+#                       buffers + g fp32 [16];
+#   * full-attention 3: the bf16 KV cache [n_kv, max_seq, head_dim] (K, V)
+#     written in place every step + 21 stage buffers.
+# The golden test runs BOTH scenarios — A (p=0, fresh state) and B (sequential
+# p=0 -> 1 -> 2, the runtime chaining its OWN prior-step state, no reset in
+# between) — so a CONTINUOUS MULTI-TOKEN micro-stack run is exercised under
+# the sanitizer: the in-place state updates (DeltaNet conv/recurrent,
+# full-attention KV write) across all 4 layers and 3 tokens, plus the
+# reset_state() zeroing of every layer's state.
+#
+#   $ compute-sanitizer --tool memcheck --error-exitcode 99 \
+#       build/tests/test_qwen35_hybrid_microstack_golden \
+#       build/data/qwen35_08b_microstack4.cudalm /root/models/Qwen3.5-0.8B-Base \
+#       build/data/qwen35_msA build/data/qwen35_msB \
+#       /root/py311/venv/bin/python /root/code/cudalm-agent --no-gen
+#   === scenario A (p=0) ===
+#   -- token 0 --
+#   [layer 0 = DeltaNet] pos=0  ...  [layer 3 = full-attention] pos=0
+#   === scenario B (p=0,1,2 sequential) ===
+#   -- token 0 --  ...  -- token 1 --  ...  -- token 2 --
+#   [PASS] test_qwen35_hybrid_microstack_golden
+#   ========= ERROR SUMMARY: 0 errors
+#
+# Notes:
+# - The --no-gen flag runs the CUDA-only path: it assumes the .cudalm + the
+#   per-(token,layer) goldens already exist and skips the test's
+#   system()-spawned Python convert / oracle steps. This avoids the
+#   compute-sanitizer / fork-exec launcher hang documented in
+#   benchmarks/sanitizer_qwen35_full_attention.txt (the CUDA 11.8 sanitizer
+#   reaper deadlocks after system()-spawned children). The Python steps are
+#   CPU-only (no CUDA) and are byte-identical to the non-sanitized run, so
+#   skipping them does not change the GPU memory surface being checked.
+# - The sanitizer covers the continuous multi-token run required by the Phase D
+#   stop condition: scenario B drives the micro-stack through p=0 -> 1 -> 2
+#   (12 layer-forwards across the 4 layers), exercising every in-place state
+#   update (DeltaNet recurrent fp32 + conv bf16, full-attention KV bf16 write)
+#   and the whole-stack forward chain.
+# - No new kernels were added in Phase D: the micro-stack reuses the frozen
+#   Phase B/C layer runtimes, so this run re-exercises those kernels in the
+#   4-layer chain + the top-level dispatch / state-reset / timing-hook path.
