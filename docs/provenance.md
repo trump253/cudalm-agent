@@ -396,16 +396,25 @@ decoding 编排 kernel 可移植（其 generation 是 Python 采样循环，Phas
 - **`test_qwen35_generation`**（real-checkpoint 门，self-skip 77，TIMEOUT
   1800，`--no-gen` 供 memcheck）：场景 A（短 confident prompt，8 token）+ B
   （长 confident prompt，16 token，最终状态）+ C（repeat-generate 污染门，
-  同 prompt 两次 generate 结果必须逐 token 一致）。比较 **EVERY 生成 token
-  id** + **EVERY 生成步全 [248320] logits** + stop_reason + forward_count
-  （== t_used）+（B）最终混合持久状态（18× DeltaNet conv/recurrent + 6× FA
-  K/V used rows），tolerance 基于实测 worst（per-step logits 0.5625、最终状态
-  < 0.19）+ 小 margin。
+  **强化**：两次 generate 用 `LogitsObserver` 抓 **EVERY 生成步全 [248320]
+  logits** 逐 step **bit-exact** 比较，证明第二次 reset 后数值轨迹与第一次相
+  同，而非仅 greedy token 恰好没变）。比较 **EVERY 生成 token id** + **EVERY
+  生成步全 [248320] logits** + stop_reason + forward_count（== t_used）+（B）
+  最终混合持久状态（18× DeltaNet conv/recurrent + 6× FA K/V used rows），
+  **收紧的 per-step / per-layer envelope**（每步 / 每层独立 = 实测 worst × 1.3
+  + 0.01，**非**共享 atol；recurrent 实测 ≤ 0.0326、**非** 0.5）。
+- **`test_qwen35_generation_contract`**（real-checkpoint 门，self-skip 77）：
+  生成核**输入契约** hardening —— `not_loaded` / 空 prompt / 非法 token id
+  （<0 与 ≥vocab）/ 非法 eos（<0 与 ≥vocab）/ `max_new_tokens < 0` /
+  `prompt_len > max_seq_len` 全部 → `ok == false` + generated 空 +
+  `forward_count == 0`（无 prefill/decode、无状态变更）；`max_new_tokens == 0`
+  → `ok == true` + 空生成 + stop=max_new_tokens + prefill 已跑但**不** decode。
+  不扩大 API（只驱动现有 `generate()`）。
 
 ### 验收证据（RTX 2080 Ti / CUDA 11.8）
 
-- 完整 ctest **37/37 PASS**（旧 34 全回归 + **3 新增**：`test_greedy_argmax` +
-  `test_greedy_stop` + `test_qwen35_generation`）。
+- 完整 ctest **38/38 PASS**（旧 34 全回归 + **4 新增**：`test_greedy_argmax` +
+  `test_greedy_stop` + `test_qwen35_generation` + `test_qwen35_generation_contract`）。
 - `scripts/check_no_torch.sh` **CLEAN**（include/、src/ 无 torch/pybind）。
 - `compute-sanitizer --tool memcheck` **0 错误**
   （`benchmarks/sanitizer_qwen35_generation.txt`，`--no-gen` CUDA-only，覆盖

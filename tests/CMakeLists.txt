@@ -385,6 +385,24 @@ if(CUDALM_PYTHON3)
                      ${CMAKE_BINARY_DIR}/data/qwen35_gen)
     set_tests_properties(test_qwen35_generation PROPERTIES
       SKIP_RETURN_CODE 77 TIMEOUT 1800)
+    # v0.4 Phase A: generator input-contract hardening. Verifies generate()'s
+    # input / capacity contract (fail loud): empty prompt / invalid token /
+    # invalid eos / max_new_tokens < 0 / prompt_len > max_seq_len all ->
+    # ok == false, generated empty, forward_count == 0 (no prefill/decode);
+    # max_new_tokens == 0 -> ok == true, empty, no decode. Self-skips (77) when
+    # the checkpoint / full-model .cudalm is absent.
+    add_executable(test_qwen35_generation_contract
+                   cuda/test_qwen35_generation_contract.cpp)
+    target_link_libraries(test_qwen35_generation_contract PRIVATE cudalm)
+    add_test(NAME test_qwen35_generation_contract
+             COMMAND test_qwen35_generation_contract
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR}
+                     ${CMAKE_BINARY_DIR}/data/qwen35_gen)
+    set_tests_properties(test_qwen35_generation_contract PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 600)
   else()
     message(STATUS "tool python lacks torch/safetensors/numpy: "
                    "qwen35 ingestion tests disabled")

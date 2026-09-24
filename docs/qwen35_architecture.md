@@ -1071,6 +1071,14 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    不同 token → 序列分叉）。`tools/diag_gen_gaps.py` 测逐步 gap；选定 prompt
    min gap **1.0625**（A=[1024,2048,3072]）/ **3.625**（B=[1024,2048,3072]×5+
    [1024]）。
+ - **收紧的 per-step / per-layer envelope**：比较阈值**不**用共享 atol，而是
+   每步 / 每层独立 envelope = `实测 worst × 1.3 + 0.01`（**不让**某个 late
+   layer / worst step 放宽其他 step/layer）：per-step 全 logits envelope（A 8
+   步 / B 16 步各自）+ per-layer DeltaNet conv / recurrent / FullAttention KV
+   envelope（B 最终状态：18× conv/recurrent + 6× KV，非适用层为 0）。实测
+   worst（pinned oracle，RTX 2080 Ti）：per-step logits ≤ 0.5625（A t4）、
+   conv ≤ 0.15625（L17）、recurrent ≤ 0.0326（L20，**非** 0.5）、KV ≤ 0.1875
+   （L11 K）。每次运行 compare 打印 max_abs，可重新收紧到实测误差（非猜值）。
 
  ### 19.3 测试与签核证据
 
@@ -1080,10 +1088,20 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    max_new_tokens / max_seq_len / 末 token eos 优先）。
  - **`test_qwen35_generation`**（real checkpoint，self-skip 77）：场景 A（短
    confident prompt，8 token）+ B（长 confident prompt，16 token，最终状态）+
-   C（repeat-generate 污染门）。比较 **EVERY 生成 token id** + **EVERY 生成步
-   全 [248320] logits** + stop_reason + forward_count（== t_used）+（B）最终
-   混合持久状态（18× DeltaNet conv/recurrent + 6× FA K/V used rows）。
- - 签核（RTX 2080 Ti / CUDA 11.8）：完整 ctest **37/37 PASS**；
+   C（repeat-generate 污染门，**强化**：两次 `generate()` 用 `LogitsObserver`
+   抓 **EVERY 生成步全 [248320] logits** 逐 step **bit-exact** 比较，证明第二次
+   reset 后数值轨迹与第一次相同，而非仅 greedy token 恰好没变）。比较 **EVERY
+   生成 token id** + **EVERY 生成步全 [248320] logits**（per-step envelope）+
+   stop_reason + forward_count（== t_used）+（B）最终混合持久状态（18× DeltaNet
+   conv/recurrent + 6× FA K/V used rows，per-layer envelope）。
+ - **`test_qwen35_generation_contract`**（real checkpoint，self-skip 77）：生成核
+   **输入契约** hardening —— `not_loaded` / 空 prompt / 非法 token id（<0 与
+   ≥vocab）/ 非法 eos（<0 与 ≥vocab）/ `max_new_tokens < 0` /
+   `prompt_len > max_seq_len` 全部 → `ok == false` + generated 空 +
+   `forward_count == 0`（无 prefill/decode、无状态变更）；`max_new_tokens == 0`
+   → `ok == true` + 空生成 + stop=max_new_tokens + prefill 已跑（forward_count
+   == prompt_len）但**不** decode。不扩大 API（只驱动现有 `generate()`）。
+ - 签核（RTX 2080 Ti / CUDA 11.8）：完整 ctest **38/38 PASS**；
    `check_no_torch.sh` **CLEAN**；`compute-sanitizer --tool memcheck` **0 错误**
    （`benchmarks/sanitizer_qwen35_generation.txt`，`--no-gen` CUDA-only，覆盖
    multi-token prompt + multi-step greedy decode：真实 prefill/decode 状态转换 +
