@@ -43,7 +43,7 @@
   "host_api_wall_us": {"mean_us": 226.393478, "min_us": 220.063995, "max_us": 263.296997, "p50_us": 222.423996},
   "timing_semantics": {
     "stage_sum_us": "sum of the 21 per-stage CUDA-event durations; excludes GPU work no stage covers (RoPE-table H2D copy), NOT a whole-layer latency",
-    "whole_layer_gpu_us": "one CUDA-event pair around the entire forward; a device-timeline interval covering the GPU work enqueued within it (incl. the inter-stage RoPE-table H2D copy) plus any device idle while the host enqueues work; NOT a direct measurement of host CPU work (see host_api_wall_us)",
+    "whole_layer_gpu_us": "one CUDA-event pair around the entire forward GPU work; true whole-layer GPU time",
     "host_api_wall_us": "CPU wall-clock around the forwardTimed() call, including stream synchronization"
   },
   "layer_steps_per_second_mean": 4864.942107

@@ -410,11 +410,12 @@ int test_attention(cudaStream_t stream) {
 // ---------------------------------------------------------------------------
 // Long-context attention: T well beyond the old O(T) shared-memory limit.
 // The old softmax requested (T+32)*4 bytes of DYNAMIC shared memory per block;
-// at T = 16384 that is 64.1 KB > the 48 KB sm_75 per-block default (and the
-// old code never opted in to the 99 KB ceiling), so the launch itself failed
-// with cudaErrorInvalidValue. The current O(num_warps) shared-memory
-// implementation must launch cleanly and produce correct results at this
-// length (max_seq_len = 262144 is the real deployment target).
+// at T = 16384 that is 64.1 KB, which exceeds the 48 KB sm_75 per-block default
+// (and even the 64 KB per-block opt-in ceiling, which the old code never opted
+// in to), so the launch itself failed with cudaErrorInvalidValue. The current
+// O(num_warps) shared-memory implementation must launch cleanly and produce
+// correct results at this length (max_seq_len = 262144 is the real deployment
+// target).
 // ---------------------------------------------------------------------------
 int test_attention_long_context(cudaStream_t stream) {
   const int T = 16384;               // clearly beyond the old dynamic-smem limit

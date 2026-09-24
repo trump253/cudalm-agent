@@ -262,8 +262,9 @@ __device__ inline float block_sum_reduce(float v, float* smem, int tid) {
 //    (max reduction / exp+sum reduction / normalize+write) instead of caching
 //    exp() in shared. Required for max_seq_len = 262144 on sm_75 (RTX 2080
 //    Ti), where the old (T+32)*4-byte dynamic-smem request exceeded the 48 KB
-//    per-block default well before T ~= 12k (and the 99 KB opt-in ceiling
-//    around T ~= 24.5k), so the launch itself failed. Each pass re-reads
+//    per-block default at T ~= 12.2k (the sm_75 opt-in ceiling is only 64 KB
+//    per block, so opting in would not have helped beyond T ~= 16.3k), so the
+//    launch itself failed. Each pass re-reads
 //    scores2 in the SAME strided order and expf is deterministic, so the max,
 //    the sum, and every normalized bf16 output are bit-identical to the old
 //    single-pass version. Memory-access-pattern change only: no
