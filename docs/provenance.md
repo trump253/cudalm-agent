@@ -82,7 +82,7 @@ sha256 `c2b1e5a17d9c1e27685d92ed9b382911ebb99955ecd89052d1721241adfbab6c`）。
   基准 `benchmarks/bench_qwen35_full_attention.cpp`
   （结果 `benchmarks/results/bench_qwen35_full_attention_p{0,5}.json`）。
 
-验收证据（2026-07-13，RTX 2080 Ti）：硬门 p=0 最差 6.1e-05、p=5 最差
+验收证据（2026-09-23，RTX 2080 Ti）：硬门 p=0 最差 6.1e-05、p=5 最差
 4.9e-04（tolerance 1e-2，`include/cudalm/stage_compare.h` 记录容差理由）；
 p=0 不变式位级成立；27/27 ctest；compute-sanitizer memcheck 0 错误；
 no-torch 守卫 CLEAN。详见 `docs/qwen35_architecture.md` §14。

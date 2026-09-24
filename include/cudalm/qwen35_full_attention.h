@@ -59,8 +59,12 @@ class Qwen35FullAttentionLayer {
   static constexpr int kNumStages = 21;
 
   // Events required by forwardTimed(): 2 per stage plus one start/stop pair
-  // around the ENTIRE forward's GPU work (whole-layer timing; covers the
-  // host-side RoPE-table construct + H2D copy that falls between stages).
+  // around the ENTIRE forward (whole-layer timing). That pair measures a
+  // CUDA-event DEVICE-TIMELINE interval: it spans every unit of GPU work
+  // enqueued between the two records (including the inter-stage RoPE-table
+  // H2D copy) and also any device idle while the host is enqueuing work
+  // (e.g. the host-side RoPE-table build between stages). It is NOT a direct
+  // measurement of host CPU work — that lives in host_api_wall_us.
   static constexpr int kNumTimingEvents = 2 * kNumStages + 2;
 
   // One decode step at 0-based `position`. `x_in` is a device bf16
@@ -74,10 +78,13 @@ class Qwen35FullAttentionLayer {
   // Same pipeline as forward(), but records CUDA events and stores elapsed
   // times in microseconds:
   //   * one event pair per stage -> stage_us[kNumStages]
-  //   * one event pair around the entire forward's GPU work ->
-  //     *whole_block_us (true whole-layer GPU time; summing stage_us[]
-  //     alone UNDERCOUNTS the layer — it misses the RoPE-table H2D copy
-  //     enqueued between the input and rmsnorm stages).
+  //   * one event pair around the entire forward -> *whole_block_us: a
+  //     CUDA-event device-timeline interval covering the whole forward. It
+  //     includes the GPU work enqueued within it (notably the RoPE-table
+  //     H2D copy between the input and rmsnorm stages that no stage pair
+  //     covers — so summing stage_us[] alone UNDERCOUNTS the layer) and may
+  //     include device idle while the host enqueues work. It is not a
+  //     direct measurement of host CPU time (see host_api_wall_us).
   // `events` must hold kNumTimingEvents caller-created events.
   // Synchronizes the stream so all event pairs are complete on return.
   void forwardTimed(int position, const __nv_bfloat16* x_in,

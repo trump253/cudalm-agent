@@ -522,9 +522,9 @@ checkpoint 权重、真实 checkpoint golden 在 p=0 及带非零 KV 历史的 p
 - 完整 `ctest`：**27/27 PASS**（旧 v0.1/v0.1.1 回归 + Phase A 摄入 +
   Phase B 单元 + Phase B golden）。
 - `compute-sanitizer --tool memcheck`：**0 错误**——kernel + GEMV 单元
-  测试，以及经 bench 在 p=0 与 p=5 跑的全层（与 golden 测试 C++ 阶段
-  同一内存面；证据 + golden 测试启动器挂起说明见
-  `benchmarks/sanitizer_qwen35_full_attention.txt`）。
+  测试，以及经 bench 在 p=0 与 p=5 跑的全层（**bench 的 KV 历史为
+  zero-initialized**，与 golden 测试 C++ 阶段同一内存面；证据 + golden 测试
+  启动器挂起说明见 `benchmarks/sanitizer_qwen35_full_attention.txt`）。
 - `scripts/check_no_torch.sh`：**CLEAN**（include/、src/ 无 torch/pybind）。
 - 量化保真度（仅报告，非硬门）：逐权重 cosine ≈ 0.991–0.993，层输出
   cosine ≈ 0.982（`build/data/qwen35_golden_l3_p0.cudalm.fidelity.json`）。
@@ -537,6 +537,13 @@ checkpoint 权重、真实 checkpoint golden 在 p=0 及带非零 KV 历史的 p
 |---|---|---|
 | p=0  | ≈ 205.6 | ≈ 4865 |
 | p=5  | ≈ 208.2 | ≈ 4803 |
+
+> **时延语义：** `whole_layer_gpu_us` 是一个 **CUDA-event device-timeline
+> 区间**（整次 forward 的一对 event），包含该区间内 enqueue 到 GPU 的工作
+> （含 stage 之间的 RoPE 表 H2D 拷贝），并可能包含 host enqueue gap 导致的
+> device idle；它**不是**对 host 侧 CPU 时间的直接测量（host CPU wall 时间
+> 归入 `host_api_wall_us`）。bench 的 p=5 行使用 **zero-initialized** KV
+> 历史（只覆盖 p>0 的寻址/访存面，不播种非零历史）。
 
 Phase B 未做任何性能调优（设计上超范围）；这些数字是 Phase D benchmark
 视图的已验证正确性基线。

@@ -10,10 +10,15 @@
 //                        EXCLUDES GPU work no stage covers (the RoPE-table
 //                        H2D copy enqueued between the input and rmsnorm
 //                        stages)
-//   * whole_layer_gpu_us: one event pair around the ENTIRE forward's GPU
-//                        work; the true whole-layer GPU time
+//   * whole_layer_gpu_us: one CUDA-event pair around the ENTIRE forward —
+//                        a DEVICE-TIMELINE interval. It spans the GPU work
+//                        enqueued within it (incl. the inter-stage RoPE-table
+//                        H2D copy) and any device idle while the host
+//                        enqueues work (e.g. host-side RoPE-table build).
+//                        NOT a direct measurement of host CPU work.
 //   * host_api_wall_us:  CPU wall-clock around the forwardTimed() call
-//                        (includes the stream sync)
+//                        (includes the stream sync); this is where the
+//                        actual CPU host time is attributed.
 // One decode step of ONE decoder layer is NOT a model token: the rate
 // metric is layer_steps_per_second_mean, based on whole_layer_gpu_us.
 //
@@ -252,7 +257,10 @@ int main(int argc, char** argv) {
          "durations; excludes GPU work no stage covers (RoPE-table H2D "
          "copy), NOT a whole-layer latency\",\n";
   out += "    \"whole_layer_gpu_us\": \"one CUDA-event pair around the "
-         "entire forward GPU work; true whole-layer GPU time\",\n";
+         "entire forward; a device-timeline interval covering the GPU work "
+         "enqueued within it (incl. the inter-stage RoPE-table H2D copy) "
+         "plus any device idle while the host enqueues work; NOT a direct "
+         "measurement of host CPU work (see host_api_wall_us)\",\n";
   out += "    \"host_api_wall_us\": \"CPU wall-clock around the forwardTimed() "
          "call, including stream synchronization\"\n";
   out += "  },\n";
