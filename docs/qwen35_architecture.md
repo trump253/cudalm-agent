@@ -705,9 +705,9 @@ micro-stack 最终输出（layer 3 final）。
   - **B（p=0→1→2 顺序）**：t=0 位级精确；t=1/t=2 逐层 stage + 状态在复合
     容差内（worst bf16 3.9e-2、fp32 3.1e-3）；逐层链（layer L 输入 ==
     layer L-1 输出）+ micro-stack final 全 OK。
-- 完整 `ctest`：**30/30 PASS**（旧 v0.1/v0.1.1 回归 + Phase A 摄入 +
+- 完整 `ctest`：**31/31 PASS**（旧 v0.1/v0.1.1 回归 + Phase A 摄入 +
   Phase B 单元 + Phase B golden + Phase C 契约 + Phase C golden +
-  **Phase D micro-stack golden**）。
+  **Phase D micro-stack golden** + Phase D `--tokens` 校验）。
 - `compute-sanitizer --tool memcheck`：**0 错误**（micro-stack golden
   `--no-gen` CUDA-only 路径，**覆盖连续多 token micro-stack 运行**——场景 B
   的 p=0→1→2 全链；证据 `benchmarks/sanitizer_qwen35_hybrid_microstack.txt`）。
