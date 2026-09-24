@@ -146,3 +146,45 @@ FLA 对齐 `l2norm`，架构文档 §1.2 钉死）。
 recurrent_state ≤ 5.96e-08）；29/29 ctest；compute-sanitizer memcheck 0
 错误（`benchmarks/sanitizer_qwen35_deltanet.txt`）；no-torch 守卫 CLEAN。
 详见 `docs/qwen35_architecture.md` §15。
+
+## CUDALM v0.2 Phase D（Qwen3.5 4 层混合 micro-stack）
+
+Phase D 在 Phase C 之上把**真实 checkpoint 前 4 层**（layer 0/1/2 = Gated
+DeltaNet，layer 3 = 全注意力）组成 **v0.2 最终混合 decoder micro-stack**。
+**无新 kernel、无新上游移植**：micro-stack 是纯接线（逐层 dispatch + 独立
+持久状态 + 整 stack 时序钩子），数学语义完全来自**复用的冻结 Phase B/C 单层
+运行时**（其数学 = pinned Qwen3.5 实现，见 Phase B/C 溯源）。事实源同 Phase
+B/C：官方 pinned transformers（`fc9137225880`）+ 真实 checkpoint
+（`Qwen/Qwen3.5-0.8B-Base`）。
+
+### CUDALM 原生（无上游）
+
+- `src/runtime/qwen35_hybrid_microstack.cpp` /
+  `include/cudalm/qwen35_hybrid_microstack.h`：`Qwen35HybridMicroStack`——
+  `load`（逐层 `validate_layer` + 按 config hybrid 排表 dispatch 到
+  `Qwen35DeltaNetLayer` / `Qwen35FullAttentionLayer`）、`forward`（0→1→2→3
+  链，每层 final output 喂下一层；输出 = layer 3 final）、`reset_state`
+  （逐层独立重置，**无跨层状态 alias/reuse**）、`forwardTimed`（4 对 per-layer
+  + 1 对整 stack 事件）。**仅编排，不复制任何单层 kernel**；每层持久状态由
+  该层自己持有（DeltaNet conv+recurrent、全注意力 KV），micro-stack 只做接线。
+- `tools/generate_qwen35_golden.py`（`--microstack-prefix` / `--tokens` →
+  `generate_microstack`）：oracle 顺序跑 layers 0→1→2→3（**同一组** W4A16
+  量化权重，无 bf16/量化混用），逐 (token, layer) 写一个 CUDLMG02（**复用
+  历史单容器**，不新建格式，不破坏既有单容器测试）。
+- 测试：`tests/cuda/test_qwen35_hybrid_microstack_golden.cpp`（真实
+  checkpoint 硬门：A 首 token p=0 + B 顺序 p=0→1→2，逐层比对 stage + 状态 +
+  micro-stack final；`--no-gen` 供 memcheck）。
+- benchmark：`benchmarks/bench_qwen35_hybrid_microstack.cpp`（未优化
+  baseline，三视图 + p=0/p=512；evidence
+  `benchmarks/results/bench_qwen35_hybrid_microstack.json`）。
+
+> 注：Phase D **复用** Phase B 的 `Qwen35FullAttentionLayer` 与 Phase C 的
+> `Qwen35DeltaNetLayer`（及其全部 kernel），**不是**新的上游移植、**不新增**
+> kernel；新增的仅是 4 层链的编排（dispatch / 状态 / 时序）与 micro-stack
+> golden 的逐层生成。
+
+验收证据（RTX 2080 Ti）：A 全链 bit-exact、B 顺序（worst bf16 3.9e-2 /
+fp32 3.1e-3，在跨层复合容差内）；30/30 ctest；compute-sanitizer memcheck 0
+错误（覆盖连续多 token micro-stack 运行，
+`benchmarks/sanitizer_qwen35_hybrid_microstack.txt`）；no-torch 守卫 CLEAN。
+详见 `docs/qwen35_architecture.md` §16。

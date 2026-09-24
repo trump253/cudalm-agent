@@ -472,7 +472,7 @@ RMSNorm = 全 fp32 链 → 一次 bf16 cast；RoPE = cos/sin 先 fp32→bf16 再
   都比对）【已完成，见 §15】
 - **D** —— 4 层混合 micro-stack golden PASS（逐层 + 全部状态 + 最终输出），
   顺序 p=0,1,2,…；benchmark 三视图；compute-sanitizer 干净；文档/证据
-  更新；推送 `v0.2-qwen35`【未开始】
+  更新；推送 `v0.2-qwen35`【已完成，见 §16】
 
 ## 13. 架构风险
 
@@ -494,7 +494,7 @@ Phase B **已完成**并通过签核验证。范围 = 一个全注意力层
 （layers 3/7/11/15/19/23）的 Qwen3.5 专属 BF16 运行时路径、真实
 checkpoint 权重、真实 checkpoint golden 在 p=0 及带非零 KV 历史的 p>0
 均 PASS。DeltaNet（Phase C）现已**完成**（见 §15）；混合 micro-stack
-（Phase D）**未开始**。
+（Phase D）现已**完成**（见 §16）。
 
 ### 14.1 落地内容
 
@@ -629,3 +629,113 @@ Phase C 未做性能调优（设计上超范围）；不跑 benchmark / NCU（Ph
 **Phase C 后 STOP** —— Phase C（Gated DeltaNet）已完成（见 §15）并推送
 `v0.2-qwen35`；等待外部 review，**不要自动开始 Phase D**（4 层混合
 micro-stack / benchmark / NCU）。
+
+---
+
+## 16. Phase D 完成记录（Qwen3.5 4 层混合 micro-stack）
+
+Phase D **已完成**并通过硬门验证。范围 = 真实 checkpoint **前 4 层**
+（layer 0/1/2 = Gated DeltaNet，layer 3 = 全注意力）构成的 **v0.2 最终
+混合 decoder micro-stack** 的 CUDALM 原生解码运行时、逐层 dispatch、独立
+持久状态、真实 checkpoint golden（首 token + 顺序多 token）+ baseline
+benchmark。**复用**冻结的 Phase B/C 单层运行时（`Qwen35FullAttentionLayer` /
+`Qwen35DeltaNetLayer`）——不复制任何单层 kernel，不改冻结数学语义。
+
+### 16.1 落地内容
+
+- `Qwen35HybridMicroStack`
+  （`include/cudalm/qwen35_hybrid_microstack.h` +
+  `src/runtime/qwen35_hybrid_microstack.cpp`）——4 层混合 micro-stack：
+  - `load(file, stream, out)`：从解析后的 v2 文件加载真实 checkpoint
+    layers 0-3（逐层 `validate_layer`），按 config 的 hybrid 排表 dispatch
+    到 `Qwen35DeltaNetLayer`（0/1/2）/ `Qwen35FullAttentionLayer`（3）。
+  - `forward(position, x_in, stream)`：链式跑 layer 0→1→2→3，把每层
+    final output 喂给下一层；micro-stack 输出 = layer 3 final output
+    （device bf16 `[1024]`）。一个 decode step = 一个 bf16 hidden `[1024]`。
+  - `reset_state(stream)`：逐层独立重置（DeltaNet 零 conv+recurrent；
+    全注意力零 KV cache）。**无跨层状态 alias/reuse/contamination**——每层
+    持有自己的持久状态（DeltaNet `conv_state` bf16 `[6144,3]` +
+    `recurrent_state` fp32 `[16,128,128]`；全注意力 K/V cache）。
+  - `forwardTimed(...)`：4 对 per-layer 事件 + 1 对整 stack 事件（benchmark）。
+  - 逐层访问器 `delta(i)` / `attention(i)`（golden 测试比对逐层 stage/状态）。
+
+- `tools/generate_qwen35_golden.py` ——新增 `--microstack-prefix` /
+  `--tokens` 模式（`generate_microstack`）：把真实 checkpoint layers 0-3
+  按 0→1→2→3 顺序、用**同一组** W4A16 量化权重（无 bf16/量化状态混用）
+  顺序跑每个 token，逐层链（layer L 输入 = 上一层 final output）+ 逐层
+  持久状态跨 token 线程；每个 (token, layer) 写一个 CUDLMG02 文件
+  （`<prefix>_L{L}_p{t}.cudalm`）。**复用历史单容器**（CUDLMG02）——不新建
+  格式，不破坏既有 `CUDLMG02` 单容器测试。
+- `test_qwen35_hybrid_microstack_golden` ——硬门（§16.2）+ `--no-gen`
+  （memcheck 用的 CUDA-only 路径，避免 compute-sanitizer 进程回收器与
+  std::system Python 子进程的死锁）。
+- `bench_qwen35_hybrid_microstack` ——baseline benchmark（§16.4）。
+
+### 16.2 micro-stack golden 硬门
+
+oracle（`generate_microstack`）与运行时用**同一组**量化权重，把
+layers 0→1→2→3 顺序链，每层持久状态跨 token 线程。逐 (token, layer) 一个
+CUDLMG02（`<prefix>_L{L}_p{t}.cudalm`）。两场景（每个都从 `reset_state` 起）：
+
+- **A 首 token**：p=0（4 层链，全零状态）；
+- **B 顺序**：p=0→1→2，运行时从**自身的**上一步持久状态链（中间不 reset）。
+
+每层比对：所有 bf16 pipeline stage（DeltaNet 22 + fp32 `stage.g`；
+全注意力 21）+ 持久状态（DeltaNet `conv_state` bf16 `[6144,3]` +
+`recurrent_state` fp32 `[16,128,128]`；全注意力 K/V cache 行 0..p）+
+micro-stack 最终输出（layer 3 final）。
+
+**容差（关键正确性论证）：** 链式多层的 W4A16 GEMV 结合序噪声会跨层复合
+（每层把前几层 ~1 ulp 的 bf16 输出噪声继承并放大；持久状态把该噪声向前携带）。
+- **t=0**：layer 0 输入是种子输入（运行时/oracle 相同），全链干净——首 token
+  用单层标准（bf16 `compare_bf16_stages` atol=rtol=1e-2，§14）；fp32 状态用
+  Phase C 紧标准（atol=1e-5、rtol=1e-4）——实测**位级精确**（recurrent
+  max_abs = 0）。
+- **t≥1**：每层输入 = 上一层输出，继承并放大前几层噪声。钉死种子（20260209）
+  实测最差：bf16 stage **3.9e-2**、fp32 状态 **3.1e-3**。门设在 bf16
+  5e-2（atol=rtol）、fp32 5e-3/1e-2（~2× 余量）——仍远低于任何 O(1) 的错
+  stage / 错索引 / 错权重 / **状态 alias / contamination** bug（这类 bug 已被
+  t=0 标准 + 逐层 Phase B/C 门钉死）。
+
+### 16.3 签核证据（本次运行）
+
+- `test_qwen35_hybrid_microstack_golden`：
+  - **A（p=0）**：4 层全链干净；逐层 `recurrent_state` **max_abs = 0**
+    （位级精确）；`conv_state` / KV 行 / 全部 stage / micro-stack final OK。
+  - **B（p=0→1→2 顺序）**：t=0 位级精确；t=1/t=2 逐层 stage + 状态在复合
+    容差内（worst bf16 3.9e-2、fp32 3.1e-3）；逐层链（layer L 输入 ==
+    layer L-1 输出）+ micro-stack final 全 OK。
+- 完整 `ctest`：**30/30 PASS**（旧 v0.1/v0.1.1 回归 + Phase A 摄入 +
+  Phase B 单元 + Phase B golden + Phase C 契约 + Phase C golden +
+  **Phase D micro-stack golden**）。
+- `compute-sanitizer --tool memcheck`：**0 错误**（micro-stack golden
+  `--no-gen` CUDA-only 路径，**覆盖连续多 token micro-stack 运行**——场景 B
+  的 p=0→1→2 全链；证据 `benchmarks/sanitizer_qwen35_hybrid_microstack.txt`）。
+- `scripts/check_no_torch.sh`：**CLEAN**（include/、src/ 无 torch/pybind）。
+
+Phase D 只做**未优化 baseline**（无 NCU / 融合 / CUDA Graph）；**不进**
+24 层全模型 / embedding / LM head / tokenizer / 生成 / Paged KV /
+batching / scheduler / kernel 优化 / NCU。
+
+### 16.4 baseline benchmark（未优化，仅报告）
+
+`bench_qwen35_hybrid_microstack`（RTX 2080 Ti，sm_75，100 迭代，5 步
+warmup，全局时钟预热 1500 步；evidence
+`benchmarks/results/bench_qwen35_hybrid_microstack.json`）：
+
+| 情况 | stage/layer sum | whole_microstack_gpu_us | host_api_wall_us | steps/s |
+|---|---|---|---|---|
+| **p=0**（零状态，FA 上下文深度 1）| 395.6 us | 405.5 us | 415.3 us | 2466 |
+| **p=512**（顺序状态，FA 上下文深度 513）| 425.5 us | 435.3 us | 445.2 us | 2297 |
+
+- DeltaNet 层与 position 无关（recurrent 状态是固定 `[16,128,128]` 矩阵，
+  每步就地更新）：p=0/p=512 均 ~102–106 us/层。
+- 全注意力层随上下文深度上升：p=0（1 行 KV）84.4 us → p=512（513 行 KV）
+  115.1 us。p=512 比 p=0 慢的 ~30 us 全部来自该层更深的注意力。
+- **micro-stack step ≠ model token**（model 有 24 层，此处只跑前 4 层）；
+  速率以 `microstack_steps_per_second_mean`（= 1e6 / whole_microstack_gpu_us
+  mean）报告，**不**称 tokens/s。
+
+**Phase D 后 STOP** —— Phase D（4 层混合 micro-stack）已完成（见 §16）并
+推送 `v0.2-qwen35`；等待外部 review。**v0.2 最终 hybrid decoder micro-stack**
+（3×Gated DeltaNet + 1×FullAttention，真实 checkpoint layers 0-3）已就绪。
