@@ -1,195 +1,189 @@
-# Qwen3.5 Architecture Contract (v0.2)
+# Qwen3.5 架构契约（v0.2）
 
-Pinned official sources + exact math contract for the Qwen3.5-0.8B hybrid
-decoder bring-up. This document is the architecture oracle for v0.2: any
-discrepancy between this document and the pinned sources means this document
-is wrong; any discrepancy between the prompt description and the pinned
-sources was resolved in favor of the pinned sources (see §2 "Deltas vs
-prompt" for the ones found).
+Qwen3.5-0.8B 混合解码器 bring-up 所用的官方钉死（pinned）源 + 精确数学契约。
+本文档是 v0.2 的架构 oracle（事实基准）：本文档与钉死源之间的任何不一致，
+意味着**本文档错了**；任务简报（prompt）描述与钉死源之间的不一致，一律以
+钉死源为准（已发现的不一致见 §2「与简报的差异」）。
 
-Scope: the **text** decoder (`Qwen3_5TextModel`, config key `text_config`)
-only. The vision tower (`model.visual.*`) and the MTP module (`mtp.*`)
-present in the checkpoint are **out of scope** for v0.2 (recorded in
-backlog).
+范围：仅**文本**解码器（`Qwen3_5TextModel`，config 键 `text_config`）。
+checkpoint 中存在的视觉塔（`model.visual.*`）与 MTP 模块（`mtp.*`）
+**不在** v0.2 范围内（已记入 backlog）。
 
 ---
 
-## 1. Official source pins
+## 1. 官方源钉死（pins）
 
-### 1.1 Model / checkpoint (fact source for shapes + values)
+### 1.1 模型 / checkpoint（形状 + 数值的事实源）
 
-| item | value |
+| 项 | 值 |
 |---|---|
-| model repo | `Qwen/Qwen3.5-0.8B-Base` |
-| revision | branch `main`, commit `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68` |
+| 模型仓库 | `Qwen/Qwen3.5-0.8B-Base` |
+| revision | 分支 `main`，commit `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68` |
 | config.json sha256 | `b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204` |
-| model.safetensors | `model.safetensors-00001-of-00001.safetensors`, 1,746,942,600 bytes, sha256 `c2b1e5a17d9c1e27685d92ed9b382911ebb99955ecd89052d1721241adfbab6c` (also written into every converted `.cudalm` v2 file's `checkpoint_sha256` metadata) |
-| weight index | `model.safetensors.index.json`, 488 tensors, `total_size = 1746882752` |
-| transfer channel | `https://hf-mirror.com` (huggingface.co unreachable from this environment; mirror is transport only — fact source is the official repo) |
-| local path | `/root/models/Qwen3.5-0.8B-Base/` (never committed to Git) |
-| native dtype | `bfloat16` (text_config.dtype); `mamba_ssm_dtype: float32` |
+| model.safetensors | `model.safetensors-00001-of-00001.safetensors`，1,746,942,600 字节，sha256 `c2b1e5a17d9c1e27685d92ed9b382911ebb99955ecd89052d1721241adfbab6c`（同时写入每个转换后的 `.cudalm` v2 文件的 `checkpoint_sha256` 元数据） |
+| 权重索引 | `model.safetensors.index.json`，488 个张量，`total_size = 1746882752` |
+| 传输通道 | `https://hf-mirror.com`（本环境访问不到 huggingface.co；镜像只作传输通道——事实源仍是官方仓库） |
+| 本地路径 | `/root/models/Qwen3.5-0.8B-Base/`（永不提交进 Git） |
+| 原生 dtype | `bfloat16`（text_config.dtype）；`mamba_ssm_dtype: float32` |
 
-### 1.2 Modeling source (fact source for math)
+### 1.2 modeling 源码（数学的事实源）
 
-| item | value |
+| 项 | 值 |
 |---|---|
-| repo | `huggingface/transformers` |
-| commit | `fc9137225880a9d03f130634c20f9dbe36a7b8bf` — "Adding Support for Qwen3.5 (#43830)", 2026-02-09 |
-| files pinned | `src/transformers/models/qwen3_5/modeling_qwen3_5.py` (sha256 `b6f02dcd1b66610df293084e00bf9bea4fc6a7e5336ffc6ff446edc7ddcd8601`), `configuration_qwen3_5.py` (sha256 `2280c6e6bd9d66d7281155243f67cf5fed2756a828af41316566afe611ff16c0`), copied under `/root/models/Qwen3.5-0.8B-Base/provenance/transformers_fc91372/` |
+| 仓库 | `huggingface/transformers` |
+| commit | `fc9137225880a9d03f130634c20f9dbe36a7b8bf` —— "Adding Support for Qwen3.5 (#43830)"，2026-02-09 |
+| 钉死文件 | `src/transformers/models/qwen3_5/modeling_qwen3_5.py`（sha256 `b6f02dcd1b66610df293084e00bf9bea4fc6a7e5336ffc6ff446edc7ddcd8601`）、`configuration_qwen3_5.py`（sha256 `2280c6e6bd9d66d7281155243f67cf5fed2756a828af41316566afe611ff16c0`），副本存放于 `/root/models/Qwen3.5-0.8B-Base/provenance/transformers_fc91372/` |
 
-**Provenance conflict (documented, resolved):** the checkpoint `config.json`
-declares `transformers_version: 4.57.0.dev0`, but the qwen3_5 modeling did not
-exist at v4.57.0 (released 2025-10-03) — it was added to main on 2026-02-09
-(commit above, contributed by Qwen, PR #43830). The version string is a stale
-artifact of the export environment. The pinned commit is the official
-implementation; the golden generator installs transformers **at exactly this
-commit** so the oracle code byte-matches this document.
+**溯源冲突（已记录，已裁决）：** checkpoint 的 `config.json` 声明
+`transformers_version: 4.57.0.dev0`，但 v4.57.0（2025-10-03 发布）时
+qwen3_5 modeling 尚不存在——它于 2026-02-09 加入 main（即上面的 commit，
+Qwen 贡献，PR #43830）。该版本字符串是导出环境的陈旧残留。钉死的 commit
+才是官方实现；golden 生成器**精确安装该 commit** 的 transformers，使
+oracle 代码与本文档逐字节一致。
 
-The pinned file is self-contained (all classes below are defined in
-`modeling_qwen3_5.py`; no qwen3_next import). The golden environment runs the
-pure-torch fallback path (no `flash-linear-attention`, no `causal-conv1d`),
-i.e. `torch_chunk_gated_delta_rule` / `torch_recurrent_gated_delta_rule` /
-`torch_causal_conv1d_update` — these are the reference equations below.
+钉死文件自包含（下文所有类都定义在 `modeling_qwen3_5.py` 中；不 import
+qwen3_next）。golden 环境跑纯 torch 回退路径（无 `flash-linear-attention`、
+无 `causal-conv1d`），即 `torch_chunk_gated_delta_rule` /
+`torch_recurrent_gated_delta_rule` / `torch_causal_conv1d_update`——
+下文参考方程以此为准。
 
-### 1.3 Model card (corroboration only)
+### 1.3 模型卡（仅作佐证）
 
-`README.md` of the repo: layout `6 × (3 × (Gated DeltaNet → FFN) → 1 ×
-(Gated Attention → FFN))`, DeltaNet 16 QK heads / 16 V heads @ 128, Gated
-Attention 8 Q / 2 KV @ 256 with RoPE dim 64, FFN intermediate 3584 — all
-consistent with config.json.
+仓库 `README.md`：层布局 `6 × (3 × (Gated DeltaNet → FFN) → 1 ×
+(Gated Attention → FFN))`，DeltaNet 16 QK 头 / 16 V 头 @ 128，
+Gated Attention 8 Q / 2 KV @ 256、RoPE 维 64，FFN 中间维 3584——
+与 config.json 全部一致。
 
 ---
 
-## 2. Model config (from official config.json, text_config)
+## 2. 模型配置（来自官方 config.json 的 text_config）
 
-| key | value |
+| 键 | 值 |
 |---|---|
 | model_type | `qwen3_5_text` |
-| architectures | `Qwen3_5ForConditionalGeneration` (multimodal wrapper; text part = `model.language_model`) |
+| architectures | `Qwen3_5ForConditionalGeneration`（多模态 wrapper；文本部分 = `model.language_model`） |
 | hidden_size | **1024** |
 | intermediate_size | **3584** |
 | num_hidden_layers | **24** |
 | hidden_act | `silu` |
 | vocab_size | 248320 |
-| tie_word_embeddings | true (out of v0.2 scope — no LM head) |
-| num_attention_heads | **8** (full attention) |
-| num_key_value_heads | **2** (GQA, group = 4) |
-| head_dim | **256** (note: q_proj out = 8·256·2 = 4096 ≠ hidden — the "Q width ≠ H" generalization of v0.1.1 is a real requirement here) |
-| attention_bias | false (all projections bias-free) |
+| tie_word_embeddings | true（不在 v0.2 范围——无 LM head） |
+| num_attention_heads | **8**（全注意力） |
+| num_key_value_heads | **2**（GQA，group = 4） |
+| head_dim | **256**（注意：q_proj 输出 = 8·256·2 = 4096 ≠ hidden——v0.1.1 的「Q 宽度 ≠ H」泛化在这里是真实需求） |
+| attention_bias | false（所有投影无 bias） |
 | attention_dropout | 0.0 |
 | attn_output_gate | **true** |
-| full_attention_interval | 4 → layer schedule below |
+| full_attention_interval | 4 → 见下文章排表 |
 | linear_conv_kernel_dim | **4** |
 | linear_num_key_heads | **16** |
 | linear_num_value_heads | **16** |
 | linear_key_head_dim | **128** |
 | linear_value_head_dim | **128** |
-| mamba_ssm_dtype | float32 (recurrent state dtype) |
+| mamba_ssm_dtype | float32（递归状态 dtype） |
 | rms_norm_eps | **1e-6** |
 | max_position_embeddings | 262144 |
 | rope_parameters | `{rope_type: "default", rope_theta: 1e7, partial_rotary_factor: 0.25, mrope_section: [11,11,10], mrope_interleaved: true}` |
-| mtp_num_hidden_layers | 1 (out of scope) |
+| mtp_num_hidden_layers | 1（超范围） |
 
-### Exact layer schedule (24 layers)
+### 精确层排表（24 层）
 
 ```
 i:    0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
 type: DN DN DN FA DN DN DN FA DN DN DN FA DN DN DN FA DN DN DN FA DN DN DN FA
 ```
 
-`layer_types[i] = "linear_attention"` (Gated DeltaNet) for `i % 4 != 3`,
-`"full_attention"` for `i % 4 == 3`. Full-attention layer indices:
-**{3, 7, 11, 15, 19, 23}** (18 DeltaNet layers + 6 full-attention layers).
+`i % 4 != 3` 时 `layer_types[i] = "linear_attention"`（Gated DeltaNet），
+`i % 4 == 3` 时为 `"full_attention"`。全注意力层索引：
+**{3, 7, 11, 15, 19, 23}**（18 个 DeltaNet 层 + 6 个全注意力层）。
 
-**Deltas vs the v0.2 prompt (official source wins):**
-- Prompt assumed the pattern might be "DeltaNet×3 → Full Attention" — CONFIRMED
-  by official config (`full_attention_interval=4`, last of each block).
-- Prompt did not mention the model is a **multimodal** checkpoint
-  (`Qwen3_5ForConditionalGeneration`, vision tower + mRoPE). Text-decode math
-  is unaffected for pure-text positions (mRoPE degenerates to plain RoPE —
-  see §5), but the checkpoint ingestion must select the
-  `model.language_model.*` prefix and skip `model.visual.*` / `mtp.*`.
+**与 v0.2 简报的差异（官方源优先）：**
+- 简报假设模式可能是「DeltaNet×3 → Full Attention」——已由官方 config
+  确认（`full_attention_interval=4`，每块最后一层）。
+- 简报未提该模型是**多模态** checkpoint
+  （`Qwen3_5ForConditionalGeneration`，视觉塔 + mRoPE）。纯文本位置下文本
+  解码数学不受影响（mRoPE 退化为普通 RoPE——见 §5），但 checkpoint 摄入
+  必须选 `model.language_model.*` 前缀、跳过 `model.visual.*` / `mtp.*`。
 
 ---
 
-## 3. v0.1.1 → Qwen3.5 delta table
+## 3. v0.1.1 → Qwen3.5 差异表
 
-| # | current v0.1.1 assumption | Qwen3.5 requirement | action |
+| # | v0.1.1 现状假设 | Qwen3.5 要求 | 行动 |
 |---|---|---|---|
-| 1 | RMSNorm `x * rsqrt(mean(x²)+eps) * w`, plain weight, H ∈ {1024,2048,4096,8192} | **Zero-centered** `x.float() * rsqrt(mean(x.float()²)+eps) * (1 + w.float())` → cast to input dtype; also used at head_dim=256 (per-head) and final norm | **NEW** `qwen35_rmsnorm` kernel + mode; KEEP v0.1.1 kernel unchanged |
-| 2 | Gated RMSNorm does not exist | DeltaNet output norm: `(w * (x·rsqrt(mean(x²)+eps)).to(bf16)) * silu(gate)` with exact bf16 roundings at two internal boundaries, w plain (init ones), H=128 | **NEW** `qwen35_rmsnorm_gated` kernel |
-| 3 | RoPE interleaved-pair, full head_dim, fp16 cos/sin **table** in weight file | **Partial rotary** (rotary dim = 64 = 0.25·256, applied to the FIRST 64 dims of each head), **rotate-half** layout, theta=1e7, cos/sin computed in fp32 from inv_freq at the position, cast to bf16; mRoPE sections [11,11,10] (no-op for pure-text positions: all 3 position dims equal) | **NEW** `qwen35_rope` kernel (compute-on-the-fly, no table); KEEP v0.1.1 kernel |
-| 4 | Full attention: plain q/k/v + RoPE + causal GQA + o_proj | + q/k per-head RMSNorm (zero-centered, over head_dim=256) **before** RoPE; q_proj outputs fused `[q; gate]` (out = 2·n_heads·head_dim); attention output **× sigmoid(gate)** before o_proj; scaling = head_dim^-0.5 = 1/16; softmax in fp32 | **NEW** `Qwen35FullAttentionLayer`; KV-cache layout [n_kv_heads, seq, head_dim] (same spirit as v0.1.1 KvCache) |
-| 5 | No linear-attention primitive | Gated DeltaNet: in_proj_qkv/z/b/a, depthwise causal conv1d (k=4, depthwise, no bias) with persistent conv state, delta-rule recurrence with persistent [16,128,128] fp32 state, gated RMSNorm, out_proj | **NEW** `Qwen35DeltaNetLayer` + `Qwen35DeltaState` |
-| 6 | Single attention type, one `DecoderBlock` | Hybrid schedule 18×DeltaNet + 6×FullAttention; per-layer type dispatch | **NEW** `Qwen35Config` + hybrid micro-stack (v0.2: 4-layer minimum) |
-| 7 | `.cudalm` v1: one block, fp16 + int4, rope tables | v2: architecture id, Qwen35Config blob, layer schedule, arbitrary named tensor table with bf16/fp32 dtypes, bounds/unique-name validation; **v1 stays immutable** | **NEW** v2 format; v1 loader untouched |
-| 8 | W4A16 G=128 from **fp16** source weights | Same packed contract (q∈[-7,7], fp16 scale = amax/7, low nibble = k=2b) but source dtype is **bf16**; scale still stored fp16 (GEMV contract unchanged) | **EXTEND** quantizer (accept bf16); KEEP packed layout + GEMV |
-| 9 | 7 GEMVs per block (q,k,v,o,gate,up,down) | Full-attn layers: same 7 (q_proj N=4096!); DeltaNet layers: in_proj_qkv (N=6144), in_proj_z (N=2048), in_proj_b/in_proj_a (N=16), out_proj (N=1024). All K dims are multiples of 128 ✓ | **EXTEND** GEMV usage (N=16 rows is legal: K=1024) |
-| 10 | KV cache only | + DeltaNet conv state [conv_dim=6144, 3] + recurrent state [16, 128, 128] fp32 per linear layer | **NEW** state ownership |
-| 11 | eps=1e-5 default | eps=**1e-6** | **EXTEND** via config (v0.1.1 constant untouched) |
-| 12 | SwiGLU silu, no bias | identical (silu, bias-free) | **KEEP** |
+| 1 | RMSNorm `x * rsqrt(mean(x²)+eps) * w`，普通权重，H ∈ {1024,2048,4096,8192} | **零中心** `x.float() * rsqrt(mean(x.float()²)+eps) * (1 + w.float())` → 转回输入 dtype；还用于 head_dim=256（逐头）与最终 norm | **新增** `qwen35_rmsnorm` kernel + 模式；v0.1.1 kernel 保持不动 |
+| 2 | Gated RMSNorm 不存在 | DeltaNet 输出 norm：`(w * (x·rsqrt(mean(x²)+eps)).to(bf16)) * silu(gate)`，两个内部边界处为精确 bf16 舍入，w 普通（初值 ones），H=128 | **新增** `qwen35_rmsnorm_gated` kernel |
+| 3 | RoPE 交错对（interleaved-pair）、整 head_dim、权重文件内 fp16 cos/sin **表** | **partial rotary**（旋转维 = 64 = 0.25·256，作用于每头的**前** 64 维）、**rotate-half** 布局、theta=1e7、cos/sin 在当前位置由 inv_freq 以 fp32 计算再转 bf16；mRoPE sections [11,11,10]（纯文本位置为 no-op：3 个位置维全相等） | **新增** `qwen35_rope` kernel（按位置现算，无表）；保留 v0.1.1 kernel |
+| 4 | 全注意力：普通 q/k/v + RoPE + causal GQA + o_proj | + RoPE **之前**对 q/k 逐头 RMSNorm（零中心，跨 head_dim=256）；q_proj 输出融合 `[q; gate]`（out = 2·n_heads·head_dim）；注意力输出在 o_proj **之前** × sigmoid(gate)；scaling = head_dim^-0.5 = 1/16；softmax 走 fp32 | **新增** `Qwen35FullAttentionLayer`；KV cache 布局 [n_kv_heads, seq, head_dim]（与 v0.1.1 KvCache 同一思路） |
+| 5 | 无线性注意力原语 | Gated DeltaNet：in_proj_qkv/z/b/a、depthwise causal conv1d（k=4、depthwise、无 bias）带持久 conv 状态、delta-rule 递推带持久 [16,128,128] fp32 状态、gated RMSNorm、out_proj | **新增** `Qwen35DeltaNetLayer` + `Qwen35DeltaState` |
+| 6 | 单一注意力类型、一个 `DecoderBlock` | 混合排布 18×DeltaNet + 6×FullAttention；逐层按类型分发 | **新增** `Qwen35Config` + 混合 micro-stack（v0.2：最少 4 层） |
+| 7 | `.cudalm` v1：单 block、fp16 + int4、rope 表 | v2：架构 id、Qwen35Config blob、层排布、任意命名张量表（bf16/fp32 dtype）、边界/唯一名校验；**v1 保持不可变** | **新增** v2 格式；v1 loader 不动 |
+| 8 | W4A16 G=128 源权重为 **fp16** | 同一打包契约（q∈[-7,7]、fp16 scale = amax/7、低 nibble = k=2b），但源 dtype 为 **bf16**；scale 仍存 fp16（GEMV 契约不变） | **扩展** 量化器（接受 bf16）；保留打包布局 + GEMV |
+| 9 | 每 block 7 个 GEMV（q,k,v,o,gate,up,down） | 全注意力层：同样 7 个（q_proj N=4096！）；DeltaNet 层：in_proj_qkv（N=6144）、in_proj_z（N=2048）、in_proj_b/in_proj_a（N=16）、out_proj（N=1024）。所有 K 维均为 128 的倍数 ✓ | **扩展** GEMV 使用（N=16 行合法：K=1024） |
+| 10 | 仅 KV cache | + 每个 linear 层增加 DeltaNet conv 状态 [conv_dim=6144, 3] + 递归状态 [16, 128, 128] fp32 | **新增** 状态归属（ownership） |
+| 11 | 默认 eps=1e-5 | eps=**1e-6** | **扩展** 经 config 传入（v0.1.1 常量不动） |
+| 12 | SwiGLU silu、无 bias | 相同（silu、无 bias） | **保留** |
 
 ---
 
-## 4. Checkpoint tensor mapping
+## 4. Checkpoint 张量映射
 
-Prefix stripped for language-model tensors: `model.language_model.` (the
-checkpoint is the multimodal `Qwen3_5ForConditionalGeneration`). 488 tensors
-total; v0.2 ingests **187** (see per-layer lists), skips 299 vision + 8 MTP
-tensors (backlog: full model).
+语言模型张量剥离前缀：`model.language_model.`（checkpoint 是多模态
+`Qwen3_5ForConditionalGeneration`）。共 488 个张量；v0.2 摄入 **187** 个
+（见逐层清单），跳过 299 个视觉 + 8 个 MTP 张量（backlog：完整模型）。
 
-### Per-layer tensors
+### 逐层张量
 
-Full-attention layer `i ∈ {3,7,11,15,19,23}` (`self_attn.*`, all bf16, no bias):
+全注意力层 `i ∈ {3,7,11,15,19,23}`（`self_attn.*`，全 bf16、无 bias）：
 
-| tensor | shape | notes |
+| 张量 | 形状 | 备注 |
 |---|---|---|
-| `self_attn.q_proj.weight` | [4096, 1024] | out row `h*512+j`: j<256 → query head h, j≥256 → **gate** head h |
-| `self_attn.k_proj.weight` | [512, 1024] | 2 KV heads × 256 |
+| `self_attn.q_proj.weight` | [4096, 1024] | 输出行 `h*512+j`：j<256 → 查询头 h，j≥256 → **gate** 头 h |
+| `self_attn.k_proj.weight` | [512, 1024] | 2 KV 头 × 256 |
 | `self_attn.v_proj.weight` | [512, 1024] | |
-| `self_attn.q_norm.weight` | [256] | zero-centered RMSNorm over head_dim |
+| `self_attn.q_norm.weight` | [256] | 跨 head_dim 的零中心 RMSNorm |
 | `self_attn.k_norm.weight` | [256] | |
 | `self_attn.o_proj.weight` | [1024, 2048] | |
 
-DeltaNet layer `i ∉ {3,7,11,15,19,23}` (`linear_attn.*`):
+DeltaNet 层 `i ∉ {3,7,11,15,19,23}`（`linear_attn.*`）：
 
-| tensor | shape | notes |
+| 张量 | 形状 | 备注 |
 |---|---|---|
-| `linear_attn.in_proj_qkv.weight` | [6144, 1024] | conv input = 2·key_dim + value_dim = 3·2048 |
-| `linear_attn.in_proj_z.weight` | [2048, 1024] | gate for output norm |
-| `linear_attn.in_proj_a.weight` | [16, 1024] | decay-rate input |
-| `linear_attn.in_proj_b.weight` | [16, 1024] | beta (update gate) input |
-| `linear_attn.conv1d.weight` | [6144, 1, 4] | depthwise causal conv, no bias; kept **bf16** (not a GEMV) |
-| `linear_attn.dt_bias` | [16] | kept bf16 |
-| `linear_attn.A_log` | [16] | **fp32** in the official checkpoint (verified in safetensors header, all 18 DeltaNet layers); v2 pass-through fp32; official code computes `A_log.float().exp()` so the decay math is fp32 regardless |
-| `linear_attn.norm.weight` | [128] | gated RMSNorm weight (plain, init ones); **fp32** in the official checkpoint; v2 pass-through fp32 |
+| `linear_attn.in_proj_qkv.weight` | [6144, 1024] | conv 输入 = 2·key_dim + value_dim = 3·2048 |
+| `linear_attn.in_proj_z.weight` | [2048, 1024] | 输出 norm 的 gate |
+| `linear_attn.in_proj_a.weight` | [16, 1024] | 衰减率输入 |
+| `linear_attn.in_proj_b.weight` | [16, 1024] | beta（更新门）输入 |
+| `linear_attn.conv1d.weight` | [6144, 1, 4] | depthwise causal conv、无 bias；保留 **bf16**（非 GEMV） |
+| `linear_attn.dt_bias` | [16] | 保留 bf16 |
+| `linear_attn.A_log` | [16] | 官方 checkpoint 中为 **fp32**（已在 safetensors header 验证，全部 18 个 DeltaNet 层一致）；v2 直通 fp32；官方代码计算 `A_log.float().exp()`，故衰减数学无论如何都是 fp32 |
+| `linear_attn.norm.weight` | [128] | gated RMSNorm 权重（普通、初值 ones）；官方 checkpoint 中为 **fp32**；v2 直通 fp32 |
 | `linear_attn.out_proj.weight` | [1024, 2048] | |
 
-Every layer (both types):
+每一层（两种类型都有）：
 
-| tensor | shape |
+| 张量 | 形状 |
 |---|---|
-| `input_layernorm.weight` | [1024] (zero-centered) |
-| `post_attention_layernorm.weight` | [1024] (zero-centered) |
+| `input_layernorm.weight` | [1024]（零中心） |
+| `post_attention_layernorm.weight` | [1024]（零中心） |
 | `mlp.gate_proj.weight` | [3584, 1024] |
 | `mlp.up_proj.weight` | [3584, 1024] |
 | `mlp.down_proj.weight` | [1024, 3584] |
 
-Model-level (ingested for completeness of the text model; not used by the
-4-layer micro-stack in v0.2 but validated at ingestion):
+模型级（为文本模型的完整性而摄入；v0.2 的 4 层 micro-stack 不用，但摄入时
+校验）：
 
-| tensor | shape |
+| 张量 | 形状 |
 |---|---|
-| `embed_tokens.weight` | [248320, 1024] (bf16; out of GEMV scope) |
-| `norm.weight` | [1024] (final zero-centered RMSNorm) |
+| `embed_tokens.weight` | [248320, 1024]（bf16；不在 GEMV 范围） |
+| `norm.weight` | [1024]（最终零中心 RMSNorm） |
 
-**Skipped (v0.2 backlog):** all `model.visual.*` (299 tensors) and `mtp.*`
-(8 tensors: `mtp.layers.0.*`, `mtp.fc`, `mtp.norm`, `mtp.pre_fc_norm_*`).
+**跳过的（v0.2 backlog）：** 全部 `model.visual.*`（299 个张量）与 `mtp.*`
+（8 个张量：`mtp.layers.0.*`、`mtp.fc`、`mtp.norm`、`mtp.pre_fc_norm_*`）。
 
-### W4A16 quantization targets (v0.2)
+### W4A16 量化目标（v0.2）
 
-All 12 projection GEMVs of each layer (7 per full-attn layer, 5 per DeltaNet
-layer) → packed int4 + fp16 scale, G=128 symmetric, source dtype bf16:
+每层全部 12 个投影 GEMV（全注意力层 7 个、DeltaNet 层 5 个）→ 打包 int4 +
+fp16 scale，G=128 对称，源 dtype bf16：
 
 | GEMV | N | K | K%128 |
 |---|---|---|---|
@@ -203,123 +197,117 @@ layer) → packed int4 + fp16 scale, G=128 symmetric, source dtype bf16:
 | in_proj_b / in_proj_a | 16 | 1024 | ✓ |
 | out_proj (deltanet) | 1024 | 2048 | ✓ |
 
-Non-GEMV bf16 tensors (layernorms, q/k_norm, conv1d, dt_bias,
-embed_tokens): stored bf16 in the v2 file, unmodified. Two tensors are
-stored fp32 in the official checkpoint — `linear_attn.A_log` [16] and
-`linear_attn.norm.weight` [128] (per-head gated-norm weight) — and are
-stored fp32 in the v2 file, unmodified. (dtype ground truth read from the
-checkpoint's safetensors header, consistent across all 24 layers.)
+非 GEMV 的 bf16 张量（layernorms、q/k_norm、conv1d、dt_bias、
+embed_tokens）：在 v2 文件中以 bf16 原样保存。有两个张量在官方 checkpoint
+中以 fp32 存储——`linear_attn.A_log` [16] 与 `linear_attn.norm.weight`
+[128]（逐头 gated-norm 权重）——在 v2 文件中同样以 fp32 原样保存。（dtype
+事实源读自 checkpoint 的 safetensors header，24 层全部一致。）
 
-Quantization (extends v1 contract, bf16 source):
-`scale32 = amax(group)/7` (fp32); `q = clamp(round-half-to-even(W/scale32),
--7, 7)`; zero group → scale=0, q=0; **scale stored as fp16** (the stored fp16
-scale is the contract, as in v1). Dequantized reference =
-`q · scale_fp16.as_f32`.
+量化（扩展 v1 契约，bf16 源）：`scale32 = amax(group)/7`（fp32）；
+`q = clamp(round-half-to-even(W/scale32), -7, 7)`；零组 → scale=0、q=0；
+**scale 以 fp16 存储**（与 v1 相同，存储的 fp16 scale 即契约）。
+反量化参考 = `q · scale_fp16.as_f32`。
 
 ---
 
-## 5. RoPE contract (Qwen3.5, full-attention layers only)
+## 5. RoPE 契约（Qwen3.5，仅全注意力层）
 
-From pinned `Qwen3_5TextRotaryEmbedding` + `apply_rotary_pos_emb`:
+出自钉死的 `Qwen3_5TextRotaryEmbedding` + `apply_rotary_pos_emb`：
 
-- `rope_type = "default"`, `rope_theta = 1e7`, `partial_rotary_factor = 0.25`
-- `head_dim = 256` → **rotary_dim = 64**; `inv_freq[j] = 1e7^(-2j/64)` for
-  j = 0..31 (fp32)
-- For decode position p (pure text): `freqs[j] = p · inv_freq[j]` (fp32)
-- **Layout = rotate-half (NOT v0.1.1 interleaved pairs):**
-  `emb = [freqs(32), freqs(32)]` (64 = 2×32);
-  `x_rot = x[0:64]`; `q' = q_rot·cos + rotate_half(q_rot)·sin` where
-  `rotate_half(z) = [-z[32:64], z[0:32]]`; dims 64..255 pass through unchanged
-- **Per-element frequency map (locked):** element `d` (0..63) of the rotated
-  part uses `freqs[d % 32]` and pairs with element `d ± 32` across the
-  halves — the replicated layout of `emb = cat(freqs, freqs)`. This is NOT
-  the interleaved `(2j, 2j+1)`-share-`freqs[j]` convention. The p=0 identity
-  holds under either convention; only the p>0 golden gate distinguishes
-  them (the interleaved indexing was caught there and fixed in
-  `qwen35_partial_rope_bf16` before Phase B sign-off)
-- cos/sin computed in **fp32**, then **cast to bf16** before the multiply
-  (official: `cos.to(dtype=x.dtype)`); the q·cos + rot·sin addition happens in
-  bf16
-- mRoPE: for pure-text decoding `position_ids` is `[3, bs, seq]` with all
-  three dims equal to p, so `apply_interleaved_mrope` is a mathematical no-op
-  (freqs identical across T/H/W). The v0.2 runtime implements the text
-  specialization only; vision grids are backlog.
-- Attention scaling: `head_dim ** -0.5 = 1/16` (separate from RoPE).
+- `rope_type = "default"`，`rope_theta = 1e7`，`partial_rotary_factor = 0.25`
+- `head_dim = 256` → **rotary_dim = 64**；j = 0..31 时
+  `inv_freq[j] = 1e7^(-2j/64)`（fp32）
+- 解码位置 p（纯文本）：`freqs[j] = p · inv_freq[j]`（fp32）
+- **布局 = rotate-half（不是 v0.1.1 的交错对）：**
+  `emb = [freqs(32), freqs(32)]`（64 = 2×32）；
+  `x_rot = x[0:64]`；`q' = q_rot·cos + rotate_half(q_rot)·sin`，其中
+  `rotate_half(z) = [-z[32:64], z[0:32]]`；64..255 维原样直通
+- **逐元素频率映射（已锁定）：** 旋转部分的元素 `d`（0..63）使用
+  `freqs[d % 32]`，并与跨半边的元素 `d ± 32` 配对——这正是
+  `emb = cat(freqs, freqs)` 的复制式布局。它**不是** `(2j, 2j+1)` 共享
+  `freqs[j]` 的交错约定。p=0 恒等式在两种约定下都成立；只有 p>0 的
+  golden 门能区分二者（交错索引正是在那里被抓住，并在 Phase B 签核前
+  修掉于 `qwen35_partial_rope_bf16`）
+- cos/sin 以 **fp32** 计算，**乘法之前转成 bf16**（官方：
+  `cos.to(dtype=x.dtype)`）；q·cos + rot·sin 的加法在 bf16 中进行
+- mRoPE：纯文本解码时 `position_ids` 为 `[3, bs, seq]` 且三个维都等于 p，
+  故 `apply_interleaved_mrope` 在数学上是 no-op（T/H/W 三向 freqs 相同）。
+  v0.2 运行时只实现文本特化；视觉网格在 backlog。
+- 注意力缩放：`head_dim ** -0.5 = 1/16`（与 RoPE 无关）。
 
 ---
 
-## 6. RMSNorm contracts
+## 6. RMSNorm 契约
 
-### 6.1 Zero-centered RMSNorm (`Qwen3_5RMSNorm`) — layernorms + q/k norm + final norm
+### 6.1 零中心 RMSNorm（`Qwen3_5RMSNorm`）——layernorm + q/k norm + 最终 norm
 
 ```
 y = (x_f32 · rsqrt(mean(x_f32²) + eps) · (1 + w_f32)).to(input_dtype)
 ```
-- `w` is the **zero-centered** weight (checkpoint values; init zeros)
+- `w` 是**零中心**权重（checkpoint 值；初值 zeros）
 - `eps = 1e-6`
-- used at: `input_layernorm` [1024], `post_attention_layernorm` [1024],
-  `q_norm`/`k_norm` [256] (per head, last dim), final `norm` [1024]
-- **v0.1.1 RMSNorm semantics (`x·rsqrt(·)·w`, plain weight) are NOT changed**
-  — new kernel/mode only.
+- 使用位置：`input_layernorm` [1024]、`post_attention_layernorm` [1024]、
+  `q_norm`/`k_norm` [256]（逐头、最后一维）、最终 `norm` [1024]
+- **v0.1.1 RMSNorm 语义（`x·rsqrt(·)·w`、普通权重）不变**——只新增
+  kernel/模式。
 
-### 6.2 Gated RMSNorm (`Qwen3_5RMSNormGated`) — DeltaNet output only
+### 6.2 Gated RMSNorm（`Qwen3_5RMSNormGated`）——仅 DeltaNet 输出
 
-Exact official dtype flow, x and gate have last dim 128:
+精确官方 dtype 流，x 与 gate 的最后一维为 128：
 
 ```
 1. n = (x.to(f32) · rsqrt(mean(x.to(f32)²) + eps)).to(bf16)
-2. a = w · n                                # w = norm.weight (stored fp32)
+2. a = w · n                                # w = norm.weight（存 fp32）
 3. y = (a · silu(gate.to(f32))).to(bf16)
 ```
-`w` is stored **fp32** in the official checkpoint, so step 2 in the official
-torch code promotes to fp32 (the only internal rounding is the bf16 cast in
-step 1); had the loader cast `w` to bf16, step 2 would be a bf16 multiply.
-The Phase B golden reference pins which case the runtime must match (the v2
-file keeps `w` fp32 byte-exact either way). The CUDA kernel must mirror the
-pinned flow's rounding points exactly, not just the fp32 ideal.
+`w` 在官方 checkpoint 中以 **fp32** 存储，因此官方 torch 代码的第 2 步会
+提升为 fp32（唯一内部舍入是第 1 步的 bf16 cast）；若 loader 把 `w` cast
+成 bf16，第 2 步就会变成 bf16 乘法。Phase B 的 golden 参考钉死了运行时
+必须匹配哪一种情况（v2 文件无论如何都把 `w` 以 fp32 逐字节保留）。
+CUDA kernel 必须精确镜像钉死流的各舍入点，而不只是 fp32 理想值。
 
 ---
 
-## 7. Full-attention layer contract (decode step, position p)
+## 7. 全注意力层契约（decode 步，位置 p）
 
-All projections bias-free; model dtype bf16. Input `x ∈ R^{1024}` (bf16,
-batch-1, one token).
+所有投影无 bias；模型 dtype bf16。输入 `x ∈ R^{1024}`（bf16、batch-1、
+单 token）。
 
 ```
 h0  = zero_rmsnorm(x, input_layernorm.w)                    # bf16
-q_g = W_q @ h0                                              # [4096] = interleave per head
+q_g = W_q @ h0                                              # [4096] = 逐头交错
       (rows h*512..h*512+255 = q_h, h*512+256..h*512+511 = gate_h, h=0..7)
-q_h = zero_rmsnorm_over_head(q_h, q_norm.w)   per head h     # over 256
+q_h = zero_rmsnorm_over_head(q_h, q_norm.w)   per head h     # 跨 256
 k_h = zero_rmsnorm_over_head(k_h, k_norm.w)   per head (2 kv heads)
 v_h = W_v @ h0                                          # [2·256]
-q'_h, k'_h = partial_rotate_half_rope(q_h, k_h, p)      # §5, first 64 dims
-KV cache: K[p] ← k', V[p] ← v                            # [2, p+1, 256] per kv head
+q'_h, k'_h = partial_rotate_half_rope(q_h, k_h, p)      # §5，前 64 维
+KV cache: K[p] ← k', V[p] ← v                            # 每个 kv 头 [2, p+1, 256]
 attn_h: s = (q'_h · K_kv[h//4][0..p]) / 16 ; softmax_fp32 ; out = w · V_kv[...]   # [256]
 out = Σ heads concat → [2048]
-out = out ⊙ sigmoid(gate)                                 # gate from q_g (bf16 sigmoid)
+out = out ⊙ sigmoid(gate)                                 # gate 来自 q_g（bf16 sigmoid）
 attn_out = W_o @ out                                      # [1024]
-res1 = x + attn_out                                       # bf16 add
+res1 = x + attn_out                                       # bf16 加法
 h1  = zero_rmsnorm(res1, post_attention_layernorm.w)
-mlp = W_down @ (silu(W_gate @ h1) ⊙ (W_up @ h1))          # SwiGLU, no bias
+mlp = W_down @ (silu(W_gate @ h1) ⊙ (W_up @ h1))          # SwiGLU、无 bias
 y   = res1 + mlp
 ```
 
-State: KV cache only, layout `[n_kv_heads=2, seq, 256]` for K and V (bf16).
+状态：仅 KV cache，K 与 V 布局 `[n_kv_heads=2, seq, 256]`（bf16）。
 
-## 8. Gated DeltaNet layer contract (decode step, position p)
+## 8. Gated DeltaNet 层契约（decode 步，位置 p）
 
-Dimensions: `key_dim = 16·128 = 2048`, `value_dim = 16·128 = 2048`,
-`conv_dim = 6144`. All projections bias-free. Model dtype bf16.
+维度：`key_dim = 16·128 = 2048`、`value_dim = 16·128 = 2048`、
+`conv_dim = 6144`。所有投影无 bias。模型 dtype bf16。
 
 ```
 mixed = W_qkv @ x            # [6144]
-z     = W_z   @ x            # [2048] = 16 heads × 128 (gate for norm)
+z     = W_z   @ x            # [2048] = 16 头 × 128（norm 的 gate）
 b     = W_b   @ x            # [16]
 a     = W_a   @ x            # [16]
 
-# depthwise causal conv1d, kernel 4, no bias — DECODE with conv state cs[6144][3]:
-buf   = [cs(3), mixed(1)]    # [6144][4], bf16
-cs    = buf[:, -3:]          # state update (in place)
+# depthwise causal conv1d、kernel 4、无 bias —— DECODE 时带 conv 状态 cs[6144][3]：
+buf   = [cs(3), mixed(1)]    # [6144][4]，bf16
+cs    = buf[:, -3:]          # 状态更新（就地）
 c     = Σ_{j=0..3} W_conv[·,j] · buf[:,j]   (per channel; bf16)
 mixed = silu(c)
 
@@ -327,246 +315,230 @@ q,k,v = split(mixed, [2048,2048,2048]) → reshape [16,128] each
 beta  = sigmoid(b)           # bf16 [16]
 g     = -exp(A_log_f32) · softplus(a_f32 + dt_bias_f32)   # fp32 [16]
 
-# delta-rule recurrence, state S ∈ R^{16×128×128} kept in FP32:
+# delta-rule 递推，状态 S ∈ R^{16×128×128} 保持 FP32：
 for each head h (independent):
   q_h = l2norm(q_h, eps=1e-6); k_h = l2norm(k_h, eps=1e-6)   # fp32
   q_h = q_h / sqrt(128)
   S_h = S_h · exp(g_h)
-  m   = S_h · k_h                       # [128] (contract over key dim)
+  m   = S_h · k_h                       # [128]（对 key 维收缩）
   d   = (v_h - m) · beta_h
-  S_h = S_h + k_h ⊗ d                   # outer product
-  o_h = S_h · q_h                       # [128]   # NOTE: out uses UPDATED S
+  S_h = S_h + k_h ⊗ d                   # 外积
+  o_h = S_h · q_h                       # [128]   # 注意：输出用的是更新后的 S
 
 core = concat o_h → [2048] → [16,128]
 out  = gated_rmsnorm(core, gate=z, w=norm.w)    # §6.2
 y    = W_out @ out                              # [1024]
 ```
 
-`l2norm(x) = x · rsqrt(Σ x² + 1e-6)` (FLA-conformant, per §1.2).
+`l2norm(x) = x · rsqrt(Σ x² + 1e-6)`（与 FLA 一致，见 §1.2）。
 
-**State (per DeltaNet layer, explicit ownership):**
-- `conv_state`: bf16 `[6144, 3]` (last kernel-1=3 tokens of the qkv stream)
-- `recurrent_state`: **fp32** `[16, 128, 128]` (head, key_dim, value_dim)
-- initial state = zeros (first token); both updated in place every decode step
+**状态（每个 DeltaNet 层，显式归属）：**
+- `conv_state`：bf16 `[6144, 3]`（qkv 流最后 kernel-1=3 个 token）
+- `recurrent_state`：**fp32** `[16, 128, 128]`（head、key_dim、value_dim）
+- 初始状态 = 全零（首 token）；两者在每个 decode 步就地更新
 
-**Order-of-operations invariants (golden-verified):** decay → delta update →
-output from updated state; conv state updated BEFORE conv output read; g
-computed in fp32; A_log is stored fp32 in the checkpoint (used directly,
-`A_log.float()` in official code is a no-op), dt_bias stored bf16 → cast
-fp32.
+**运算顺序不变式（golden 验证）：** 衰减 → delta 更新 → 用更新后的状态算
+输出；conv 状态在读取 conv 输出**之前**更新；g 以 fp32 计算；A_log 在
+checkpoint 中存 fp32（直接使用，官方代码里的 `A_log.float()` 是 no-op）；
+dt_bias 存 bf16 → cast 成 fp32。
 
 ---
 
-## 9. Decoder layer / micro-stack wiring
+## 9. Decoder 层 / micro-stack 接线
 
-Standard pre-norm (both layer types):
+标准 pre-norm（两种层类型）：
 
 ```
 res1 = x + mixer(zero_rmsnorm(x, input_layernorm))
 y    = res1 + mlp(zero_rmsnorm(res1, post_attention_layernorm))
 ```
 
-**Hybrid micro-stack (v0.2 top target):** layers 0,1,2 (DeltaNet) + layer 3
-(first Full Attention) of the real checkpoint, decode steps p = 0,1,2,… with
-batch-1 tokens. Inputs: seeded random bf16 hidden states [1, 1, 1024]
-(embedding is out of scope — recorded in backlog); position p at step p.
-Verified per step: every layer output, full-attn KV state, DeltaNet conv +
-recurrent states, final micro-stack output — against the official
-transformers forward at the pinned commit with the quantized weights swapped
-in (see §11).
+**混合 micro-stack（v0.2 顶层目标）：** 真实 checkpoint 的 0、1、2 层
+（DeltaNet）+ 第 3 层（第一个 Full Attention），decode 步 p = 0,1,2,…，
+batch-1 token。输入：带种子的随机 bf16 hidden states [1, 1, 1024]
+（embedding 超范围——已记 backlog）；第 p 步用位置 p。逐步骤验证：每层
+输出、全注意力 KV 状态、DeltaNet conv + 递归状态、micro-stack 最终输出——
+对照钉死 commit 的官方 transformers forward（换入量化权重，见 §11）。
 
 ---
 
-## 10. .cudalm v2 plan
+## 10. .cudalm v2 规划
 
-v1 (`CUDLMW01`) is immutable. v2 (`CUDLMW02`) additions:
+v1（`CUDLMW01`）不可变。v2（`CUDLMW02`）新增：
 
-- magic `CUDLMW02`, version u32 = 2
-- fixed config blob for `Qwen35Config` (dims above + eps + rope_theta +
+- magic `CUDLMW02`，version u32 = 2
+- `Qwen35Config` 的固定 config blob（上述维度 + eps + rope_theta +
   partial_rotary_factor + mrope_section[3] + full_attention_interval +
-  group_size + max_seq_len)
-- architecture id string (`qwen35-text`), model repo/revision and
-  transformers commit + file hashes in a metadata TLV section (provenance
-  travels with the weights)
-- arbitrary named tensor table: name (≤255B, unique), dtype ∈ {fp16, bf16,
-  fp32, int4_packed, fp16_scale, int8}, ndim ≤ 8, dims i64, offset/byte_size/
-  align; 16B payload alignment; full bounds validation
-- NO RoPE tables (cos/sin computed on the fly per position — §5)
-- tensor names: official checkpoint names with the `model.language_model.`
-  prefix (e.g. `layers.3.self_attn.q_proj.weight`, `layers.0.linear_attn.conv1d.weight`,
-  `layers.0.input_layernorm.weight`, plus quantized pairs
-  `*.weight`→int4 + `*.scale`→fp16) — no giant C++ switch; the loader resolves
-  by name table.
+  group_size + max_seq_len）
+- 架构 id 字符串（`qwen35-text`）；模型 repo/revision 与 transformers
+  commit + 文件 hash 放在 metadata TLV 段（溯源随权重走）
+- 任意命名张量表：name（≤255B、唯一）、dtype ∈ {fp16, bf16, fp32,
+  int4_packed, fp16_scale, int8}、ndim ≤ 8、dims i64、offset/byte_size/
+  align；payload 16B 对齐；完整边界校验
+- **无** RoPE 表（cos/sin 按位置现算——§5）
+- 张量命名：官方 checkpoint 名加 `model.language_model.` 前缀（如
+  `layers.3.self_attn.q_proj.weight`、`layers.0.linear_attn.conv1d.weight`、
+  `layers.0.input_layernorm.weight`，以及量化对
+  `*.weight`→int4 + `*.scale`→fp16）——不搞巨型 C++ switch；loader 按
+  命名表解析。
 
-Converter: `tools/convert_qwen35.py` (offline; may use Python/safetensors/
-torch) reads official config.json + safetensors, applies the shared
-bf16→W4A16 quantizer, writes v2. Runtime (`include/`+`src/`) stays
-no-torch.
+转换器：`tools/convert_qwen35.py`（离线；可用 Python/safetensors/torch）
+读官方 config.json + safetensors，套用共享的 bf16→W4A16 量化器，写出 v2。
+运行时（`include/`+`src/`）保持无 torch。
 
-## 11. Golden strategy
+## 11. Golden 策略
 
-`tools/generate_qwen35_golden.py` (offline):
+`tools/generate_qwen35_golden.py`（离线）：
 
-1. installs/uses transformers pinned at `fc9137225880` (oracle code)
-2. loads the real checkpoint (bf16), takes `model.language_model`
-   (`Qwen3_5TextModel`)
-3. swaps the 12 per-layer GEMV weights with the **dequantized W4A16** values
-   (same shared quantizer as the converter) → "quantized reference"
-4. runs history tokens (seeded random bf16 hidden states) through the
-   official forward to build real KV + conv + recurrent state, then the
-   decode step at position p
-5. hooks capture: layer inputs/outputs, norm outputs, projection outputs,
-   q/k after norm, after RoPE, attention gate/output, DeltaNet conv state /
-   g / beta / recurrent state (before+after), FFN outputs, final output, KV
-   state
-6. writes a `CUDLMG02` golden container (see below)
+1. 安装/使用钉死在 `fc9137225880` 的 transformers（oracle 代码）
+2. 加载真实 checkpoint（bf16），取 `model.language_model`
+   （`Qwen3_5TextModel`）
+3. 把每层 12 个 GEMV 权重换成**反量化 W4A16** 值（与转换器同一共享量化器）
+   →「量化参考」
+4. 用历史 token（带种子的随机 bf16 hidden states）跑官方 forward 建立真实
+   KV + conv + 递归状态，再跑位置 p 的 decode 步
+5. hook 捕获：层输入/输出、norm 输出、投影输出、norm 后的 q/k、RoPE 后、
+   注意力 gate/输出、DeltaNet conv 状态 / g / beta / 递归状态（前后）、
+   FFN 输出、最终输出、KV 状态
+6. 写出 `CUDLMG02` golden 容器（见下）
 
-**A/B split (hard gate vs report):**
-- A. runtime correctness: CUDALM runtime (quantized weights + golden-seeded
-  states) vs this golden — HARD GATE
-- B. quantization fidelity: official bf16 weights vs quantized reference
-  (max_abs, RMSE, cosine per weight tensor + layer outputs) — REPORT ONLY,
-  written to a sibling `.fidelity.json` and never mixed into the runtime
-  error numbers
+**A/B 切分（硬门 vs 报告）：**
+- A. 运行时正确性：CUDALM 运行时（量化权重 + golden 播种的状态）vs 本
+  golden —— **硬门**
+- B. 量化保真度：官方 bf16 权重 vs 量化参考（每权重张量 + 层输出的
+  max_abs、RMSE、cosine）——**仅报告**，写入同目录 `.fidelity.json`，
+  绝不混进运行时误差数字
 
-Provenance recorded in the golden: repo, revision, transformers commit,
-transformers version, input seed, positions, dtype, fast-path=off.
+golden 内记录溯源：repo、revision、transformers commit、transformers 版本、
+输入种子、位置、dtype、fast-path=off。
 
-### 11.1 CUDLMG02 container (locked)
+### 11.1 CUDLMG02 容器（已锁定）
 
 `magic "CUDLMG02"` | u32 version=1 | u32 flags=0 | u32 n_tensors |
 u32 _pad | 88 B Qwen35Config blob | i32 position | i32 layer_idx |
 i32 input_seed | i32 _reserved | u64 table_offset (=144) |
-u64 payload_offset (16 B-aligned). The table REGION is
-`[table_offset, payload_offset)`: the n records occupy its front and the
-remaining bytes are zero padding (the header carries **no** `table_size`
-field, unlike the v2 weight container; readers parse exactly n records and
-require the rest to be zero). Each record: `name_len u8 | name |
-dtype u8 | ndim u8 | pad u16 | dims i64[8] | offset u64 | byte_size u64 |
-align u8 | pad u8`. Payload tensor blobs follow in table order, offsets from
-`payload_offset`, each 16 B-aligned.
+u64 payload_offset（16 B 对齐）。表**区域**为 `[table_offset,
+payload_offset)`：n 条记录占据其前部，其余字节为零填充（与 v2 权重容器
+不同，表头**没有** `table_size` 字段；读者恰好解析 n 条记录，并要求其余
+字节为零）。每条记录：`name_len u8 | name | dtype u8 | ndim u8 |
+pad u16 | dims i64[8] | offset u64 | byte_size u64 | align u8 | pad u8`。
+payload 张量 blob 按表序排列，偏移自 `payload_offset` 起，每个 16 B 对齐。
 
-Tensors (23 stage tensors + KV state), all bf16 unless noted:
+张量（23 个 stage 张量 + KV 状态），除注明外全为 bf16：
 `stage.{input,rmsnorm1,q_gate,q,att_gate,k,v,q_norm,k_norm,rope_q,rope_k,
 attention_raw,attention_gated,o_proj,residual1,rmsnorm2,mlp_gate,mlp_up,
-silu_mul,mlp_down,final_output}` plus `kv.k_state` / `kv.v_state` with
-`[n_kv*(position+1), head_dim]` row order `(kv_head, position)` — the
-history rows are what the runtime seeds its cache from, so the KV round-trip
-is checked bit-exact.
+silu_mul,mlp_down,final_output}`，另加 `kv.k_state` / `kv.v_state`，形状
+`[n_kv*(position+1), head_dim]`、行序 `(kv_head, position)`——历史行正是
+运行时播种其 cache 的来源，因此 KV round-trip 按位精确（bit-exact）校验。
 
-**Oracle rounding contract** (mirrored 1:1 by the runtime, this is why the
-hard gate is bit-exact at p=0 and within 1 bf16 ulp at p>0): GEMV = fp32
-accumulate → one bf16 RNE; zero-centered RMSNorm = all-fp32 chain → one bf16
-cast; RoPE = cos/sin fp32→bf16 **before** the multiply, then per element
-three bf16 roundings `bf16(x·cos_b)`, `bf16(rot·sin_b)`, `bf16(sum)`;
-attention = bf16 QK matmul (fp32 acc → bf16) × `1/16` (bf16) → fp32
-max-subtract softmax → bf16 → bf16 PV (fp32 acc → bf16); silu = fp32
-`x/(1+exp(-x))` rounded to bf16 **first**, then bf16 multiply; sigmoid the
-same. The QuantLinear in the oracle is an fp32 dequant matmul → one bf16
-cast, so quantization fidelity stays OUT of the hard gate.
+**Oracle 舍入契约**（运行时 1:1 镜像，这正是硬门在 p=0 位级精确、p>0 在
+1 个 bf16 ulp 内的原因）：GEMV = fp32 累加 → 一次 bf16 RNE；零中心
+RMSNorm = 全 fp32 链 → 一次 bf16 cast；RoPE = cos/sin 先 fp32→bf16 再
+参与乘法，之后逐元素三次 bf16 舍入 `bf16(x·cos_b)`、`bf16(rot·sin_b)`、
+`bf16(sum)`；注意力 = bf16 QK matmul（fp32 acc → bf16）× `1/16`（bf16）
+→ fp32 减最大值 softmax → bf16 → bf16 PV（fp32 acc → bf16）；silu = fp32
+`x/(1+exp(-x))` **先**舍入到 bf16、再做 bf16 乘法；sigmoid 同理。oracle
+里的 QuantLinear 是 fp32 反量化 matmul → 一次 bf16 cast，因此量化保真度
+被排除在硬门之外。
 
-**p=0 invariants (bit-exact):** rope_q == q_norm and rope_k == k_norm
-(RoPE at position 0 is the identity vs its inputs, not vs raw q/k); each
-attention_raw head-h row == the v row of KV head `h // num_key_value_groups`
-(probs = [1] exactly); KV rows == the stage copies.
+**p=0 不变式（位级精确）：** rope_q == q_norm 且 rope_k == k_norm
+（位置 0 的 RoPE 相对其输入是恒等，而非相对原始 q/k）；attention_raw
+每个头 h 的行 == KV 头 `h // num_key_value_groups` 的 v 行（probs 恰为
+[1]）；KV 行 == stage 拷贝。
 
-**Stage tolerance:** the C++ `compare_bf16_stages` uses atol=rtol=1e-2.
-The oracle and the runtime agree to ~1 bf16 ulp after each rounding; the
-tolerance absorbs fp32 re-association inside the GEMV/attention matmuls and
-≤1-ulp libm vs torch `cosf/sinf` differences, while still catching any
-O(1) wiring or dtype bug. See `include/cudalm/stage_compare.h`.
+**Stage 容差：** C++ `compare_bf16_stages` 用 atol=rtol=1e-2。oracle 与
+运行时在每次舍入后相差 ~1 个 bf16 ulp；该容差吸收 GEMV/注意力 matmul
+内部的 fp32 结合序差异与 libm 对 torch `cosf/sinf` 的 ≤1-ulp 差异，
+同时仍能抓住任何 O(1) 的接线或 dtype 错误。见
+`include/cudalm/stage_compare.h`。
 
-## 12. Milestones
+## 12. 里程碑
 
-- **A** — this doc + `Qwen35Config` + `.cudalm` v2 + `convert_qwen35.py` +
-  ingestion test (names/shapes/dtype/values/schedule/roundtrip)
-- **B** — `Qwen35FullAttentionLayer` (+ rmsnorm / rope / gated-norm kernels
-  shared) + real-checkpoint golden PASS (p=0, p>0, non-zero KV history)
-- **C** — `Qwen35DeltaNetLayer` + state transition golden PASS (first token,
-  sequential tokens, non-zero previous state; output AND state compared)
-- **D** — 4-layer hybrid micro-stack golden PASS (per-layer + all states +
-  final), sequential p=0,1,2,…; benchmark three views; compute-sanitizer
-  clean; docs/evidence update; push `v0.2-qwen35`
+- **A** —— 本文档 + `Qwen35Config` + `.cudalm` v2 + `convert_qwen35.py` +
+  摄入测试（名/形状/dtype/数值/排布/round-trip）【已完成】
+- **B** —— `Qwen35FullAttentionLayer`（+ 共享的 rmsnorm / rope /
+  gated-norm kernel）+ 真实 checkpoint golden PASS（p=0、p>0、非零 KV
+  历史）【已完成，见 §14】
+- **C** —— `Qwen35DeltaNetLayer` + 状态转移 golden PASS（首 token、连续
+  token、非零前一状态；输出**和**状态都比对）【未开始】
+- **D** —— 4 层混合 micro-stack golden PASS（逐层 + 全部状态 + 最终输出），
+  顺序 p=0,1,2,…；benchmark 三视图；compute-sanitizer 干净；文档/证据
+  更新；推送 `v0.2-qwen35`【未开始】
 
-## 13. Architecture risks
+## 13. 架构风险
 
-| risk | mitigation |
+| 风险 | 缓解 |
 |---|---|
-| bf16 conv1d on sm_75 (Turing) in the golden env | test early; if cuDNN bf16 conv fails on GPU, run oracle on CPU bf16 or isolate conv in fp32 with the official rounding points (documented deviation only if unavoidable) |
-| `@use_kernelized_func` decorator routing RoPE elsewhere | golden env has no kernel libraries → pure function path; assert at golden-gen time that the fallback path is active |
-| bf16 rounding subtleties in gated RMSNorm / g / beta | golden captures staged values in model dtype; kernel mirrors the exact rounding sequence (verified per-stage, not just final output) |
-| version-string conflict (4.57.0.dev0 vs modeling added 2026-02) | documented §1.2; pin = the official PR commit, not the version string |
-| conv state shape (kernel-1 = 3) vs docstring `d_conv` | docstring in pinned source is imprecise; empirical layout from `torch_causal_conv1d_update` is authoritative: [conv_dim, 3] |
-| q_proj fused [q;gate] layout misread | pinned source: `view(-1, head_dim*2)` then `chunk(2, dim=-1)` → per-head q then gate; verified against checkpoint shape 4096 |
-| state seeding across quantized vs bf16 reference | golden builds states from the SAME quantized weights the runtime uses (no mixed-state contamination) |
+| golden 环境中 sm_75（Turing）上的 bf16 conv1d | 尽早测试；若 GPU 上 cuDNN bf16 conv 失败，改在 CPU bf16 上跑 oracle，或把 conv 隔离在 fp32 并按官方舍入点处理（仅在不可避免时记录为偏差） |
+| `@use_kernelized_func` 装饰器把 RoPE 路由到别处 | golden 环境无 kernel 库 → 走纯函数路径；golden 生成时断言回退路径已激活 |
+| gated RMSNorm / g / beta 的 bf16 舍入细节 | golden 以模型 dtype 捕获逐级值；kernel 精确镜像舍入序列（逐 stage 验证，而非只看最终输出） |
+| 版本字符串冲突（4.57.0.dev0 vs modeling 2026-02 才加入） | 已记录于 §1.2；pin = 官方 PR commit，而非版本字符串 |
+| conv 状态形状（kernel-1 = 3）vs docstring 的 `d_conv` | 钉死源里的 docstring 不精确；以 `torch_causal_conv1d_update` 的经验布局为准：[conv_dim, 3] |
+| q_proj 融合 [q;gate] 布局误读 | 钉死源：`view(-1, head_dim*2)` 后 `chunk(2, dim=-1)` → 每头先 q 后 gate；已对照 checkpoint 形状 4096 验证 |
+| 量化 vs bf16 参考之间的状态播种 | golden 用与运行时**相同**的量化权重建立状态（无混合状态污染） |
 
 ---
 
-## 14. Phase B completion record (Qwen3.5 Full Attention)
+## 14. Phase B 完成记录（Qwen3.5 全注意力）
 
-Phase B is **DONE** and sign-off-verified. Scope = the Qwen3.5-specific BF16
-runtime path for one full-attention layer (layers 3/7/11/15/19/23), real
-checkpoint weights, real-checkpoint golden PASS at p=0 and p>0 with
-non-zero KV history. DeltaNet (Phase C) and the hybrid micro-stack (Phase D)
-are **NOT started**.
+Phase B **已完成**并通过签核验证。范围 = 一个全注意力层
+（layers 3/7/11/15/19/23）的 Qwen3.5 专属 BF16 运行时路径、真实
+checkpoint 权重、真实 checkpoint golden 在 p=0 及带非零 KV 历史的 p>0
+均 PASS。DeltaNet（Phase C）与混合 micro-stack（Phase D）**未开始**。
 
-### 14.1 What landed
+### 14.1 落地内容
 
-- `int4_gemv_bf16` (`.h`/`.cu`) — port of the v0.1 `int4_gemv` rowtile4
-  kernel with a BF16 activation/output path (W4A16 G=128, q∈[-7,7], FP16
-  scale, FP32 accumulate, one bf16 RNE store). CUDA 11.8 has no
-  `__bfloat1622float2`, so a `bf162_to_float2` helper is used.
-- `qwen35_kernels` (`.h`/`.cu`) — native BF16 kernels: `qwen35_rmsnorm_zc_bf16`
-  (zero-centered `x·(1+w)`), `qwen35_split_q_gate_bf16`, `qwen35_partial_rope_bf16`
-  (replicated-freq §5, fp32 cos/sin table → bf16 at the multiply),
-  `qwen35_kv_write_bf16`, `qwen35_attention_decode_bf16` (scores/softmax/PV,
-  bf16 matmuls with fp32 accumulate, exact `1/16` scaling), and
-  `qwen35_add_bf16` / `qwen35_silu_mul_bf16` / `qwen35_gate_mul_bf16`.
-- `Qwen35KvCache` (`.h`/`.cpp`) — BF16 `[n_kv, max_seq, head_dim]` cache,
-  K = post-RoPE rows, V = raw rows; `k_mut()/v_mut()` for test seeding.
-- `Qwen35FullAttentionLayer` (`.h`/`.cpp`) — the 21-stage decode layer with
-  `forward` / `forwardTimed` (21 stage event pairs + whole-layer pair),
-  owns the KV cache + buffers + fp32 rope table (host libm, bit-identical to
-  the CPU golden).
-- `golden_loader_v2` (`.h`/`.cpp`) + `tools/common/golden_v2.py` — the
-  CUDLMG02 C++/Python pair (§11.1), byte-for-byte round-trip.
-- `tools/generate_qwen35_golden.py` — the oracle (pinned transformers, real
-  checkpoint, shared quantizer) + `--selftest` (synthetic weights, no
-  checkpoint) + `--fidelity-report`.
+- `int4_gemv_bf16`（`.h`/`.cu`）——v0.1 `int4_gemv` rowtile4 kernel 的
+  移植，带 BF16 激活/输出路径（W4A16 G=128、q∈[-7,7]、FP16 scale、FP32
+  累加、一次 bf16 RNE 存储）。CUDA 11.8 没有 `__bfloat1622float2`，故使用
+  `bf162_to_float2` 辅助函数。
+- `qwen35_kernels`（`.h`/`.cu`）——原生 BF16 kernel：`qwen35_rmsnorm_zc_bf16`
+  （零中心 `x·(1+w)`）、`qwen35_split_q_gate_bf16`、`qwen35_partial_rope_bf16`
+  （复制式频率 §5，fp32 cos/sin 表 → 乘法处转 bf16）、`qwen35_kv_write_bf16`、
+  `qwen35_attention_decode_bf16`（scores/softmax/PV，bf16 matmul 配 fp32
+  累加、精确 `1/16` 缩放），以及 `qwen35_add_bf16` /
+  `qwen35_silu_mul_bf16` / `qwen35_gate_mul_bf16`。
+- `Qwen35KvCache`（`.h`/`.cpp`）——BF16 `[n_kv, max_seq, head_dim]`
+  cache，K = RoPE 后行、V = 原始行；`k_mut()/v_mut()` 供测试播种。
+- `Qwen35FullAttentionLayer`（`.h`/`.cpp`）——21 个 stage 的 decode 层，
+  带 `forward` / `forwardTimed`（21 对 stage 事件 + 整层一对），持有
+  KV cache + 各 buffer + fp32 rope 表（宿主 libm，与 CPU golden 位级一致）。
+- `golden_loader_v2`（`.h`/`.cpp`）+ `tools/common/golden_v2.py` ——
+  CUDLMG02 的 C++/Python 一对（§11.1），逐字节 round-trip。
+- `tools/generate_qwen35_golden.py` —— oracle（钉死 transformers、真实
+  checkpoint、共享量化器）+ `--selftest`（合成权重、无需 checkpoint）+
+  `--fidelity-report`。
 
-### 14.2 Sign-off evidence (this run)
+### 14.2 签核证据（本次运行）
 
-- `test_qwen35_full_attention_golden` (layer 3, seed 20260209):
-  - p=0: all 21 stages OK, **worst max_abs_err = 6.1e-05**, p=0 invariants
-    bit-exact, KV pos-row copy invariants OK.
-  - p=5 (5-row non-zero KV history): all 21 stages OK,
-    **worst max_abs_err = 4.9e-04**, KV history bit-exact, pos-row
-    invariants OK.
-- Kernel unit tests: `test_int4_gemv_bf16` and `test_qwen35_kernels` all
-  bit-exact / 0-error (RoPE vs the exact-rounding CPU reference, attention
-  p=0 == v row, p=4 0-error).
-- Full `ctest`: **27/27 PASS** (old v0.1/v0.1.1 regression + Phase A
-  ingestion + Phase B unit + Phase B golden).
-- `compute-sanitizer --tool memcheck`: **0 errors** — kernel + GEMV unit
-  tests, and the full layer via the bench at p=0 and p=5 (same memory
-  surface as the golden test's C++ phase; evidence + the golden-test
-  launcher-hang note in `benchmarks/sanitizer_qwen35_full_attention.txt`).
-- `scripts/check_no_torch.sh`: **CLEAN** (no torch/pybind in include/ src/).
-- Quantization fidelity (REPORT ONLY, not the gate): per-weight cosine
-  ≈ 0.991–0.993, layer-output cosine ≈ 0.982
-  (`build/data/qwen35_golden_l3_p0.cudalm.fidelity.json`).
+- `test_qwen35_full_attention_golden`（layer 3，种子 20260209）：
+  - p=0：21 个 stage 全 OK，**最差 max_abs_err = 6.1e-05**，p=0 不变式
+    位级精确，KV pos 行拷贝不变式 OK。
+  - p=5（5 行非零 KV 历史）：21 个 stage 全 OK，
+    **最差 max_abs_err = 4.9e-04**，KV 历史位级精确，pos 行不变式 OK。
+- kernel 单元测试：`test_int4_gemv_bf16` 与 `test_qwen35_kernels` 全部
+  位级精确 / 0 错误（RoPE 对精确舍入 CPU 参考、注意力 p=0 == v 行、
+  p=4 0 错误）。
+- 完整 `ctest`：**27/27 PASS**（旧 v0.1/v0.1.1 回归 + Phase A 摄入 +
+  Phase B 单元 + Phase B golden）。
+- `compute-sanitizer --tool memcheck`：**0 错误**——kernel + GEMV 单元
+  测试，以及经 bench 在 p=0 与 p=5 跑的全层（与 golden 测试 C++ 阶段
+  同一内存面；证据 + golden 测试启动器挂起说明见
+  `benchmarks/sanitizer_qwen35_full_attention.txt`）。
+- `scripts/check_no_torch.sh`：**CLEAN**（include/、src/ 无 torch/pybind）。
+- 量化保真度（仅报告，非硬门）：逐权重 cosine ≈ 0.991–0.993，层输出
+  cosine ≈ 0.982（`build/data/qwen35_golden_l3_p0.cudalm.fidelity.json`）。
 
-### 14.3 Latency (RTX 2080 Ti, sm_75, 100 iters, report only)
+### 14.3 时延（RTX 2080 Ti，sm_75，100 次迭代，仅报告）
 
-Archived under `benchmarks/results/`:
+存档于 `benchmarks/results/`：
 
-| position | whole_layer_gpu_us (mean) | layer_steps_per_second_mean |
+| 位置 | whole_layer_gpu_us（均值） | layer_steps_per_second_mean |
 |---|---|---|
 | p=0  | ≈ 205.6 | ≈ 4865 |
 | p=5  | ≈ 208.2 | ≈ 4803 |
 
-No performance tuning was done in Phase B (out of scope by design); these
-numbers are the correctness-verified baseline for Phase D's benchmark view.
+Phase B 未做任何性能调优（设计上超范围）；这些数字是 Phase D benchmark
+视图的已验证正确性基线。
 
-**STOP after Phase B** — per the handoff brief. Do not start Phase C
-(DeltaNet) automatically.
+**Phase B 后 STOP** —— 按交接简报要求。不要自动开始 Phase C（DeltaNet）。
