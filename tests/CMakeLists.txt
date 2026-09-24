@@ -253,6 +253,30 @@ if(CUDALM_PYTHON3)
                      ${CMAKE_SOURCE_DIR})
     set_tests_properties(test_qwen35_full_attention_golden PROPERTIES
       SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+    # --- v0.2 Phase C: Qwen3.5 Gated DeltaNet golden gate (layer 0) ---------
+    # HARD GATE: native runtime vs quantized PyTorch reference. The test
+    # converts layer 0 (a DeltaNet layer) from the real pinned checkpoint,
+    # generates CUDLMG02 goldens for three state-transition scenarios
+    # (A: first token / zero state; B: consecutive p0->p1 from the runtime's
+    # own state; C: seeded non-zero conv+recurrent state), and compares all
+    # 22 stages + stage.g (fp32) + the persistent state (conv_state bf16
+    # [6144,3] + recurrent_state fp32 [16,128,128]) — the state is the Phase C
+    # hard gate. Self-skips (77) when the checkpoint is absent.
+    add_executable(test_qwen35_deltanet_golden
+                   cuda/test_qwen35_deltanet_golden.cpp)
+    target_link_libraries(test_qwen35_deltanet_golden PRIVATE cudalm)
+    add_test(NAME test_qwen35_deltanet_golden
+             COMMAND test_qwen35_deltanet_golden
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_l0.cudalm
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CMAKE_BINARY_DIR}/data/qwen35_golden_l0_A.cudalm
+                     ${CMAKE_BINARY_DIR}/data/qwen35_golden_l0_B.cudalm
+                     ${CMAKE_BINARY_DIR}/data/qwen35_golden_l0_C.cudalm
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR})
+    set_tests_properties(test_qwen35_deltanet_golden PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
   else()
     message(STATUS "tool python lacks torch/safetensors/numpy: "
                    "qwen35 ingestion tests disabled")
