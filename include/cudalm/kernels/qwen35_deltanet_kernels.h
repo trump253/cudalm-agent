@@ -47,12 +47,14 @@ void qwen35_deltanet_gbeta_bf16(
     const __nv_bfloat16* dt_bias, __nv_bfloat16* beta, float* g, int n_heads,
     cudaStream_t stream);
 
-// Gated delta-rule recurrent DECODE update (docs §8). All math fp32; the
-// state S is fp32 and updated IN PLACE. One block per head (128 threads =
-// value index). l2norm is applied to q/k in fp32 (eps), q additionally scaled
-// by 1/sqrt(head_dim); the ordering is decay -> delta -> output from UPDATED
-// S. num_v_heads == num_key_heads is required (pinned 0.8B: 16 == 16, no
-// repeat_interleave).
+// Gated delta-rule recurrent DECODE update (docs §8). q/k/v enter as bf16;
+// the FLA-aligned l2norm on q/k runs with bf16 rounding semantics (bf16
+// products, fp32 sum, bf16 rsqrt — NOT a pure-fp32 l2norm), and q is
+// additionally scaled by 1/sqrt(head_dim); the NORMALIZED bf16 q/k then feed
+// the fp32 recurrent delta-rule / state math (state S is fp32 and updated IN
+// PLACE). One block per head (128 threads = value index); the ordering is
+// decay -> delta -> output from UPDATED S. num_v_heads == num_key_heads is
+// required (pinned 0.8B: 16 == 16, no repeat_interleave).
 //   q, k, v   : bf16 [n_heads, head_dim]   (post-conv split)
 //   g         : fp32 [n_heads];  beta : bf16 [n_heads]
 //   S         : fp32 [n_heads, head_dim, head_dim]  (READ + UPDATED IN PLACE)

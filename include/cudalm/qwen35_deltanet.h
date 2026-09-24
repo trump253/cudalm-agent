@@ -16,8 +16,10 @@
 //       -> split: q [2048] / k [2048] / v [2048]
 //       -> beta = sigmoid(b) (bf16); g = -exp(A_log)*softplus(a+dt_bias) (fp32)
 //       -> delta-rule recurrent update (state S fp32 [16,128,128], in place):
-//            l2norm(q,k) in fp32, q/=sqrt(128); decay -> delta -> output
-//            from UPDATED S                                    -> core (bf16)
+//            FLA-aligned l2norm on bf16 q/k (bf16 rounding semantics),
+//            q/=sqrt(128); the normalized bf16 q/k then feed the fp32
+//            recurrent delta-rule / state math: decay -> delta -> output
+//            from UPDATED S                                       -> core (bf16)
 //       -> gated RMSNorm(core, gate=z, w=linear_norm fp32)     -> gated (bf16)
 //       -> o = out_proj(gated)        (W4A16, [1024])
 //       -> res1 = x + o               (bf16 add)
