@@ -2,7 +2,7 @@
 #
 # Host: RTX 2080 Ti (sm_75), CUDA 11.8, driver 570.172.08, single device (CUDA_VISIBLE_DEVICES=0)
 # Tool: /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck --launch-timeout 900
-# git: 0b657986b643666cd17f7925d8233f7640435a12
+# git: 99fa68d23f26b7d8eba7e35a4b243a7a37860a7c   # commit A — the exact code under test (clean worktree)
 #
 # Scope: the NEW plain BF16 GEMV kernel (kernels/bf16_gemv.h/.cu) — the tied-LM-head
 # matmul — under the sanitizer, both execution paths:
@@ -10,7 +10,8 @@
 #                        kernel), incl. the actual LM-head shape [N=248320, K=1024]
 #                        (509 MB W buffer) + N=1/7/100/1024/4096, K=8/16/64/512/1024;
 #   * scalar fallback  : K % 8 != 0 (K=1000/1025/1/3/7/9) AND a 2-byte-offset
-#                        (16B-misaligned) W/x base on a K%8==0 shape;
+#                        (2-byte-aligned but not 16B-aligned, a legal __nv_bfloat16
+#                        access) W/x base on a K%8==0 shape;
 #   * cross-check      : scalar (misaligned) vs vec4 (aligned) on the SAME data;
 #   * zero row         : a fully-zero W row -> bit-exact zero output.
 # Each path is compared against a CPU FP32-accumulate -> BF16 RNE reference (no
