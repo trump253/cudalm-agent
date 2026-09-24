@@ -705,9 +705,10 @@ micro-stack 最终输出（layer 3 final）。
   - **B（p=0→1→2 顺序）**：t=0 位级精确；t=1/t=2 逐层 stage + 状态在复合
     容差内（worst bf16 3.9e-2、fp32 3.1e-3）；逐层链（layer L 输入 ==
     layer L-1 输出）+ micro-stack final 全 OK。
-- 完整 `ctest`：**31/31 PASS**（旧 v0.1/v0.1.1 回归 + Phase A 摄入 +
+- 完整 `ctest`：**32/32 PASS**（旧 v0.1/v0.1.1 回归 + Phase A 摄入 +
   Phase B 单元 + Phase B golden + Phase C 契约 + Phase C golden +
-  **Phase D micro-stack golden** + Phase D `--tokens` 校验）。
+  **Phase D micro-stack golden** + Phase D `--tokens` 校验 + v0.3 Phase A
+  full-model）。
 - `compute-sanitizer --tool memcheck`：**0 错误**（micro-stack golden
   `--no-gen` CUDA-only 路径，**覆盖连续多 token micro-stack 运行**——场景 B
   的 p=0→1→2 全链；证据 `benchmarks/sanitizer_qwen35_hybrid_microstack.txt`）。
@@ -845,7 +846,8 @@ checkpoint = `Qwen3.5-0.8B-Base`（`raw/config.json` + `model.safetensors`，
   （DeltaNet 经 `seed_state` H2D；FA 经 `cudaMemsetAsync`），reset 后逐层回读
   全部归零。
 - 新增 `test_qwen35_full_model`（CPU 结构门 + GPU 所有权/状态门；无 checkpoint
-  时 self-skip 77）。旧 **31 测试全回归 PASS**；`check_no_torch.sh` **CLEAN**；
+  时 self-skip 77）。完整 ctest **32/32 PASS**（旧 31 全回归 + 1 full-model）；
+  `check_no_torch.sh` **CLEAN**；
   `compute-sanitizer --tool memcheck` **0 错误**（`--no-gen` CUDA-only 路径，
   覆盖全模型 load + 24 层 seed + reset + unload 的**新 CUDA 分配生命周期**）。
 

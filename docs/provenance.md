@@ -235,7 +235,7 @@ tied LM head / 统一 reset_state）为 CUDALM 原生，无可移植的上游 ke
 验收证据（RTX 2080 Ti）：真实 checkpoint 全量转换 PASS（506 张量 / 766 MB /
 layers 0..23）；24/24 层 validate PASS + 层排表 exact（全注意力 3,7,11,15,19,23）
 + embedding/final-norm/LM-head 张量契约 PASS；full model load/unload PASS；
-`reset_state()` 覆盖全部 24 层；旧 31 测试全回归 PASS；compute-sanitizer
+`reset_state()` 覆盖全部 24 层；完整 ctest 32/32 PASS（旧 31 全回归 + 1 full-model）；compute-sanitizer
 memcheck 0 错误（`--no-gen` CUDA-only 路径，覆盖全模型 load + 24 层 seed +
 reset + unload 的新 CUDA 分配生命周期）；no-torch 守卫 CLEAN。详见
 `docs/qwen35_architecture.md` §17。
