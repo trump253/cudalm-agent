@@ -832,6 +832,125 @@ def generate(cudalm_path: str, ckpt_dir: str, layer_idx: int, out_path: str,
 
 
 # ---------------------------------------------------------------------------
+# Phase D — 4-layer hybrid micro-stack (layers 0-3: 3x DeltaNet + 1x full
+# attention). Runs the real checkpoint layers IN ORDER 0->1->2->3 for each
+# token in `tokens`, threading each layer's OWN persistent state across the
+# token sequence (DeltaNet conv/recurrent, full-attention KV). Reuses the SAME
+# W4A16 quantized weights the runtime loads (no bf16/quantized mixing). Emits
+# one CUDLMG02 file per (token, layer) — the historical per-layer container is
+# reused unchanged; the micro-stack golden is the SET of these files, whose
+# layer L input == layer L-1 output is what the runtime chain must reproduce.
+# ---------------------------------------------------------------------------
+def generate_microstack(cudalm_path: str, ckpt_dir: str, out_prefix: str,
+                        tokens, input_seed: int) -> int:
+    from transformers.models.qwen3_5.configuration_qwen3_5 import (
+        Qwen3_5TextConfig)
+
+    st_path = os.path.join(ckpt_dir, "model.safetensors")
+    cfg_path = os.path.join(ckpt_dir, "raw", "config.json")
+    if not (os.path.isfile(st_path) and os.path.isfile(cfg_path)):
+        print(f"error: checkpoint dir {ckpt_dir!r} incomplete "
+              f"(need model.safetensors + raw/config.json)", file=sys.stderr)
+        return 2
+    if sha256_file(cfg_path) != CONFIG_SHA256:
+        print("error: config.json sha256 mismatch (not the pinned "
+              "revision)", file=sys.stderr)
+        return 1
+    if sha256_file(st_path) != CHECKPOINT_SHA256:
+        print("error: model.safetensors sha256 mismatch (not the pinned "
+              "checkpoint)", file=sys.stderr)
+        return 1
+
+    import_pinned_transformers(ckpt_dir)
+    global _P
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
+    _P = mq
+
+    v2file = v2.read_v2(cudalm_path)
+    if v2file.metadata.get("arch") != ARCH_ID:
+        print("error: v2 file arch mismatch", file=sys.stderr)
+        return 1
+    pinned = v2.Qwen35Config.qwen35_08b()
+    if v2file.config != pinned:
+        print("error: v2 file config deviates from the pinned 0.8B "
+              "contract", file=sys.stderr)
+        return 1
+    for L in range(4):
+        if not (v2file.config.is_linear_attention(L)
+                or v2file.config.is_full_attention(L)):
+            print(f"error: layer {L} has an unexpected type", file=sys.stderr)
+            return 2
+
+    raw_cfg = json.load(open(cfg_path))["text_config"]
+    text_cfg = Qwen3_5TextConfig(**raw_cfg)
+    H = text_cfg.hidden_size
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        Qwen3_5TextRotaryEmbedding)
+    rope = Qwen3_5TextRotaryEmbedding(text_cfg)
+
+    # Build the 4 quantized layers (the same W4A16 weights the runtime loads).
+    layers = []
+    for L in range(4):
+        if v2file.config.is_linear_attention(L):
+            layers.append(build_quantized_deltanet_layer(v2file, text_cfg, L))
+        else:
+            layers.append(build_quantized_layer(v2file, text_cfg, L))
+
+    # Persistent state, threaded across the token sequence and kept
+    # INDEPENDENT per layer (the micro-stack state-ownership hard gate).
+    dn = layers[0].linear_attn
+    conv_dim = dn.conv_dim
+    conv_states = [torch.zeros(1, conv_dim, 3, dtype=BF16) for _ in range(3)]
+    rec_states = [None, None, None]  # None = zero start
+    kv_cache = None  # (Kc, Vc) for the full-attention layer
+
+    torch.manual_seed(input_seed)
+    out_dir = os.path.dirname(os.path.abspath(out_prefix))
+    os.makedirs(out_dir, exist_ok=True)
+    for t in tokens:
+        # ONE seeded draw per token = the micro-stack input fed to layer 0.
+        x = (0.05 * torch.randn(1, 1, H, dtype=torch.float32)).to(BF16)
+        for L in range(4):
+            layer = layers[L]
+            if v2file.config.is_linear_attention(L):
+                stages, conv_states[L], rec_after, conv_before, rec_before = (
+                    forward_step_deltanet(layer, x, t, conv_states[L],
+                                          rec_states[L]))
+                rec_states[L] = rec_after
+                specs = stage_tensors_deltanet(
+                    stages, conv_before, conv_states[L], rec_before, rec_after)
+            else:
+                stages, kv_cache = forward_step(layer, rope, x, t, kv_cache)
+                specs = [(name, dims, v2.DT_BF16, blob)
+                         for name, dims, blob
+                         in stage_tensors(stages, kv_cache[0], kv_cache[1], t)]
+            tensors = [v2.V2Tensor(name, dt, dims, blob)
+                       for name, dims, dt, blob in specs]
+            g = gv2.GoldenV2File(v2file.config, t, L, input_seed, tensors)
+            blob = g.to_bytes()
+            # Round-trip + expected-set validation (same as generate()).
+            rt = gv2.GoldenV2File.from_bytes(blob)
+            expected = gv2.golden_tensor_expectations(v2file.config, t, L)
+            if len(rt.tensors) != len(expected):
+                raise SystemExit(
+                    f"microstack: tensor count mismatch (t={t}, L={L})")
+            for (ename, edims, edtype), tt in zip(expected, rt.tensors):
+                if (tt.name != ename or tuple(tt.dims) != edims
+                        or tt.dtype != edtype):
+                    raise SystemExit(
+                        f"microstack: tensor {tt.name!r} mismatch "
+                        f"(t={t}, L={L})")
+            if bytes(blob) != rt.to_bytes():
+                raise SystemExit(f"microstack: bytes not idempotent (t={t})")
+            outp = f"{out_prefix}_L{L}_p{t}.cudalm"
+            gv2.write_golden_v2(outp, g)
+            x = stages["final_output"]  # chain layer L's output to layer L+1
+    print(f"wrote micro-stack goldens: {len(tokens)} token(s) x 4 layers "
+          f"under {out_prefix!r} (per-(token,layer) CUDLMG02)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Selftest: no checkpoint. Synthetic weights through the shared quantizer;
 # exercises the reference pipeline, invariants, container round-trip, and
 # determinism.
@@ -969,10 +1088,25 @@ if __name__ == "__main__":
     ap.add_argument("--state-seed", type=int, default=None,
                     help="Phase C scenario C: seed a deterministic non-zero "
                          "conv+recurrent previous state (DeltaNet only)")
+    ap.add_argument("--microstack-prefix", default=None,
+                    help="Phase D: emit per-(token,layer) CUDLMG02 goldens "
+                         "under <prefix>_L{layer}_p{pos}.cudalm for the "
+                         "4-layer hybrid micro-stack (layers 0-3)")
+    ap.add_argument("--tokens", default="0",
+                    help="Phase D micro-stack: comma-separated 0-based token "
+                         "sequence, e.g. 0 (scenario A) or 0,1,2 (scenario B)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
         sys.exit(selftest_impl())
+    if a.microstack_prefix:
+        if not (a.cudalm and a.checkpoint_dir):
+            ap.error("--cudalm and --checkpoint-dir are required for "
+                     "--microstack-prefix")
+        tokens = [int(x) for x in a.tokens.split(",") if x.strip() != ""]
+        sys.exit(generate_microstack(a.cudalm, a.checkpoint_dir,
+                                     a.microstack_prefix, tokens,
+                                     a.input_seed))
     if not (a.cudalm and a.checkpoint_dir and a.out):
         ap.error("--cudalm, --checkpoint-dir and --out are required "
                  "(or use --selftest)")

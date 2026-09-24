@@ -283,6 +283,31 @@ if(CUDALM_PYTHON3)
                      ${CMAKE_SOURCE_DIR})
     set_tests_properties(test_qwen35_deltanet_golden PROPERTIES
       SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+    # --- v0.2 Phase D: Qwen3.5 4-layer hybrid micro-stack golden gate -------
+    # HARD GATE: the native Qwen35HybridMicroStack (real checkpoint layers
+    # 0-3: 3x Gated DeltaNet + 1x full attention, run as a 0->1->2->3 chain)
+    # vs the pinned-transformers oracle running the SAME quantized layers in
+    # order. The test converts layers 0-3, generates per-(token,layer)
+    # CUDLMG02 goldens for scenario A (p=0) and scenario B (sequential
+    # p=0,1,2 from the runtime's OWN prior-step state, no reset in between),
+    # and compares every layer's bf16 stages + stage.g (fp32) + the persistent
+    # state (DeltaNet conv_state+recurrent_state, full-attention K+V cache
+    # rows) + the micro-stack final output. Self-skips (77) when the
+    # checkpoint is absent. Distinct .cudalm output from the ingestion test.
+    add_executable(test_qwen35_hybrid_microstack_golden
+                   cuda/test_qwen35_hybrid_microstack_golden.cpp)
+    target_link_libraries(test_qwen35_hybrid_microstack_golden PRIVATE cudalm)
+    add_test(NAME test_qwen35_hybrid_microstack_golden
+             COMMAND test_qwen35_hybrid_microstack_golden
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_microstack4.cudalm
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CMAKE_BINARY_DIR}/data/qwen35_msA
+                     ${CMAKE_BINARY_DIR}/data/qwen35_msB
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR})
+    set_tests_properties(test_qwen35_hybrid_microstack_golden PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
   else()
     message(STATUS "tool python lacks torch/safetensors/numpy: "
                    "qwen35 ingestion tests disabled")
