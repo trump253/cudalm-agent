@@ -153,6 +153,15 @@ inline void config_to_blob(const Qwen35Config& c, std::uint8_t* out) {
   (void)o;
 }
 
+// The reserved u32 of the 88-byte config blob (offset 84..87) must be 0.
+// The Python parser (tools/common/cudalm_v2.py Qwen35Config.from_blob)
+// rejects non-zero; the C++ v2 loaders (weight + golden) enforce the same
+// rule so both paths behave identically.
+constexpr std::size_t kConfigReservedOffset = 84;  // within the 88-B blob
+inline bool config_blob_reserved_ok(const std::uint8_t* p) {
+  return rd_u32(p + kConfigReservedOffset) == 0;
+}
+
 inline Qwen35Config config_from_blob(const std::uint8_t* p) {
   Qwen35Config c;
   c.hidden_size = rd_i32(p + 0);

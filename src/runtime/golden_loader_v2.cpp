@@ -75,6 +75,8 @@ Status GoldenFileV2::load(const std::string& path, GoldenFileV2* out) {
 
   // Fixed header words.
   const Qwen35Config cfg = wfmt2::config_from_blob(p + 24);
+  if (!wfmt2::config_blob_reserved_ok(p + 24))
+    return Status::error("config blob reserved word must be 0");
   if (!cfg.valid())
     return Status::error("Qwen35Config blob failed validation");
   const int position = wfmt2::rd_i32(p + gfmt2::kPositionOffset);

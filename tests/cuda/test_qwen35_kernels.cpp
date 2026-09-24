@@ -408,6 +408,64 @@ int test_attention(cudaStream_t stream) {
 }
 
 // ---------------------------------------------------------------------------
+// Long-context attention: T well beyond the old O(T) shared-memory limit.
+// The old softmax requested (T+32)*4 bytes of DYNAMIC shared memory per block;
+// at T = 16384 that is 64.1 KB > the 48 KB sm_75 per-block default (and the
+// old code never opted in to the 99 KB ceiling), so the launch itself failed
+// with cudaErrorInvalidValue. The current O(num_warps) shared-memory
+// implementation must launch cleanly and produce correct results at this
+// length (max_seq_len = 262144 is the real deployment target).
+// ---------------------------------------------------------------------------
+int test_attention_long_context(cudaStream_t stream) {
+  const int T = 16384;               // clearly beyond the old dynamic-smem limit
+  const int position = T - 1;        // decode at the last row
+  const int n_heads = 8, n_kv = 2, hd = 256;
+  const int max_seq = T;             // cache spans the whole context
+
+  Rng rng(0x1c0c + T);
+  std::vector<__nv_bfloat16> q = rand_bf(rng, n_heads * hd);
+  std::vector<__nv_bfloat16> kc = rand_bf(rng, n_kv * max_seq * hd);
+  std::vector<__nv_bfloat16> vc = rand_bf(rng, n_kv * max_seq * hd);
+
+  DeviceBuffer dq(q.size() * 2, stream);
+  DeviceBuffer dk(kc.size() * 2, stream);
+  DeviceBuffer dv(vc.size() * 2, stream);
+  DeviceBuffer do_(n_heads * hd * 2, stream);
+  DeviceBuffer ds(2 * static_cast<std::size_t>(n_heads) * max_seq * 2, stream);
+  dq.copy_from_host(q.data(), dq.bytes(), stream);
+  dk.copy_from_host(kc.data(), dk.bytes(), stream);
+  dv.copy_from_host(vc.data(), dv.bytes(), stream);
+
+  // A launch failure aborts inside the decode op (CUDA_CHECK_LAUNCH), so
+  // reaching the sync below proves the O(num_warps) launch succeeded at T.
+  kernels::qwen35_attention_decode_bf16(
+      dq.data<__nv_bfloat16>(), dk.data<__nv_bfloat16>(),
+      dv.data<__nv_bfloat16>(), position, do_.data<__nv_bfloat16>(),
+      n_heads, n_kv, hd, max_seq, ds.data<__nv_bfloat16>(), stream);
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  CUDA_CHECK(cudaGetLastError());  // no residual launch error at T = 16384
+
+  std::vector<__nv_bfloat16> ref;
+  ref_attention(q, kc, vc, position, n_heads, n_kv, hd, max_seq, &ref);
+  std::vector<__nv_bfloat16> act(n_heads * hd);
+  do_.copy_to_host(act.data(), act.size() * 2, stream);
+
+  const StageCompareResult r = compare_bf16_stages(
+      reinterpret_cast<const std::uint16_t*>(ref.data()),
+      reinterpret_cast<const std::uint16_t*>(act.data()), act.size());
+  if (!r.ok) {
+    std::fprintf(stderr, "  attention long-context T=%d: FAIL max_abs_err=%.9g\n",
+                 T, r.max_abs_err);
+    return 1;
+  }
+  std::fprintf(stderr,
+               "  attention long-context T=%d: launched cleanly, "
+               "max_abs_err=%.9g OK\n",
+               T, r.max_abs_err);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Elementwise: add / silu_mul / gate_mul
 // ---------------------------------------------------------------------------
 int test_elementwise(cudaStream_t stream) {
@@ -571,6 +629,7 @@ int main() {
   if (int rc = test_rope(stream)) return rc;
   if (int rc = test_kv_write(stream)) return rc;
   if (int rc = test_attention(stream)) return rc;
+  if (int rc = test_attention_long_context(stream)) return rc;
   if (int rc = test_elementwise(stream)) return rc;
   if (int rc = test_kv_cache_class(stream)) return rc;
 

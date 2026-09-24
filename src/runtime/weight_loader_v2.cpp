@@ -118,6 +118,8 @@ Status WeightFileV2::load(const std::string& path, WeightFileV2* out) {
 
   // ---- config blob --------------------------------------------------------
   const Qwen35Config cfg = wfmt2::config_from_blob(p + config_offset);
+  if (!wfmt2::config_blob_reserved_ok(p + config_offset))
+    return Status::error("config blob reserved word must be 0");
   if (!cfg.valid())
     return Status::error("Qwen35Config blob failed validation");
 

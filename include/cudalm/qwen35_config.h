@@ -72,11 +72,20 @@ struct Qwen35Config {
   int linear_conv_state_len() const { return lin_conv_kernel_dim - 1; }
 
   // Layer-type schedule (mirrors official Qwen3_5TextConfig default).
-  bool is_full_attention(int i) const {
-    return i >= 0 && i < num_hidden_layers &&
-           full_attention_interval > 0 && (i + 1) % full_attention_interval == 0;
+  // Both predicates share ONE legal domain: 0 <= i < num_hidden_layers
+  // (with num_hidden_layers > 0). Out-of-domain indices (i < 0,
+  // i >= num_hidden_layers) are false for BOTH — an invalid index must
+  // never report as a linear-attention layer.
+  bool has_layer(int i) const {
+    return num_hidden_layers > 0 && i >= 0 && i < num_hidden_layers;
   }
-  bool is_linear_attention(int i) const { return !is_full_attention(i); }
+  bool is_full_attention(int i) const {
+    return has_layer(i) && full_attention_interval > 0 &&
+           (i + 1) % full_attention_interval == 0;
+  }
+  bool is_linear_attention(int i) const {
+    return has_layer(i) && !is_full_attention(i);
+  }
 
   bool valid() const {
     if (hidden_size <= 0 || num_hidden_layers <= 0 || intermediate_size <= 0)

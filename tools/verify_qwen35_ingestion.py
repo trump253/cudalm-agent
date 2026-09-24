@@ -11,6 +11,10 @@ Checks a converted .cudalm v2 file against the source safetensors checkpoint:
      |deq - w| <= 0.51 * scale_stored (round-half-to-even + fp16-scale
      storage bound; see w4a16_quant docstring); zero-scale groups have
      zero q and a zero original group.
+  3b. FP16 companion scales: BIT-EXACT binary contract
+     stored_scale == fp16(amax(original_group) / 7), recomputed from the
+     checkpoint's .weight twin (verifies the W4A16 scale contract directly,
+     not just the dequant result).
   4. Completeness: for every requested layer the expected tensor-name set
      (per layer type) is exactly present; model norm present.
 
@@ -145,15 +149,46 @@ def verify(cudalm_path: str, checkpoint_dir: str, layers, report_path=None,
         errors.append(f"unexpected tensors: {sorted(extra)[:8]}...")
 
     # ---- value checks ---------------------------------------------------------
-    stats = {"bf16_exact": 0, "fp32_exact": 0, "w4a16_checked": 0}
+    stats = {
+        "bf16_exact": 0, "fp32_exact": 0, "w4a16_checked": 0,
+        "fp16_scale_exact": 0,
+    }
     fidelity = []
     with safe_open(st_path, framework="pt") as f:
         for t in obj.tensors:
             if t.name not in want:
                 continue
             if t.dtype == v2.DT_FP16_SCALE:
-                # Synthetic (produced by the converter, not present in the
-                # checkpoint): validated through its .weight twin below.
+                # Exact W4A16 scale binary contract:
+                #     stored_scale == fp16(amax(original_group) / 7)
+                # The scale tensor is converter-synthetic (absent from the
+                # checkpoint), so recompute it from the checkpoint's .weight
+                # twin and require a BIT-EXACT match. This pins the stored
+                # scale bits directly; the INT4 dequant bound below only
+                # bounds the error and does not verify the scale contract.
+                N, Gc = t.dims
+                G = conf.group_size
+                weight_name = t.name[: -len(".scale")] + ".weight"
+                try:
+                    wsrc = f.get_tensor(LANG_PREFIX + weight_name)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{t.name}: missing checkpoint weight twin "
+                                  f"{weight_name} ({e})")
+                    continue
+                w = wsrc.float().view(N, Gc, G)
+                amax = w.abs().amax(dim=2)
+                scale_want = (amax / 7.0).to(torch.float16)
+                scale_got = torch.from_numpy(
+                    np.frombuffer(t.data, dtype="uint8").copy()
+                ).view(torch.float16).view(N, Gc)
+                if not bool(torch.equal(scale_got, scale_want)):
+                    d = (scale_got.float() - scale_want.float()).abs()
+                    idx = d.argmax()
+                    errors.append(
+                        f"{t.name}: stored scale != "
+                        f"fp16(amax(original_group)/7) "
+                        f"(max diff {d.flatten()[idx].item():.6g})")
+                stats["fp16_scale_exact"] += 1
                 continue
             src_name = LANG_PREFIX + t.name
             try:
@@ -225,21 +260,9 @@ def verify(cudalm_path: str, checkpoint_dir: str, layers, report_path=None,
                 fidelity.append({
                     "name": t.name, **fidelity_stats(src, packed, scale)})
             else:
-                # fp16 scale: check it is the fp16 rounding of the
-                # amax/7 of its group (recompute from the checkpoint).
-                N, Gc = t.dims
-                G = conf.group_size
-                w = src.float().view(N, Gc, G)
-                amax = w.abs().amax(dim=2)
-                scale_want = (amax / 7.0).to(torch.float16)
-                scale_got = torch.from_numpy(
-                    np.frombuffer(t.data, dtype="uint8")).view(torch.float16)
-                if not bool(torch.equal(scale_got, scale_want)):
-                    d = (scale_got.float() - scale_want.float()).abs()
-                    idx = d.argmax()
-                    errors.append(
-                        f"{t.name}: scale != fp16(amax/7) "
-                        f"(max diff {d.flatten()[idx].item():.6g})")
+                # FP16_SCALE is handled above; any other dtype here is a bug.
+                errors.append(
+                    f"{t.name}: unexpected dtype {t.dtype} in value checks")
 
     # Sidecar for the C++ side (tests/cpu/test_qwen35_ingestion_real.cpp):
     # per tensor (file order): name, byte size, fp32 sum of the bf16/fp32
@@ -273,7 +296,9 @@ def verify(cudalm_path: str, checkpoint_dir: str, layers, report_path=None,
             print(f"  - {e}", file=sys.stderr)
         return 1
     print(f"VERIFY OK: {stats['bf16_exact']} bf16 tensors bit-exact, "
-          f"{stats['w4a16_checked']} W4A16 tensors within dequant bound")
+          f"{stats['w4a16_checked']} W4A16 tensors within dequant bound, "
+          f"{stats['fp16_scale_exact']} FP16 scales bit-exact "
+          f"(== fp16(amax(original_group)/7))")
     return 0
 
 

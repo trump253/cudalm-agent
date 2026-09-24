@@ -66,6 +66,32 @@ int test_pinned_08b() {
   return 0;
 }
 
+int test_predicate_domain() {
+  const Qwen35Config c = Qwen35Config::qwen35_08b();
+  const int L = c.num_hidden_layers;  // 24
+  // Legal domain: the two predicates partition the schedule — for every
+  // valid index exactly one is true.
+  for (int i = 0; i < L; ++i)
+    CHECK(c.is_full_attention(i) != c.is_linear_attention(i));
+  // Out-of-domain indices are false for BOTH predicates (an invalid index
+  // must never report as a linear-attention layer): i < 0, i == L and
+  // i > L.
+  const int out_of_domain[] = {-1, -17, L, L + 1, 100, 1000000};
+  for (const int i : out_of_domain) {
+    CHECK(!c.is_full_attention(i));
+    CHECK(!c.is_linear_attention(i));
+    CHECK(!c.has_layer(i));
+  }
+  // A config with no layers has no domain at all.
+  Qwen35Config empty = c;
+  empty.num_hidden_layers = 0;
+  CHECK(!empty.is_full_attention(0));
+  CHECK(!empty.is_linear_attention(0));
+  CHECK(!empty.has_layer(0));
+  TEST_PASS("qwen35_config predicate domain");
+  return 0;
+}
+
 int test_blob_roundtrip() {
   const Qwen35Config c = Qwen35Config::qwen35_08b();
   std::uint8_t blob[wfmt2::kConfigBytes] = {0};
@@ -162,6 +188,7 @@ int test_operator_eq() {
 int main() {
   int rc = 0;
   rc |= test_pinned_08b();
+  rc |= test_predicate_domain();
   rc |= test_blob_roundtrip();
   rc |= test_validity_rules();
   rc |= test_operator_eq();

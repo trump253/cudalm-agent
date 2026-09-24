@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(
     "tools", "common"))
 
 import cudalm_v2 as v2  # noqa: E402
+import golden_v2 as gv2  # noqa: E402
 
 
 def prb(i: int) -> bytes:
@@ -236,7 +237,33 @@ def main(out_dir: str) -> None:
     assert not badconf.valid()
     out("invalid_config", build_file(badconf, tensors, meta))
 
-    print(f"gen_v2_format: wrote valid + 13 corruption cases to {out_dir}")
+    # Config blob reserved word (offset 84..87 within the 88-B blob) != 0.
+    # The Python writer always emits 0; this byte-patch simulates a
+    # corrupted/malformed file that both C++ v2 loaders must reject.
+    r = bytearray(valid)
+    (c_off,) = struct.unpack_from("<Q", valid, 24)  # config_offset field
+    patch_u32(r, c_off + 84, 0xDEAD)
+    out("config_reserved", bytes(r))
+
+    # --- Golden (CUDLMG02) config-blob reserved-word parity ---------------
+    # The golden container reuses the same 88-byte Qwen35Config blob at file
+    # offset 24. A minimal golden (valid header + config + decode state, zero
+    # tensors) must LOAD; the same file with the config reserved word set
+    # must be REJECTED, proving the golden loader enforces the identical rule
+    # as the weight loader.
+    golden = gv2.GoldenV2File(conf, position=0, layer_idx=3, input_seed=42,
+                              tensors=[])
+    with open(os.path.join(out_dir, "valid_golden.cudalm"), "wb") as f:
+        f.write(golden.to_bytes())
+
+    gr = bytearray(golden.to_bytes())
+    patch_u32(gr, 24 + 84, 0xDEAD)  # config blob reserved word (file off 108)
+    with open(os.path.join(out_dir,
+                           "corrupt_golden_config_reserved.cudalm"), "wb") as f:
+        f.write(bytes(gr))
+
+    print(f"gen_v2_format: wrote valid + 14 corruption cases + "
+          f"2 golden fixtures to {out_dir}")
 
 
 if __name__ == "__main__":

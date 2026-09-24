@@ -257,6 +257,17 @@ __device__ inline float block_sum_reduce(float v, float* smem, int tid) {
 
 // 2) softmax over row [0..T) in fp32 (max-subtracted) -> bf16 probs
 //    (official F.softmax(dtype=fp32).to(bf16)).
+//
+//    Shared memory is O(num_warps), NOT O(T): three global-memory passes
+//    (max reduction / exp+sum reduction / normalize+write) instead of caching
+//    exp() in shared. Required for max_seq_len = 262144 on sm_75 (RTX 2080
+//    Ti), where the old (T+32)*4-byte dynamic-smem request exceeded the 48 KB
+//    per-block default well before T ~= 12k (and the 99 KB opt-in ceiling
+//    around T ~= 24.5k), so the launch itself failed. Each pass re-reads
+//    scores2 in the SAME strided order and expf is deterministic, so the max,
+//    the sum, and every normalized bf16 output are bit-identical to the old
+//    single-pass version. Memory-access-pattern change only: no
+//    FlashAttention, no fusion, no architectural change.
 __global__ void qwen35_attention_softmax_kernel(
     const __nv_bfloat16* __restrict__ scores2,
     __nv_bfloat16* __restrict__ probs, int T) {
@@ -267,27 +278,24 @@ __global__ void qwen35_attention_softmax_kernel(
       scores2 + static_cast<std::size_t>(h) * static_cast<std::size_t>(T);
   __nv_bfloat16* prow =
       probs + static_cast<std::size_t>(h) * static_cast<std::size_t>(T);
-  extern __shared__ float sh[];  // sh[0..T-1] exp, sh[T..] warp partials
-  float* sh_exp = sh;
-  float* sh_red = sh + T;
+  __shared__ float sh_red[32];  // warp partials (O(num_warps), not O(T))
   const int tid = threadIdx.x;
 
+  // Pass 1: max reduction.
   float m = -FLT_MAX;
   for (int t = tid; t < T; t += blockDim.x)
     m = fmaxf(m, __bfloat162float(srow[t]));
   m = block_max_reduce(m, sh_red, tid);
 
+  // Pass 2: exp + sum reduction (exp() is NOT cached in shared memory).
   float acc = 0.0f;
-  for (int t = tid; t < T; t += blockDim.x) {
-    const float e = expf(__bfloat162float(srow[t]) - m);
-    sh_exp[t] = e;
-    acc += e;
-  }
-  __syncthreads();
+  for (int t = tid; t < T; t += blockDim.x)
+    acc += expf(__bfloat162float(srow[t]) - m);
   const float sum = block_sum_reduce(acc, sh_red, tid);
 
+  // Pass 3: normalize and write bf16 probs (re-computes the same expf).
   for (int t = tid; t < T; t += blockDim.x)
-    prow[t] = __float2bfloat16_rn(sh_exp[t] / sum);
+    prow[t] = __float2bfloat16_rn(expf(__bfloat162float(srow[t]) - m) / sum);
 }
 
 // 3) out[h,d] = bf16(Σ_t f32(probs[t]) * f32(V[kh][t,d]))
@@ -479,8 +487,9 @@ void qwen35_attention_decode_bf16(const __nv_bfloat16* q,
       scale);
   CUDA_CHECK_LAUNCH();
 
-  const std::size_t smem = (static_cast<std::size_t>(T) + 32) * sizeof(float);
-  qwen35_attention_softmax_kernel<<<n_heads, kSoftmaxBfBlock, smem, stream>>>(
+  // Shared memory is a fixed 32-float warp-partial buffer, independent of T
+  // (see the kernel comment); the launch must succeed up to max_seq_len.
+  qwen35_attention_softmax_kernel<<<n_heads, kSoftmaxBfBlock, 0, stream>>>(
       scores2, probs, T);
   CUDA_CHECK_LAUNCH();
 
