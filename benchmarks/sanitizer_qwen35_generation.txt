@@ -1,0 +1,71 @@
+# compute-sanitizer memcheck — CUDALM v0.4 Phase A (Qwen3.5 generation core:
+# single-request SERIAL prefill + greedy decode)
+#
+# Host: RTX 2080 Ti (sm_75), CUDA 11.8, single device (CUDA_VISIBLE_DEVICES=0)
+# Tool: /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck --launch-timeout 900
+# git: a5c3ae4fa5ca5fbb30188336f5227c826a9a6de4   # the exact code under test (clean worktree)
+#
+# Scope: a MULTI-TOKEN prompt + MULTI-STEP greedy decode under the sanitizer
+# (the new CUDA work introduced by v0.4 Phase A on top of the v0.3 full model):
+#   * real prefill state transition : scenario A (3-token prompt, positions
+#                              0..2) + scenario B (16-token prompt, positions
+#                              0..15) — the 18x DeltaNet conv/recurrent + 6x
+#                              FullAttention KV rows are all read+written across
+#                              the whole prompt (the runtime threads its OWN
+#                              persistent state in place);
+#   * decode state transition       : scenario A (8 decode steps) + scenario B
+#                              (16 decode steps) — the per-step LM-head GEMV
+#                              (tied, over the 509 MB embedding) re-runs on every
+#                              generated token; the DeltaNet recurrent state +
+#                              the FullAttention KV history grow row by row;
+#   * per-step FULL logits [248320] : every generation step D2H's the full
+#                              bf16 logit vector (the greedy argmax reads it);
+#   * final persistent state (B)    : 18x DeltaNet conv bf16 [6144,3] +
+#                              recurrent fp32 [16,128,128] + 6x FullAttention
+#                              K/V used rows bf16 [kv, t_used, 256] all read back;
+#   * repeat-generate gate (C)      : the SAME prompt generate() twice — the
+#                              second call starts from a fresh reset (no state
+#                              leakage); both runs execute the full forward.
+#
+# Run with the test's --no-gen flag (CUDA-only path) so compute-sanitizer does
+# not wrap a std::system Python child (CUDA 11.8 reaper deadlock); the full-model
+# .cudalm + the generation goldens are pre-generated (deterministic confident
+# prompts: A=[1024,2048,3072], B=[1024,2048,3072]x5+[1024]).
+#
+#   $ /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck --launch-timeout 900 \
+#       build/tests/test_qwen35_generation \
+#       build/data/qwen35_08b_full.cudalm /root/models/Qwen3.5-0.8B-Base \
+#       /root/py311/venv/bin/python <src_dir> build/data/qwen35_gen --no-gen
+#
+# Result (condensed — full per-layer/per-state output omitted):
+========= COMPUTE-SANITIZER
+[scenario A] prompt=3 tok, max_new=8
+  gen.logits.t0  max_abs=0.164550781 OK   ...   gen.logits.t4  max_abs=0.5625 OK   ...
+  A.generated_tokens     8 tokens all match OK
+  A.stop_reason          max_new_tokens OK
+  A.forward_count        10 == t_used OK
+[scenario B] prompt=16 tok, max_new=16
+  gen.logits.t0  max_abs=0.1875 OK  ...  gen.logits.t15 max_abs=0.15625 OK
+  B.generated_tokens     16 tokens all match OK
+  B.stop_reason          max_new_tokens OK
+  B.forward_count        31 == t_used OK
+  DeltaNet.conv_after[L0]                   max_abs=0 OK
+  DeltaNet.recurrent_after[L0]              max_abs=3.57627869e-07 OK
+  DeltaNet.conv_after[L12]                  max_abs=0.125 OK
+  DeltaNet.recurrent_after[L12]             max_abs=0.0161222219 OK
+  FA.KV_used[L3]                            K max_abs=0.0625  V max_abs=0.03125 OK
+  FA.KV_used[L11]                           K max_abs=0.1875  V max_abs=0.0625 OK
+  FA.KV_used[L23]                           K max_abs=0.09375 V max_abs=0.0859375 OK
+  ...(all 24 layers: 18x DeltaNet conv/recurrent + 6x FA K/V used rows compared OK)...
+[scenario C] repeat-generate contamination gate
+  C.repeat_identical                         8 tokens, stop=max_new_tokens — identical OK
+[PASS] qwen35_generation (A short + B longer + C contamination; per-decode-step FULL logits + final hybrid state)
+========= ERROR SUMMARY: 0 errors
+#
+# => 0 memory errors across the multi-token prefill + the multi-step greedy decode
+#    (the runtime's own threaded persistent state: DeltaNet conv/recurrent + FullAttention
+#    KV history growth, the repeated tied-LM-head GEMV over the 509 MB embedding, the
+#    per-step full-[vocab] logit D2H, and the final persistent-state readback) under
+#    compute-sanitizer memcheck. Correctness gate = the per-step full logits + the final
+#    hybrid state + the generated-token sequence (all compared against the pinned
+#    quantized oracle). Serial prefill is a correctness baseline (NOT a perf figure).

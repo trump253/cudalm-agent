@@ -1004,3 +1004,88 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
     CUDA 分配生命周期）；
   - `benchmarks/sanitizer_bf16_gemv.txt`（覆盖 **bf16_gemv vec4 路径 + scalar
     回退（K%8!=0 及错位）**）。
+
+ ## 19. v0.4 Phase A —— token-ID 级单请求 serial prefill + 贪心 decode 生成核
+
+ 范围 = **token-ID 级单请求生成**（`prompt_token_ids + max_new_tokens +
+ eos_token_id → generated_token_ids + stop_reason`），correctness bring-up：
+ serial prefill（正确性优先，**不** batched/chunked）+ 贪心 decode（greedy
+ only）。**不做** tokenizer / prompt 字符串 / detokenizer / sampling /
+ temperature / top-k / top-p / repetition penalty / beam / batched-chunked
+ prefill / Paged KV / multi-request / scheduler / continuous batching / NCU /
+ kernel fusion / CUDA Graph / 性能优化。serial prefill 的速度**不是**最终性能
+ 数字（本 phase 不 benchmark）。
+
+ ### 19.1 生成核契约（`include/cudalm/qwen35_generator.h` +
+ `src/runtime/qwen35_generator.cpp`）
+
+ - **接口**：`Qwen35Generator::generate(const std::vector<int>& prompt_tokens,
+   int max_new_tokens, int eos_token_id, cudaStream_t stream,
+   const LogitsObserver* = nullptr) → GenerationResult`。`GenerationResult`
+   = `{ok, error, prompt_count, generated_token_ids, stop_reason,
+   forward_count}`。generator 持 **非 const** `Qwen35Model&`（模型自身持久
+   状态 in-place 线程化整条序列）。
+ - **生命周期（钉死）**：每次 `generate()` 开头 **`reset_state()` 一次**；
+   **serial prefill** `forward_token(t_i, i)` for i=0..N-1（**故意** serial，
+   正确性优先，不 batched/chunked）；prefill 最后一个 token 的 logits 预测
+   position N；**greedy decode**：`next = argmax(prefill-last logits)` →
+   position N，放置 `next`；若不 stop 则 `forward_token(next, N+step)` →
+   position N+step+1，再 `argmax`。**禁止**：重 forward prompt 末 token、
+   position off-by-one、decode 前再 reset、golden 状态回填 runtime。
+ - **position 守卫**：`position_of(step) = prompt_len + step`；每个 decode
+   forward 前守卫 `position_of(step) < max_seq_len`（**绝不**以
+   `position >= max_seq_len` 调 `forward_token`）。
+ - **贪心 argmax（CPU，`include/cudalm/greedy.h`）**：`argmax_bf16` **最大化
+   bf16 数值 logit**，**tie → 最小 token id**；**不**用 CUDA argmax/reduction
+   kernel（Phase A 正确性优先：D2H 全 [248320] bf16 logits → CPU argmax）。
+ - **EOS/stop 控制器（确定性，`greedy.h::GreedyStopController`）**：
+   **EOS 选中 → 立即 stop**（该 token **在** `generated_token_ids` 里、**不**
+   再 forward）；否则 `step+1 >= max_new_tokens` → stop；否则可继续；
+   `max_seq_len` 由 position 守卫触发（`position_of(step) >= max_seq_len`）。
+   同一步 EOS **优先于** max_new_tokens。
+ - **容量契约（loudly fail）**：空 prompt / 非法 token id / 非法 eos（不在
+   `[0, vocab)`）/ `max_new_tokens < 0` / `prompt_len > max_seq_len`。
+   `max_new_tokens == 0` → 空生成、不 decode（文档化）。
+ - **forward_count 语义**：= prefill N + decode forward 次数。EOS 在 step k →
+   decode forward = k（EOS 不 forward）；max_new_tokens（G token）→ decode
+   forward = G-1（末 token 不 forward）；max_seq_len（G_avail token）→ decode
+   forward = G_avail。等于 oracle 的 `t_used`。
+
+ ### 19.2 生成级 golden oracle（pinned quantized，
+ `tools/generate_qwen35_golden.py --gen-prefix`）
+
+ - **pinned quantized oracle**：复用 §18 的全模型 oracle（同一份 `.cudalm v2`
+   W4A16 权重 + tied BF16 embedding + 18× DeltaNet / 6× FullAttention 层 +
+   pinned `Qwen3_5RMSNorm` + tied LM head = `normed @ embedding^T`）。
+ - **serial prefill + greedy decode 镜像 C++ 循环**：同一 reset、同一 position
+   守卫、同一 argmax 契约（bf16 数值 max、tie→最小 id，`torch.argmax` on bf16）、
+   同一 stop 顺序、stop token 不 forward、**不回填 golden 状态**。
+ - **输出 CUDLMW02 容器**（C++ `WeightFileV2::load` 可载）：metadata = 生成
+   token 序列 + stop_reason + `t_used`；张量 = **每个生成步的全 [248320] bf16
+   logits**（`gen.logits.t{k}`，预测 `generated[k]`）+（场景 B）**最终持久
+   状态**（18× DeltaNet conv bf16 [6144,3] + recurrent fp32 [16,128,128]；
+   6× FullAttention K/V used rows bf16 [kv, t_used, 256]）。
+ - **confident prompt（钉死）**：oracle 的 top-1 vs top-2 logit gap 在**每个**
+   生成步都需**显著高于** runtime/oracle bf16-logits 舍入（~0.13），贪心序列
+   才是**稳定 golden**（near-tie 会让 ~0.13 舍入翻转 argmax → 两 runtime 选
+   不同 token → 序列分叉）。`tools/diag_gen_gaps.py` 测逐步 gap；选定 prompt
+   min gap **1.0625**（A=[1024,2048,3072]）/ **3.625**（B=[1024,2048,3072]×5+
+   [1024]）。
+
+ ### 19.3 测试与签核证据
+
+ - **`test_greedy_argmax`**（CPU，无 checkpoint）：argmax（normal / negative /
+   exact tie→最小 id / single / bf16-rounding tie）。
+ - **`test_greedy_stop`**（CPU，无 checkpoint）：确定性控制器（eos /
+   max_new_tokens / max_seq_len / 末 token eos 优先）。
+ - **`test_qwen35_generation`**（real checkpoint，self-skip 77）：场景 A（短
+   confident prompt，8 token）+ B（长 confident prompt，16 token，最终状态）+
+   C（repeat-generate 污染门）。比较 **EVERY 生成 token id** + **EVERY 生成步
+   全 [248320] logits** + stop_reason + forward_count（== t_used）+（B）最终
+   混合持久状态（18× DeltaNet conv/recurrent + 6× FA K/V used rows）。
+ - 签核（RTX 2080 Ti / CUDA 11.8）：完整 ctest **37/37 PASS**；
+   `check_no_torch.sh` **CLEAN**；`compute-sanitizer --tool memcheck` **0 错误**
+   （`benchmarks/sanitizer_qwen35_generation.txt`，`--no-gen` CUDA-only，覆盖
+   multi-token prompt + multi-step greedy decode：真实 prefill/decode 状态转换 +
+   重复 tied-LM-head GEMV + KV history 增长 + DeltaNet recurrent 更新 + 最终
+   状态读回）。

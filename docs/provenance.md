@@ -327,3 +327,88 @@ memcheck` **0 错误**，两份 evidence：`benchmarks/sanitizer_qwen35_full_for
 （完整 24 层 forward + 新 `bf16_gemv` LM-head GEMV + A/B 顺序路径）+
 `benchmarks/sanitizer_bf16_gemv.txt`（vec4 + scalar 回退）。详见
 `docs/qwen35_architecture.md` §18.
+
+## CUDALM v0.4 Phase A（token-ID 级单请求 serial prefill + 贪心 decode 生成核）
+
+范围 = **token-ID 级单请求生成**（`prompt_token_ids + max_new_tokens +
+eos_token_id → generated_token_ids + stop_reason`），correctness bring-up：
+serial prefill（正确性优先，**不** batched/chunked）+ 贪心 decode（greedy
+only）。**不做** tokenizer / prompt 字符串 / detokenizer / sampling /
+temperature / top-k / top-p / repetition penalty / beam / batched-chunked
+prefill / Paged KV / multi-request / scheduler / continuous batching / NCU /
+kernel fusion / CUDA Graph / 性能优化。serial prefill 速度**不是**最终性能
+数字。契约 + golden oracle + 测试详见 `docs/qwen35_architecture.md` §19。
+
+### 上游核查（CUDALab `cb6a6a9`，只读参考）
+
+生成核是**编排层**（orchestration），**无**可移植的上游 kernel：它复用冻结
+v0.3 全模型 runtime（`Qwen35Model::reset_state` / `forward_token`，其内核族
+溯源见 §v0.2/v0.3）+ 新增两个 CPU-only 组件（贪心 argmax + stop 控制器，无
+CUDA kernel）。核查结论：frozen `CUDALab@cb6a6a9` **无** generation /
+decoding 编排 kernel 可移植（其 generation 是 Python 采样循环，Phase A 明确
+不采样）；贪心 argmax 按规则**不用** CUDA argmax/reduction kernel（Phase A
+正确性优先，CPU bf16 argmax）。
+
+### CUDALM 原生（无上游）
+
+- **贪心 argmax + stop 控制器**（`include/cudalm/greedy.h`，CPU-only）：
+  `argmax_bf16` **最大化 bf16 数值 logit**、**tie → 最小 token id**（D2H 全
+  [248320] bf16 logits → CPU argmax，**不**用 CUDA argmax/reduction kernel）；
+  `GreedyStopController` 确定性 stop（**EOS 选中立即 stop**、token 在序列里、
+  不再 forward；否则 max_new_tokens；否则 max_seq_len；同一步 EOS **优先于**
+  max_new_tokens）。
+- **生成核**（`include/cudalm/qwen35_generator.h` +
+  `src/runtime/qwen35_generator.cpp`）：持**非 const** `Qwen35Model&`（模型
+  自身持久状态 in-place 线程化整条序列）；每次 `generate()` 开头 **reset
+  一次** → **serial prefill** `forward_token(t_i, i)` i=0..N-1（**故意**
+  serial，正确性优先）→ **greedy decode** 直到 eos / max_new_tokens /
+  max_seq_len；每个 decode forward 前 position 守卫（`position_of(step) =
+  prompt_len + step < max_seq_len`，**绝不**越界）；**禁止**重 forward prompt
+  末 token / off-by-one / decode 前再 reset / golden 状态回填；`max_new_tokens
+  == 0` → 空生成不 decode；容量契约 loudly fail（空 prompt / 非法 token id /
+  非法 eos / max_new_tokens < 0 / prompt_len > max_seq_len）。`forward_count`
+  = prefill N + decode forward（EOS/max_new_tokens 末 token 不 forward），
+  等于 oracle `t_used`。
+
+### golden oracle（`tools/generate_qwen35_golden.py --gen-prefix`）
+
+- **pinned quantized oracle**：复用 §v0.3 Phase B 全模型 oracle（同一份
+  `.cudalm v2` W4A16 权重 + tied BF16 embedding + 18× DeltaNet / 6×
+  FullAttention + pinned `Qwen3_5RMSNorm` + tied LM head）。
+- **serial prefill + greedy decode 镜像 C++ 循环**（同一 reset / position
+  守卫 / argmax 契约 / stop 顺序 / stop token 不 forward / **不回填** golden
+  状态）。
+- 输出 **CUDLMW02 容器**（C++ `WeightFileV2::load` 可载）：生成 token 序列 +
+  stop_reason + `t_used`（metadata）+ **每个生成步的全 [248320] bf16 logits**
+  +（场景 B）**最终持久状态**（18× DeltaNet conv bf16 [6144,3] + recurrent
+  fp32 [16,128,128]；6× FA K/V used rows bf16 [kv, t_used, 256]）。
+- **confident prompt（钉死）**：oracle top-1 vs top-2 logit gap 每步**显著
+  高于** runtime/oracle bf16-logits 舍入（~0.13），贪心序列才是稳定 golden
+  （near-tie 会让舍入翻转 argmax → 序列分叉）。`tools/diag_gen_gaps.py` 测
+  逐步 gap；选定 prompt min gap **1.0625**（A）/ **3.625**（B）。
+
+### 测试
+
+- **`test_greedy_argmax`**（CPU，always，无 checkpoint）：argmax（normal /
+  negative / exact tie→最小 id / single / bf16-rounding tie）。
+- **`test_greedy_stop`**（CPU，always，无 checkpoint）：确定性控制器（eos /
+  max_new_tokens / max_seq_len / 末 token eos 优先）。
+- **`test_qwen35_generation`**（real-checkpoint 门，self-skip 77，TIMEOUT
+  1800，`--no-gen` 供 memcheck）：场景 A（短 confident prompt，8 token）+ B
+  （长 confident prompt，16 token，最终状态）+ C（repeat-generate 污染门，
+  同 prompt 两次 generate 结果必须逐 token 一致）。比较 **EVERY 生成 token
+  id** + **EVERY 生成步全 [248320] logits** + stop_reason + forward_count
+  （== t_used）+（B）最终混合持久状态（18× DeltaNet conv/recurrent + 6× FA
+  K/V used rows），tolerance 基于实测 worst（per-step logits 0.5625、最终状态
+  < 0.19）+ 小 margin。
+
+### 验收证据（RTX 2080 Ti / CUDA 11.8）
+
+- 完整 ctest **37/37 PASS**（旧 34 全回归 + **3 新增**：`test_greedy_argmax` +
+  `test_greedy_stop` + `test_qwen35_generation`）。
+- `scripts/check_no_torch.sh` **CLEAN**（include/、src/ 无 torch/pybind）。
+- `compute-sanitizer --tool memcheck` **0 错误**
+  （`benchmarks/sanitizer_qwen35_generation.txt`，`--no-gen` CUDA-only，覆盖
+  **multi-token prompt + multi-step greedy decode**：真实 prefill/decode 状态
+  转换 + 重复 tied-LM-head GEMV + KV history 增长 + DeltaNet recurrent 更新 +
+  最终状态读回）。
