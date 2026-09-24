@@ -89,9 +89,10 @@ Status GoldenFileV2::load(const std::string& path, GoldenFileV2* out) {
     return Status::error("position out of bounds [0, max_seq_len)");
   if (layer_idx < 0 || layer_idx >= cfg.num_hidden_layers)
     return Status::error("layer_idx out of bounds");
-  if (!cfg.is_full_attention(layer_idx))
-    return Status::error("layer_idx is not a full-attention layer "
-                         "(Phase B goldens cover full-attention layers only)");
+  if (!cfg.is_full_attention(layer_idx) &&
+      !cfg.is_linear_attention(layer_idx))
+    return Status::error("layer_idx is not a valid layer type "
+                         "(Phase B full-attention or Phase C Gated DeltaNet)");
 
   const std::uint64_t table_offset = wfmt2::rd_u64(p + gfmt2::kTableOffsetField);
   const std::uint64_t payload_offset =
@@ -234,14 +235,85 @@ Status expect_tensor(const GoldenFileV2& f, const std::string& name,
 Status GoldenFileV2::validate_golden_tensors() const {
   const Qwen35Config& c = config_;
   const int H = c.hidden_size;
-  const int qo = c.n_heads * c.head_dim;   // per-head-count flat width
-  const int kvo = c.n_kv_heads * c.head_dim;
   const int inter = c.intermediate_size;
-  const int rows = c.n_kv_heads * (position_ + 1);
 
   auto expect = [&](const std::string& n, const std::vector<std::int64_t>& d) {
     return expect_tensor(*this, n, Dtype::kBf16, d);
   };
+  auto expect_f32 = [&](const std::string& n,
+                        const std::vector<std::int64_t>& d) {
+    return expect_tensor(*this, n, Dtype::kFp32, d);
+  };
+
+  if (c.is_linear_attention(layer_idx_)) {
+    // Phase C: Gated DeltaNet decode stages (bf16 except stage.g fp32) + the
+    // persistent-state hard gate (conv bf16 [conv_dim,3], recurrent fp32
+    // [n_heads, key_dim, value_dim], each captured before/after the step).
+    const int conv_dim = c.linear_conv_dim();
+    const int key_dim = c.linear_key_dim();
+    const int value_dim = c.linear_value_dim();
+    const int n_heads = c.lin_num_v_heads;
+    const int hd_k = c.lin_key_head_dim;
+    const int hd_v = c.lin_value_head_dim;
+    Status s = expect("stage.input", {1, H});
+    if (!s.ok) return s;
+    s = expect("stage.rmsnorm1", {1, H});
+    if (!s.ok) return s;
+    s = expect("stage.in_proj_qkv", {1, conv_dim});
+    if (!s.ok) return s;
+    s = expect("stage.in_proj_z", {1, value_dim});
+    if (!s.ok) return s;
+    s = expect("stage.in_proj_b", {1, n_heads});
+    if (!s.ok) return s;
+    s = expect("stage.in_proj_a", {1, n_heads});
+    if (!s.ok) return s;
+    s = expect("stage.conv_out", {1, conv_dim});
+    if (!s.ok) return s;
+    s = expect("stage.conv_silu", {1, conv_dim});
+    if (!s.ok) return s;
+    s = expect("stage.q", {1, key_dim});
+    if (!s.ok) return s;
+    s = expect("stage.k", {1, key_dim});
+    if (!s.ok) return s;
+    s = expect("stage.v", {1, value_dim});
+    if (!s.ok) return s;
+    s = expect("stage.beta", {1, n_heads});
+    if (!s.ok) return s;
+    s = expect_f32("stage.g", {1, n_heads});
+    if (!s.ok) return s;
+    s = expect("stage.core_out", {1, value_dim});
+    if (!s.ok) return s;
+    s = expect("stage.gated_norm", {1, value_dim});
+    if (!s.ok) return s;
+    s = expect("stage.out_proj", {1, H});
+    if (!s.ok) return s;
+    s = expect("stage.residual1", {1, H});
+    if (!s.ok) return s;
+    s = expect("stage.rmsnorm2", {1, H});
+    if (!s.ok) return s;
+    s = expect("stage.mlp_gate", {1, inter});
+    if (!s.ok) return s;
+    s = expect("stage.mlp_up", {1, inter});
+    if (!s.ok) return s;
+    s = expect("stage.silu_mul", {1, inter});
+    if (!s.ok) return s;
+    s = expect("stage.mlp_down", {1, H});
+    if (!s.ok) return s;
+    s = expect("stage.final_output", {1, H});
+    if (!s.ok) return s;
+    s = expect("state.conv_before", {conv_dim, 3});
+    if (!s.ok) return s;
+    s = expect("state.conv_after", {conv_dim, 3});
+    if (!s.ok) return s;
+    s = expect_f32("state.recurrent_before", {n_heads, hd_k, hd_v});
+    if (!s.ok) return s;
+    return expect_f32("state.recurrent_after", {n_heads, hd_k, hd_v});
+  }
+
+  // Full-attention (Phase B) tensor set.
+  const int qo = c.n_heads * c.head_dim;   // per-head-count flat width
+  const int kvo = c.n_kv_heads * c.head_dim;
+  const int rows = c.n_kv_heads * (position_ + 1);
   Status s = expect("stage.input", {1, H});
   if (!s.ok) return s;
   s = expect("stage.rmsnorm1", {1, H});

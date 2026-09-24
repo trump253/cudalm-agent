@@ -60,6 +60,7 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "common"))
 
 import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
 
 import cudalm_v2 as v2  # noqa: E402
 import golden_v2 as gv2  # noqa: E402
@@ -103,6 +104,37 @@ STAGE_NAMES = [
     "stage.attention_gated", "stage.o_proj", "stage.residual1",
     "stage.rmsnorm2", "stage.mlp_gate", "stage.mlp_up", "stage.silu_mul",
     "stage.mlp_down", "stage.final_output",
+]
+
+# --- Phase C (Gated DeltaNet) tensor names (docs §4/§8) ----------------------
+# GEMV Linears swapped for QuantLinear on a DeltaNet layer (5 linear_attn +
+# 3 mlp).
+DELTANET_GEMV_NAMES = [
+    "linear_attn.in_proj_qkv",
+    "linear_attn.in_proj_z",
+    "linear_attn.in_proj_b",
+    "linear_attn.in_proj_a",
+    "linear_attn.out_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+]
+# Canonical DeltaNet decode stage order (all bf16 except stage.g, which is
+# fp32 — see stage_tensors_deltanet).
+STAGE_NAMES_DN = [
+    "stage.input", "stage.rmsnorm1", "stage.in_proj_qkv", "stage.in_proj_z",
+    "stage.in_proj_b", "stage.in_proj_a", "stage.conv_out", "stage.conv_silu",
+    "stage.q", "stage.k", "stage.v", "stage.beta", "stage.g", "stage.core_out",
+    "stage.gated_norm", "stage.out_proj", "stage.residual1", "stage.rmsnorm2",
+    "stage.mlp_gate", "stage.mlp_up", "stage.silu_mul", "stage.mlp_down",
+    "stage.final_output",
+]
+# Persistent-state tensor names (the Phase C hard gate): conv_state bf16
+# [conv_dim, 3], recurrent_state fp32 [n_heads, key_dim, value_dim], each
+# captured before AND after the decode step.
+STATE_NAMES_DN = [
+    "state.conv_before", "state.conv_after",
+    "state.recurrent_before", "state.recurrent_after",
 ]
 
 
@@ -200,6 +232,39 @@ def build_quantized_layer(v2file, text_cfg, layer_idx: int):
         for p in mod_path.split("."):
             obj = getattr(obj, p)
         setattr(obj, "weight", torch.nn.Parameter(t))
+    return layer
+
+
+def build_quantized_deltanet_layer(v2file, text_cfg, layer_idx: int):
+    """Official Qwen3_5DecoderLayer (DeltaNet) with the 8 GEMV Linears swapped
+    for QuantLinear (dequantized W4A16), the bf16 layernorm weights loaded
+    byte-exact, and the fp32 linear_attn.norm.weight + A_log loaded byte-exact
+    from the SAME .cudalm v2 file the runtime loads (docs §4/§11)."""
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+
+    layer = Qwen3_5DecoderLayer(text_cfg, layer_idx)
+    prefix = f"layers.{layer_idx}."
+    for proj in DELTANET_GEMV_NAMES:
+        mod, leaf = proj.rsplit(".", 1)
+        parent = layer.linear_attn if mod == "linear_attn" else layer.mlp
+        setattr(parent, leaf, QuantLinear(dequant_v2(v2file, prefix, proj)))
+    # bf16 zero-centered layernorms (replace the module's .weight in place).
+    for mod_path in ("input_layernorm", "post_attention_layernorm"):
+        t = tensor_from_v2(v2file, prefix + mod_path + ".weight", BF16)
+        getattr(layer, mod_path).weight = torch.nn.Parameter(t)
+    # fp32 gated-norm weight (docs §6.2: norm.weight is fp32) + A_log fp32.
+    norm_w = tensor_from_v2(v2file, prefix + "linear_attn.norm.weight",
+                            torch.float32)
+    setattr(layer.linear_attn.norm, "weight",
+            torch.nn.Parameter(norm_w))
+    a_log = tensor_from_v2(v2file, prefix + "linear_attn.A_log",
+                           torch.float32)
+    setattr(layer.linear_attn, "A_log", torch.nn.Parameter(a_log))
+    # bf16 conv1d depthwise weights + dt_bias (docs §4).
+    conv_w = tensor_from_v2(v2file, prefix + "linear_attn.conv1d.weight", BF16)
+    layer.linear_attn.conv1d.weight = torch.nn.Parameter(conv_w)
+    dt_bias = tensor_from_v2(v2file, prefix + "linear_attn.dt_bias", BF16)
+    setattr(layer.linear_attn, "dt_bias", torch.nn.Parameter(dt_bias))
     return layer
 
 
@@ -349,6 +414,182 @@ def run_reference(layer, rope, position: int, input_seed: int, H: int):
     return stages, Kc, Vc
 
 
+# ---------------------------------------------------------------------------
+# Phase C — Gated DeltaNet reference forward (decode path, docs §8)
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def forward_step_deltanet(layer, x: torch.Tensor, position: int,
+                          conv_state: torch.Tensor,
+                          recurrent_state):
+    """One DeltaNet DECODE step at `position` (the pinned decode path:
+    torch_causal_conv1d_update + torch_recurrent_gated_delta_rule). x: [1,1,H]
+    bf16. conv_state: [1, conv_dim, 3] bf16 (updated IN PLACE). recurrent_state:
+    [1, n_heads, 128, 128] fp32 or None. Returns
+    (stages, conv_state, rec_after, conv_before, rec_before).
+
+    The conv mirrors the pinned torch_causal_conv1d_update op-for-op (cat the
+    OLD state + new token, copy_ the state in place, F.conv1d over the OLD
+    window, F.silu); the recurrent rule uses the pinned
+    torch_recurrent_gated_delta_rule (l2norm applied to bf16 q/k inside the
+    kernel, then fp32; decay -> delta -> output from the UPDATED state); the
+    gated norm uses the pinned Qwen3_5RMSNormGated module (two bf16 roundings,
+    docs §6.2).
+    """
+    dn = layer.linear_attn
+    B, S = x.shape[0], x.shape[1]
+    key_dim = dn.key_dim
+    value_dim = dn.value_dim
+    conv_dim = dn.conv_dim
+    n_heads = dn.num_v_heads
+    hd_k = dn.head_k_dim
+    hd_v = dn.head_v_dim
+
+    stages = {"input": x}
+    h0 = layer.input_layernorm(x)
+    stages["rmsnorm1"] = h0
+
+    mixed = dn.in_proj_qkv(h0)            # [1,1,conv_dim] bf16 (QuantLinear)
+    stages["in_proj_qkv"] = mixed
+    z = dn.in_proj_z(h0).reshape(B, S, -1, hd_v)  # [1,1,n_heads,hd_v]
+    stages["in_proj_z"] = z
+    b = dn.in_proj_b(h0)                   # [1,1,n_heads] bf16
+    a = dn.in_proj_a(h0)                   # [1,1,n_heads] bf16
+    stages["in_proj_b"] = b
+    stages["in_proj_a"] = a
+
+    # depthwise causal conv1d decode update (mirror torch_causal_conv1d_update)
+    mixed_t = mixed.transpose(1, 2)        # [1,conv_dim,S]
+    conv_before = conv_state.clone()
+    w = dn.conv1d.weight                   # [conv_dim,1,kernel] bf16
+    hidden_new = torch.cat([conv_state, mixed_t], dim=-1).to(w.dtype)
+    conv_state.copy_(hidden_new[:, :, -3:])  # IN-PLACE state update
+    conv_out = F.conv1d(hidden_new, w, None, padding=0,
+                        groups=conv_dim)[:, :, -S:]
+    stages["conv_out"] = conv_out          # [1,conv_dim,S] bf16 (pre-SiLU)
+    mixed_conv = F.silu(conv_out).to(mixed.dtype)  # [1,conv_dim,S] bf16
+    stages["conv_silu"] = mixed_conv
+    conv_after = conv_state.clone()
+
+    mixed_conv = mixed_conv.transpose(1, 2)  # [1,1,conv_dim]
+    query, key, value = torch.split(mixed_conv,
+                                    [key_dim, key_dim, value_dim], dim=-1)
+    query = query.reshape(B, S, -1, hd_k)    # [1,1,n_heads,hd_k]
+    key = key.reshape(B, S, -1, hd_k)
+    value = value.reshape(B, S, -1, hd_v)
+    stages["q"] = query
+    stages["k"] = key
+    stages["v"] = value
+
+    beta = b.sigmoid()                     # bf16 [1,1,n_heads]
+    stages["beta"] = beta
+    g = -dn.A_log.float().exp() * F.softplus(a.float() + dn.dt_bias)  # fp32
+    stages["g"] = g
+
+    # gated delta-rule recurrent (pinned function; l2norm in-kernel)
+    rec_before = (recurrent_state.clone() if recurrent_state is not None
+                  else torch.zeros(B, n_heads, hd_k, hd_v,
+                                   dtype=torch.float32))
+    core, rec_after = _P.torch_recurrent_gated_delta_rule(
+        query, key, value, g=g, beta=beta, initial_state=recurrent_state,
+        output_final_state=True, use_qk_l2norm_in_kernel=True)
+    stages["core_out"] = core              # bf16 [1,1,n_heads,hd_v]
+
+    # gated RMSNorm (pinned Qwen3_5RMSNormGated module, docs §6.2)
+    core_2d = core.reshape(-1, hd_v)       # [n_heads,hd_v]
+    z_2d = z.reshape(-1, hd_v)
+    gated = dn.norm(core_2d, z_2d)         # bf16 [n_heads,hd_v]
+    stages["gated_norm"] = gated
+    out = dn.out_proj(gated.reshape(B, S, -1))  # bf16 [1,1,H]
+    stages["out_proj"] = out
+
+    # decoder residual wiring (docs §9)
+    res1 = x + out
+    stages["residual1"] = res1
+    h1 = layer.post_attention_layernorm(res1)
+    stages["rmsnorm2"] = h1
+    g2 = layer.mlp.gate_proj(h1)
+    u2 = layer.mlp.up_proj(h1)
+    sg = F.silu(g2) * u2
+    stages["mlp_gate"] = g2
+    stages["mlp_up"] = u2
+    stages["silu_mul"] = sg
+    d = layer.mlp.down_proj(sg)
+    stages["mlp_down"] = d
+    y = res1 + d
+    stages["final_output"] = y
+
+    return stages, conv_state, rec_after, conv_before, rec_before
+
+
+def make_state_seed(state_seed: int, conv_dim: int, n_heads: int,
+                    hd_k: int, hd_v: int):
+    """Deterministic non-zero (conv_state, recurrent_state) pair for scenario C
+    (seeded non-zero previous state), independent of the input stream."""
+    gen = torch.Generator().manual_seed(state_seed)
+    conv = (0.05 * torch.randn(1, conv_dim, 3, generator=gen,
+                               dtype=torch.float32)).to(BF16)
+    rec = 0.01 * torch.randn(1, n_heads, hd_k, hd_v, generator=gen,
+                             dtype=torch.float32)
+    return conv, rec
+
+
+def run_reference_deltanet(layer, position: int, input_seed: int, H: int,
+                           state_seed=None):
+    """Drive positions 0..position on the seeded input stream (ONE
+    torch.manual_seed(input_seed) stream for all positions — v0.1.1
+    convention), threading the persistent conv/recurrent state through. If
+    `state_seed` is given, build a deterministic non-zero state and run exactly
+    ONE step at `position` (scenario C). Returns
+    (stages, conv_state, rec_after, conv_before, rec_before)."""
+    torch.manual_seed(input_seed)
+    dn = layer.linear_attn
+    if state_seed is not None:
+        conv_state, recurrent_state = make_state_seed(
+            state_seed, dn.conv_dim, dn.num_v_heads, dn.head_k_dim,
+            dn.head_v_dim)
+        x = (0.05 * torch.randn(1, 1, H, dtype=torch.float32)).to(BF16)
+        return forward_step_deltanet(layer, x, position, conv_state,
+                                     recurrent_state)
+    conv_state = torch.zeros(1, dn.conv_dim, 3, dtype=BF16)
+    recurrent_state = None
+    stages = None
+    for t in range(position + 1):
+        x = (0.05 * torch.randn(1, 1, H, dtype=torch.float32)).to(BF16)
+        stages, conv_state, recurrent_state, conv_before, rec_before = (
+            forward_step_deltanet(layer, x, t, conv_state, recurrent_state))
+    return stages, conv_state, recurrent_state, conv_before, rec_before
+
+
+def stage_tensors_deltanet(stages, conv_before, conv_after, rec_before,
+                           rec_after) -> list:
+    """Flatten to (name, dims, dtype, blob) in canonical golden order. All
+    stages are bf16 EXCEPT stage.g (fp32); the persistent state is conv bf16
+    [conv_dim, 3] and recurrent fp32 [n_heads, 128, 128]."""
+    out = []
+    for name in STAGE_NAMES_DN:
+        t = stages[name[len("stage."):]]
+        is_g = (name == "stage.g")
+        dt = torch.float32 if is_g else BF16
+        t = t.contiguous().view(dt)
+        out.append((name, (1, int(t.numel())),
+                    v2.DT_FP32 if is_g else v2.DT_BF16, bytes_of(t)))
+    cb = conv_before[0].contiguous()
+    ca = conv_after[0].contiguous()
+    rb = rec_before[0].contiguous()
+    ra = rec_after[0].contiguous()
+    out.append(("state.conv_before", (int(cb.shape[0]), int(cb.shape[1])),
+                v2.DT_BF16, bytes_of(cb)))
+    out.append(("state.conv_after", (int(ca.shape[0]), int(ca.shape[1])),
+                v2.DT_BF16, bytes_of(ca)))
+    out.append(("state.recurrent_before",
+                (int(rb.shape[0]), int(rb.shape[1]), int(rb.shape[2])),
+                v2.DT_FP32, bytes_of(rb)))
+    out.append(("state.recurrent_after",
+                (int(ra.shape[0]), int(ra.shape[1]), int(ra.shape[2])),
+                v2.DT_FP32, bytes_of(ra)))
+    return out
+
+
 def stage_tensors(stages: dict, Kc: torch.Tensor, Vc: torch.Tensor,
                   position: int) -> list:
     """Flatten to (name, dims, bytes) in canonical golden order (bf16)."""
@@ -473,7 +714,8 @@ def fidelity_report(v2file, safetensors, text_cfg, layer_idx: int,
 # Main
 # ---------------------------------------------------------------------------
 def generate(cudalm_path: str, ckpt_dir: str, layer_idx: int, out_path: str,
-             position: int, input_seed: int, fidelity_path=None) -> int:
+             position: int, input_seed: int, fidelity_path=None,
+              state_seed=None) -> int:
     from transformers.models.qwen3_5.configuration_qwen3_5 import (
         Qwen3_5TextConfig)
 
@@ -507,9 +749,11 @@ def generate(cudalm_path: str, ckpt_dir: str, layer_idx: int, out_path: str,
         print("error: v2 file config deviates from the pinned 0.8B "
               "contract", file=sys.stderr)
         return 1
-    if not v2file.config.is_full_attention(layer_idx):
-        print(f"error: layer {layer_idx} is not a full-attention layer",
-              file=sys.stderr)
+    is_dn = v2file.config.is_linear_attention(layer_idx)
+    is_fa = v2file.config.is_full_attention(layer_idx)
+    if not (is_dn or is_fa):
+        print(f"error: layer {layer_idx} is neither a full-attention nor a "
+              f"linear-attention (Gated DeltaNet) layer", file=sys.stderr)
         return 2
 
     # Official text config from the checkpoint (drives the oracle modules).
@@ -521,13 +765,24 @@ def generate(cudalm_path: str, ckpt_dir: str, layer_idx: int, out_path: str,
         Qwen3_5TextRotaryEmbedding)
     rope = Qwen3_5TextRotaryEmbedding(text_cfg)
 
-    layer = build_quantized_layer(v2file, text_cfg, layer_idx)
-    stages, Kc, Vc = run_reference(layer, rope, position, input_seed, H)
-    check_invariants(stages, Kc, Vc, position)
+    if is_dn:
+        layer = build_quantized_deltanet_layer(v2file, text_cfg, layer_idx)
+        stages, conv_state, rec_after, conv_before, rec_before = (
+            run_reference_deltanet(layer, position, input_seed, H, state_seed))
+        specs = stage_tensors_deltanet(stages, conv_before, conv_state,
+                                       rec_before, rec_after)
+        tensors = [v2.V2Tensor(name, dt, dims, blob)
+                   for name, dims, dt, blob in specs]
+    else:
+        layer = build_quantized_layer(v2file, text_cfg, layer_idx)
+        stages, Kc, Vc = run_reference(layer, rope, position, input_seed, H)
+        check_invariants(stages, Kc, Vc, position)
+        specs = [(name, dims, v2.DT_BF16, blob)
+                 for name, dims, blob
+                 in stage_tensors(stages, Kc, Vc, position)]
+        tensors = [v2.V2Tensor(name, dt, dims, blob)
+                   for name, dims, dt, blob in specs]
 
-    tensors = []
-    for name, dims, blob in stage_tensors(stages, Kc, Vc, position):
-        tensors.append(v2.V2Tensor(name, v2.DT_BF16, dims, blob))
     g = gv2.GoldenV2File(v2file.config, position, layer_idx, input_seed,
                          tensors)
     blob = g.to_bytes()
@@ -538,24 +793,33 @@ def generate(cudalm_path: str, ckpt_dir: str, layer_idx: int, out_path: str,
                                               layer_idx)
     if len(rt.tensors) != len(expected):
         raise SystemExit("round-trip: tensor count mismatch")
-    for (ename, edims), t in zip(expected, rt.tensors):
-        if t.name != ename or tuple(t.dims) != edims:
+    for (ename, edims, edtype), t in zip(expected, rt.tensors):
+        if (t.name != ename or tuple(t.dims) != edims
+                or t.dtype != edtype):
             raise SystemExit(
-                f"round-trip: tensor {t.name} dims {t.dims} != expected "
-                f"{ename} {edims}")
+                f"round-trip: tensor {t.name} {tuple(t.dims)} "
+                f"dtype={t.dtype} != expected {ename} {edims} dtype={edtype}")
     if bytes(blob) != rt.to_bytes():
         raise SystemExit("round-trip: bytes are not idempotent")
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     gv2.write_golden_v2(out_path, g)
     print(f"wrote {out_path} ({len(blob)} bytes, layer={layer_idx}, "
-          f"position={position}, input_seed={input_seed})")
-    for name, dims, b in stage_tensors(stages, Kc, Vc, position):
-        if name.startswith("stage."):
-            arr = torch.frombuffer(bytearray(b), dtype=torch.uint8)
-            max_abs = float(arr.view(torch.bfloat16).float().abs().max().item())
-            print(f"  {name:<26s} max_abs={max_abs:.6f}")
+          f"position={position}, input_seed={input_seed}"
+          + (f", state_seed={state_seed}" if state_seed is not None else ""))
+    for t in g.tensors:
+        if t.name.startswith("stage."):
+            torch_dt = (torch.float32 if t.dtype == v2.DT_FP32
+                        else torch.bfloat16)
+            arr = torch.frombuffer(bytearray(t.data), dtype=torch.uint8)
+            max_abs = float(arr.view(torch_dt).float().abs().max().item())
+            print(f"  {t.name:<26s} max_abs={max_abs:.6f}")
 
+    if fidelity_path and is_dn:
+        print("note: --fidelity-report is full-attention only; skipped for "
+              "the DeltaNet layer (the Phase C gate is the state-validated "
+              "golden)", file=sys.stderr)
+        return 0
     if fidelity_path:
         rep = fidelity_report(v2file, st_path, text_cfg, layer_idx, position,
                               input_seed, H, transformers)
@@ -674,7 +938,7 @@ def selftest_impl() -> int:
         if rt.to_bytes() != b1:
             raise SystemExit("selftest: golden round-trip not idempotent")
         expected = gv2.golden_tensor_expectations(cfg, position, 3)
-        if [(t.name, tuple(t.dims)) for t in rt.tensors] != expected:
+        if [(t.name, tuple(t.dims), t.dtype) for t in rt.tensors] != expected:
             raise SystemExit("selftest: golden tensor set mismatch")
         # Determinism: regenerate, bytes must be identical.
         stages2, Kc2, Vc2 = run_reference(layer, rope, position, seed, H)
@@ -702,6 +966,9 @@ if __name__ == "__main__":
     ap.add_argument("--position", type=int, default=0)
     ap.add_argument("--input-seed", type=int, default=20260209)
     ap.add_argument("--fidelity-report")
+    ap.add_argument("--state-seed", type=int, default=None,
+                    help="Phase C scenario C: seed a deterministic non-zero "
+                         "conv+recurrent previous state (DeltaNet only)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -710,4 +977,5 @@ if __name__ == "__main__":
         ap.error("--cudalm, --checkpoint-dir and --out are required "
                  "(or use --selftest)")
     sys.exit(generate(a.cudalm, a.checkpoint_dir, a.layer, a.out,
-                      a.position, a.input_seed, a.fidelity_report))
+                      a.position, a.input_seed, a.fidelity_report,
+                      a.state_seed))

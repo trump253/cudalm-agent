@@ -158,6 +158,11 @@ class Qwen35Config:
         return (0 <= i < self.num_hidden_layers
                 and (i + 1) % self.full_attention_interval == 0)
 
+    def is_linear_attention(self, i: int) -> bool:
+        # Gated DeltaNet layer (mirror qwen35_config.h is_linear_attention).
+        return (0 <= i < self.num_hidden_layers
+                and not self.is_full_attention(i))
+
     def valid(self) -> bool:
         c = self
         if (c.hidden_size <= 0 or c.num_hidden_layers <= 0

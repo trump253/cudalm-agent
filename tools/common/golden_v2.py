@@ -32,6 +32,8 @@ from typing import Dict, List, Optional
 
 from cudalm_v2 import (
     CONFIG_BYTES,
+    DT_BF16,
+    DT_FP32,
     DTYPE_NAMES,
     MAX_DIM,
     MAX_NAME_LEN,
@@ -67,8 +69,9 @@ class GoldenV2File:
         if not (0 <= position < config.max_seq_len):
             raise V2FormatError("position out of bounds")
         if not (0 <= layer_idx < config.num_hidden_layers
-                and config.is_full_attention(layer_idx)):
-            raise V2FormatError("layer_idx is not a full-attention layer")
+                and (config.is_full_attention(layer_idx)
+                     or config.is_linear_attention(layer_idx))):
+            raise V2FormatError("layer_idx is not a valid layer type")
         self.config = config
         self.position = int(position)
         self.layer_idx = int(layer_idx)
@@ -139,8 +142,9 @@ class GoldenV2File:
         if not (0 <= position < config.max_seq_len):
             raise V2FormatError("position out of bounds")
         if not (0 <= layer_idx < config.num_hidden_layers
-                and config.is_full_attention(layer_idx)):
-            raise V2FormatError("layer_idx is not a full-attention layer")
+                and (config.is_full_attention(layer_idx)
+                     or config.is_linear_attention(layer_idx))):
+            raise V2FormatError("layer_idx is not a valid layer type")
         (table_off, payload_off) = struct.unpack_from("<QQ", raw,
                                                       OFFSET_TABLE_FIELD)
         if table_off != HEADER_BYTES:
@@ -239,32 +243,74 @@ def write_golden_v2(path: str, obj: GoldenV2File) -> None:
 def golden_tensor_expectations(config: Qwen35Config, position: int,
                                layer_idx: int) -> List[tuple]:
     H = config.hidden_size
+    inter = config.intermediate_size
+    B = DT_BF16
+    F32 = DT_FP32
+    if config.is_linear_attention(layer_idx):
+        # Phase C: Gated DeltaNet decode stages (bf16 except stage.g fp32) +
+        # the persistent-state hard gate (conv bf16 [conv_dim,3], recurrent
+        # fp32 [n_heads, key_dim, value_dim], each before/after the step).
+        conv_dim = config.linear_conv_dim
+        key_dim = config.linear_key_dim
+        value_dim = config.linear_value_dim
+        n_heads = config.lin_num_v_heads
+        hd_k = config.lin_key_head_dim
+        hd_v = config.lin_value_head_dim
+        return [
+            ("stage.input", (1, H), B),
+            ("stage.rmsnorm1", (1, H), B),
+            ("stage.in_proj_qkv", (1, conv_dim), B),
+            ("stage.in_proj_z", (1, value_dim), B),
+            ("stage.in_proj_b", (1, n_heads), B),
+            ("stage.in_proj_a", (1, n_heads), B),
+            ("stage.conv_out", (1, conv_dim), B),
+            ("stage.conv_silu", (1, conv_dim), B),
+            ("stage.q", (1, key_dim), B),
+            ("stage.k", (1, key_dim), B),
+            ("stage.v", (1, value_dim), B),
+            ("stage.beta", (1, n_heads), B),
+            ("stage.g", (1, n_heads), F32),
+            ("stage.core_out", (1, value_dim), B),
+            ("stage.gated_norm", (1, value_dim), B),
+            ("stage.out_proj", (1, H), B),
+            ("stage.residual1", (1, H), B),
+            ("stage.rmsnorm2", (1, H), B),
+            ("stage.mlp_gate", (1, inter), B),
+            ("stage.mlp_up", (1, inter), B),
+            ("stage.silu_mul", (1, inter), B),
+            ("stage.mlp_down", (1, H), B),
+            ("stage.final_output", (1, H), B),
+            ("state.conv_before", (conv_dim, 3), B),
+            ("state.conv_after", (conv_dim, 3), B),
+            ("state.recurrent_before", (n_heads, hd_k, hd_v), F32),
+            ("state.recurrent_after", (n_heads, hd_k, hd_v), F32),
+        ]
+    # Full-attention (Phase B) tensor set.
     qo = config.n_heads * config.head_dim
     kvo = config.n_kv_heads * config.head_dim
-    inter = config.intermediate_size
     rows = config.n_kv_heads * (position + 1)
     return [
-        ("stage.input", (1, H)),
-        ("stage.rmsnorm1", (1, H)),
-        ("stage.q_gate", (1, 2 * qo)),
-        ("stage.q", (1, qo)),
-        ("stage.att_gate", (1, qo)),
-        ("stage.k", (1, kvo)),
-        ("stage.v", (1, kvo)),
-        ("stage.q_norm", (1, qo)),
-        ("stage.k_norm", (1, kvo)),
-        ("stage.rope_q", (1, qo)),
-        ("stage.rope_k", (1, kvo)),
-        ("stage.attention_raw", (1, qo)),
-        ("stage.attention_gated", (1, qo)),
-        ("stage.o_proj", (1, H)),
-        ("stage.residual1", (1, H)),
-        ("stage.rmsnorm2", (1, H)),
-        ("stage.mlp_gate", (1, inter)),
-        ("stage.mlp_up", (1, inter)),
-        ("stage.silu_mul", (1, inter)),
-        ("stage.mlp_down", (1, H)),
-        ("stage.final_output", (1, H)),
-        ("kv.k_state", (rows, config.head_dim)),
-        ("kv.v_state", (rows, config.head_dim)),
+        ("stage.input", (1, H), B),
+        ("stage.rmsnorm1", (1, H), B),
+        ("stage.q_gate", (1, 2 * qo), B),
+        ("stage.q", (1, qo), B),
+        ("stage.att_gate", (1, qo), B),
+        ("stage.k", (1, kvo), B),
+        ("stage.v", (1, kvo), B),
+        ("stage.q_norm", (1, qo), B),
+        ("stage.k_norm", (1, kvo), B),
+        ("stage.rope_q", (1, qo), B),
+        ("stage.rope_k", (1, kvo), B),
+        ("stage.attention_raw", (1, qo), B),
+        ("stage.attention_gated", (1, qo), B),
+        ("stage.o_proj", (1, H), B),
+        ("stage.residual1", (1, H), B),
+        ("stage.rmsnorm2", (1, H), B),
+        ("stage.mlp_gate", (1, inter), B),
+        ("stage.mlp_up", (1, inter), B),
+        ("stage.silu_mul", (1, inter), B),
+        ("stage.mlp_down", (1, H), B),
+        ("stage.final_output", (1, H), B),
+        ("kv.k_state", (rows, config.head_dim), B),
+        ("kv.v_state", (rows, config.head_dim), B),
     ]
