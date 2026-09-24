@@ -13,8 +13,10 @@ container whose tensor table follows docs/qwen35_architecture.md §4:
       layernorms, q/k_norm, conv1d.weight, dt_bias, model norm.
   * fp32 pass-through (byte-exact; stored fp32 in the official checkpoint):
       A_log, linear_attn.norm.weight (per-head gated norm).
-  * Skipped (out of v0.2 scope): vision tower, MTP module, embed_tokens
-    (tie_word_embeddings; no embedding/LM head in v0.2).
+  * Skipped (out of per-layer scope): vision tower, MTP module.
+    embed_tokens is skipped in the per-layer path (tie_word_embeddings; no
+    embedding/LM head in v0.2) but IS emitted in the v0.3 full model
+    (--full-model) as the embedding + tied LM head.
 
 All provenance (repo, revision, sha256 of config + checkpoint, transformers
 pin) is written into the container metadata; the config blob is built from
@@ -24,6 +26,7 @@ Usage:
   python3 tools/convert_qwen35.py \
       --checkpoint-dir /root/models/Qwen3.5-0.8B-Base \
       --out data/qwen35_08b.cudalm [--layers 0,1,2,3] [--manifest m.json]
+      [--full-model]   # v0.3: all 24 layers + embedding + final norm + tie
 """
 from __future__ import annotations
 
@@ -93,7 +96,8 @@ def config_from_checkpoint(cfg: dict) -> v2.Qwen35Config:
     )
 
 
-def convert(checkpoint_dir: str, out_path: str, layers, manifest_path=None):
+def convert(checkpoint_dir: str, out_path: str, layers, manifest_path=None,
+            full_model=False):
     cfg_path = os.path.join(checkpoint_dir, "raw", "config.json")
     st_path = os.path.join(checkpoint_dir, "model.safetensors")
     if not (os.path.isfile(cfg_path) and os.path.isfile(st_path)):
@@ -126,6 +130,10 @@ def convert(checkpoint_dir: str, out_path: str, layers, manifest_path=None):
             raise SystemExit(f"layer {i}: config says {layer_types[i]!r}, "
                              f"schedule says {expected!r}")
 
+    if full_model:
+        # Full model: convert every decoder layer (0..n_layers-1) so the file
+        # can be loaded whole by the v0.3 Qwen35Model runtime.
+        layers = list(range(n_layers))
     if layers is None:
         layers = list(range(n_layers))
     layers = sorted(set(layers))
@@ -141,7 +149,11 @@ def convert(checkpoint_dir: str, out_path: str, layers, manifest_path=None):
         "config_sha256": CONFIG_SHA256,
         "checkpoint_sha256": CHECKPOINT_SHA256,
         "layers": layers,
-        "skipped": ["visual", "mtp", "embed_tokens"],
+        "full_model": full_model,
+        # embed_tokens is converted (and the LM head is tied to it) in the full
+        # model; visual + mtp are always out of v0.2/v0.3 text scope.
+        "skipped": (["visual", "mtp"] if full_model
+                    else ["visual", "mtp", "embed_tokens"]),
         "tensors": [],
         "fidelity_report_only": [],
     }
@@ -203,6 +215,13 @@ def convert(checkpoint_dir: str, out_path: str, layers, manifest_path=None):
             w4(f"layers.{i}.mlp.up_proj", f.get_tensor(L + "mlp.up_proj.weight"))
             w4(f"layers.{i}.mlp.down_proj", f.get_tensor(L + "mlp.down_proj.weight"))
         bf16("norm.weight", f.get_tensor(LANG_PREFIX + "norm.weight"))
+        if full_model:
+            # Embedding (v0.3 full model). The LM head is TIED to this tensor
+            # (pinned 0.8B: tie_word_embeddings=true), so there is NO separate
+            # lm_head tensor in the checkpoint; the tie is recorded in metadata
+            # below and the loader aliases the embedding as the LM head.
+            bf16("embed_tokens.weight",
+                 f.get_tensor(LANG_PREFIX + "embed_tokens.weight"))
 
     metadata = {
         v2.META_ARCH: ARCH_ID,
@@ -213,8 +232,21 @@ def convert(checkpoint_dir: str, out_path: str, layers, manifest_path=None):
         v2.META_TRANSFORMERS_COMMIT: TRANSFORMERS_COMMIT,
         v2.META_TRANSFORMERS_VERSION: f"git+https://github.com/huggingface/transformers@{TRANSFORMERS_COMMIT}",
         v2.META_SOURCE_DTYPE: "bf16",
-        v2.META_GENERATOR: "tools/convert_qwen35.py (CUDALM v0.2)",
+        # Full model (v0.3) is tagged v0.3; the default per-layer path keeps the
+        # historical v0.2 label so existing Phase A-D fixtures/provenance are
+        # unchanged.
+        v2.META_GENERATOR: ("tools/convert_qwen35.py (CUDALM v0.3)"
+                            if full_model
+                            else "tools/convert_qwen35.py (CUDALM v0.2)"),
     }
+    if full_model:
+        # Record the LM-head weight tying from the pinned config. The pinned
+        # Qwen3.5-0.8B ties lm_head to the embedding (tie_word_embeddings=true,
+        # source _tied_weights_keys), so the checkpoint has no separate lm_head
+        # tensor; the loader aliases the embedding as the LM head.
+        tie = bool(cfg.get("tie_word_embeddings",
+                           cfg["text_config"].get("tie_word_embeddings", False)))
+        metadata[v2.META_TIE_WORD_EMBEDDINGS] = "true" if tie else "false"
     obj = v2.V2File(conf, metadata, tensors)
     raw = obj.to_bytes()
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -307,6 +339,12 @@ if __name__ == "__main__":
     ap.add_argument("--layers", help="comma-separated layer indices "
                                      "(default: all 24)")
     ap.add_argument("--manifest", help="write a JSON manifest here")
+    ap.add_argument("--full-model", action="store_true",
+                    help="v0.3: emit the FULL model — all 24 decoder layers + "
+                         "embed_tokens.weight + final norm.weight + the "
+                         "tie_word_embeddings metadata (LM head is tied to the "
+                         "embedding). Implies all layers; for the Qwen35Model "
+                         "runtime.")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -315,4 +353,8 @@ if __name__ == "__main__":
         layers = None
         if a.layers:
             layers = [int(x) for x in a.layers.split(",")]
-        convert(a.checkpoint_dir, a.out, layers, a.manifest)
+        if a.full_model and a.layers:
+            ap.error("--full-model converts all 24 layers; do not also pass "
+                     "--layers")
+        convert(a.checkpoint_dir, a.out, layers, a.manifest,
+                full_model=a.full_model)

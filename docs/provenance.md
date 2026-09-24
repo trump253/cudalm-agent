@@ -188,3 +188,142 @@ fp32 3.1e-3，在跨层复合容差内）；30/30 ctest；compute-sanitizer memc
 错误（覆盖连续多 token micro-stack 运行，
 `benchmarks/sanitizer_qwen35_hybrid_microstack.txt`）；no-torch 守卫 CLEAN。
 详见 `docs/qwen35_architecture.md` §16。
+
+## CUDALM v0.3 Phase A（Qwen3.5 全模型结构 + 权重摄入口径）
+
+Phase A 在 v0.2 之上完成**完整 24 层模型**的结构 + 权重摄入口径 + 模型级
+runtime 骨架（embedding / 24 层 / 最终 norm / tied LM head 的**所有权**与
+**状态生命周期**）。**无新 kernel、无新上游移植**：`Qwen35Model` 是纯接线
+（模型级张量 + 24 层逐层 dispatch + 统一 reset_state），数学语义完全来自
+**复用的冻结 v0.2 单层运行时**（`Qwen35FullAttentionLayer` /
+`Qwen35DeltaNetLayer`）。本 Phase **不跑**全模型 forward / logits（Phase B）。
+事实源：官方 pinned transformers（`fc9137225880`）+ 真实 checkpoint
+（`Qwen/Qwen3.5-0.8B-Base`）——全模型契约见 `docs/qwen35_architecture.md` §17。
+
+### 上游核查（CUDALab `cb6a6a9`，只读参考）
+
+已核查 frozen `CUDALab@cb6a6a9`：本 Phase **不新增任何 kernel**（只复用 Phase
+B/C 单层运行时 + 其已移植 kernel）。模型级 wiring（embedding / 24 层 dispatch /
+tied LM head / 统一 reset_state）为 CUDALM 原生，无可移植的上游 kernel。
+
+### CUDALM 原生（无上游）
+
+- `include/cudalm/qwen35_model.h` / `src/runtime/qwen35_model.cpp`：
+  `Qwen35Model`——`load`（`validate_full_model`：embedding + 最终 norm + 24/24 层
+  + tie metadata；逐层 `Qwen35LayerWeights::load` + 按 config 排表构造
+  `Qwen35DeltaNetLayer`(18) / `Qwen35FullAttentionLayer`(6)；embedding 上传
+  `[248320,1024]` bf16、最终 norm `[1024]` bf16、LM head **alias 词嵌入**）、
+  `reset_state`（遍历**全部 24 层**逐层独立重置，无跨层 alias）、访问器
+  （embedding/final_norm/lm_head/layer_weights/delta/attention/排表）。**仅
+  编排 + 所有权，不复制任何 kernel**。
+- `tools/convert_qwen35.py`（`--full-model`）：一次转出全 24 层 +
+  `embed_tokens.weight` + `norm.weight` + metadata `tie_word_embeddings`
+  （读 config）。**不加 `--full-model` 时逐字节不变**（不破坏 Phase A-D）。
+  `tools/common/cudalm_v2.py` 仅新增 metadata 常量 `META_TIE_WORD_EMBEDDINGS`。
+- `include/cudalm/weight_loader_v2.h` / `src/runtime/weight_loader_v2.cpp`：
+  新增 `validate_model_embedding()` + `validate_full_model()`（缺张量/shape/
+  dtype/tie 不符都 loudly fail）。
+- 测试：`tests/cuda/test_qwen35_full_model.cpp`（真实 checkpoint 硬门：
+  CPU 全模型结构契约 + GPU 所有权 + `reset_state` 覆盖全部 24 层；
+  `--no-gen` 供 memcheck）。
+
+> 注：Phase A **复用** Phase B 的 `Qwen35FullAttentionLayer` 与 Phase C 的
+> `Qwen35DeltaNetLayer`（及其全部 kernel），**不是**新的上游移植、**不新增**
+> kernel；新增的仅是全模型接线（embedding/norm/LM-head 所有权 + 24 层 dispatch
+> + 统一 reset_state）与全模型摄入。
+
+验收证据（RTX 2080 Ti）：真实 checkpoint 全量转换 PASS（506 张量 / 766 MB /
+layers 0..23）；24/24 层 validate PASS + 层排表 exact（全注意力 3,7,11,15,19,23）
++ embedding/final-norm/LM-head 张量契约 PASS；full model load/unload PASS；
+`reset_state()` 覆盖全部 24 层；完整 ctest 34/34 PASS（旧 31 全回归 + 1 Phase A
+ full-model + 1 Phase B full-forward + 1 standalone bf16_gemv）；
+ compute-sanitizer
+memcheck 0 错误（`--no-gen` CUDA-only 路径，覆盖全模型 load + 24 层 seed +
+reset + unload 的新 CUDA 分配生命周期）；no-torch 守卫 CLEAN。详见
+`docs/qwen35_architecture.md` §17。
+
+## v0.3 Phase B —— 完整单-token forward（LM-head BF16 GEMV + golden oracle）
+
+范围 = 完整单-token forward（`token_id → embedding → 24 层 → final RMSNorm →
+tied LM head → logits [248320]`），correctness bring-up（不 generation /
+tokenizer / sampling / benchmark 优化）。全模型契约 + 逐段舍入 + 实测 envelope
+见 `docs/qwen35_architecture.md` §18（§18.1-18.3）。
+
+### 上游核查（CUDALab `cb6a6a9`，只读参考）
+
+LM-head 需要一个**新** BF16 GEMV（`[V=248320, K=1024]`，tied：W = embedding）。
+按规则**先核查** frozen `CUDALab@cb6a6a9` 的已优化 GEMV 结构再移植：
+
+- 采用 proven 的 **16B 向量化 load** 变体 `kernels/gemv/gemv_vec4_row.cu`
+  （GEMV-0001）：每行一个 block、256 线程、fp32 累加、warp-shfl + shared +
+  warp0 归约、末尾**单次** RNE store；16B 向量 load（`epv = 16/sizeof(T)`）。
+- **标量回退**复用其共享的 `kernels/gemv/gemv_common.h` 的
+  `gemv_scalar_kernel<T>`（每行一 block、256 线程、fp32 累加、同一归约）。
+- 未采用 `gemv_baseline.cu` / `gemv_splitk4.cu` / `gemv_warp_vec4.cu`（本
+  `[V=248320,K=1024]` 形状下 vec4_row 是 proven 主路径；splitk 是为大 K 的
+  占用率优化，此处 K=1024 不需要）。
+
+### CUDALM 移植（`kernels/bf16_gemv.h/.cu`）
+
+- 从 `gemv_vec4_row.cu`（主路径）+ `gemv_common.h`（标量回退）**机械适配**：
+  `__half → __nv_bfloat16`（`el_to_float→__bfloat162float`、
+  `el_from_float→__float2bfloat16_rn`，与 Qwen3.5 bf16 kernel 族同一
+  "边界单次 RNE" 舍入口径）；PyTorch 绑定（at::Tensor / getCurrentCUDAStream /
+  C10_CUDA_KERNEL_LAUNCH_CHECK）改为 **raw pointer + cudaStream_t +
+  CUDA_CHECK_LAUNCH**；数学 / 控制流不变。
+- 向量化契约与 W4A16 GEMV 一致：W 基 16B ∧ x 基 16B ∧ K%8==0（epv=8）走
+  vec4_row，否则标量回退；合法输入永不拒（DeviceBuffer 256B 对齐、K=1024 是
+  8 的倍数 → runtime 全部走 vec4_row）。
+- **tied**：`Qwen35Model::forward_token` 的 LM-head GEMV 直接以 `embedding`
+  的 device buffer 为 `W`（`logits = normed @ embedding^T`），**不复制权重**。
+- `forward_token`（`src/runtime/qwen35_model.cpp`）：embedding 行拷贝（D2D，
+  bit-exact）→ 复用冻结 v0.2 `Qwen35DeltaNetLayer`(18)/`Qwen35FullAttentionLayer`
+  (6) 逐层链（`stage_final_output` 递推）→ 复用 `qwen35_rmsnorm_zc_bf16`
+  （final norm，M=1 H=1024 eps=1e-6）→ 新 `bf16_gemv`（LM head）。token_id /
+  position OOB **loudly fail**（host precondition）。持久状态用 runtime 自身
+  历史（逐层 in-place 更新，顺序 forward 自线程）。
+
+### golden oracle（`tools/generate_qwen35_golden.py --fullmodel-prefix`）
+
+- **pinned quantized oracle**：用**与 runtime 同一份** `.cudalm v2` W4A16
+  权重 + tied BF16 embedding（`tensor_from_v2` 直接读 v2 文件的
+  `embed_tokens.weight`/`norm.weight`），复用 `build_quantized_*_layer`
+  构建全部 24 层；final norm 用 pinned `Qwen3_5RMSNorm`（weight = checkpoint
+  norm，零中心 `1+w`）；LM head = `normed @ embedding^T`（fp32 累加、bf16 出）。
+- 场景 **A**（p0 fresh）+ **B**（p0→p1→p2 顺序，oracle 自线程状态，**不回填
+  golden 状态**）。每 token 输出：per-(token,layer) CUDLMG02（24 层，含全部
+  stage + 持久状态 before/after，同 micro-stack 张量集）+ per-token model 级
+  CUDLMG02（`model.embedding_output`/`model.final_norm_output`/`model.logits`
+  `[248320]` 全向量）。确定性 token：A=[15]，B=[15,16,17]。
+
+### 测试
+
+**独立 `bf16_gemv` numeric 硬门（`tests/cuda/test_bf16_gemv.cpp`，无
+checkpoint）**：kernel 正确性**不靠** full-model logits 证明。deterministic
+BF16 输入 vs **CPU FP32-accumulate → BF16 RNE** 参考（`compare_bf16_stages`
+1e-2，抓 O(magnitude) 的错索引/错累加/错舍入/错 dtype），覆盖 **vec4 路径**
+（K%8==0 ∧ 16B 对齐，含真实 LM-head `[N=248320,K=1024]` + 多 N/K）、**scalar
+回退**（K%8!=0 及 K%8==0 但 2 字节错位基址）、scalar-vs-vec4 同数据交叉、
+全零 weight 行 → bit-exact 0。
+
+**full-forward golden 硬门（`tests/cuda/test_qwen35_full_forward.cpp`）**：
+真实 checkpoint，A（p0 fresh）+ B（p0→p1→p2，runtime 自线程状态）逐 token
+比较 embedding（bit-exact）/ 24× 层 final / final norm / **FULL logits
+[248320]** / 18× DeltaNet conv+recurrent / 6× FA K/V rows 0..p，tolerance =
+**per-layer / depth-aware 最小必要 envelope**（每层 = 该层实测 worst × 1.3 +
+1e-3，L0 紧、L23 松、L23 不放宽 L0；final norm / logits 保留模型级，§18.2）。
+**正确性只由 per-layer envelope 硬门决定**（`actual_error[L] <= k*Atol[L]`）；
+深度趋势由 `report_smooth_growth` **diagnostic 报告**（总体随 depth 增大、非严格
+单调，**非 PASS/FAIL 门**，误差不因变小而 fail）。`--no-gen` 供 memcheck。
+
+`tests/CMakeLists.txt` 注册：`test_bf16_gemv`（纯 kernel，always）+
+`test_qwen35_full_forward`（real-checkpoint 门，self-skip 77，TIMEOUT 1800）。
+
+验收证据（RTX 2080 Ti / CUDA 11.8）：完整 forward A+B 全类别 PASS（§18.2
+per-layer envelope 硬门；深度趋势为 diagnostic）；`test_bf16_gemv` PASS；完整
+ctest
+**34/34 PASS**；`check_no_torch.sh` **CLEAN**；`compute-sanitizer --tool
+memcheck` **0 错误**，两份 evidence：`benchmarks/sanitizer_qwen35_full_forward.txt`
+（完整 24 层 forward + 新 `bf16_gemv` LM-head GEMV + A/B 顺序路径）+
+`benchmarks/sanitizer_bf16_gemv.txt`（vec4 + scalar 回退）。详见
+`docs/qwen35_architecture.md` §18.

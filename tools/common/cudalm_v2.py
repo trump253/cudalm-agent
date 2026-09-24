@@ -76,6 +76,11 @@ META_TRANSFORMERS_COMMIT = "transformers_commit"
 META_TRANSFORMERS_VERSION = "transformers_version"
 META_SOURCE_DTYPE = "source_dtype"
 META_GENERATOR = "generator"
+# v0.3 full model: LM-head weight tying (pinned Qwen3.5-0.8B is tied, so the
+# checkpoint has no separate lm_head tensor and the LM head aliases the
+# embedding). Emitted as "true"/"false"; the loader requires "true" for the
+# pinned 0.8B full-model contract.
+META_TIE_WORD_EMBEDDINGS = "tie_word_embeddings"
 
 
 class V2FormatError(ValueError):

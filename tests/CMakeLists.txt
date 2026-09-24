@@ -23,6 +23,10 @@ cudalm_add_test(test_int4_gemv test_int4_gemv cuda/test_int4_gemv.cpp)
 # Qwen3.5 kernel family (zero-centered RMSNorm, fused q/gate split, partial
 # rotate-half RoPE, bf16 KV write/decode attention, bf16 elementwise).
 cudalm_add_test(test_int4_gemv_bf16 test_int4_gemv_bf16 cuda/test_int4_gemv_bf16.cpp)
+# Plain BF16 GEMV (the tied-LM-head matmul, v0.3 Phase B) — standalone numeric
+# hard gate: vec4 (K%8==0, aligned) + scalar (K%8!=0 / misaligned) + zero-row,
+# vs a CPU FP32-accumulate -> BF16 RNE reference. No checkpoint needed.
+cudalm_add_test(test_bf16_gemv test_bf16_gemv cuda/test_bf16_gemv.cpp)
 cudalm_add_test(test_qwen35_kernels test_qwen35_kernels cuda/test_qwen35_kernels.cpp)
 cudalm_add_test(test_rope test_rope cuda/test_rope.cpp)
 cudalm_add_test(test_kv_cache test_kv_cache cuda/test_kv_cache.cpp)
@@ -316,6 +320,45 @@ if(CUDALM_PYTHON3)
                      ${CUDALM_TOOL_PYTHON3}
                      ${CMAKE_SOURCE_DIR})
     set_tests_properties(test_qwen35_hybrid_microstack_golden PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+    # --- v0.3 Phase A: Qwen3.5 full-model structure + ownership gate -------
+    # HARD GATE: convert the COMPLETE Qwen3.5-0.8B-Base (all 24 decoder layers
+    # + embed_tokens + final norm + tie metadata) in one shot, validate the
+    # full-model tensor contract on the host (24/24 layers, embedding/final-
+    # norm/LM-head shapes+dtype, exact hybrid schedule, weight tying), then
+    # load the full Qwen35Model (device memory) and prove reset_state() covers
+    # every one of the 24 layers (seed each layer's state non-zero, reset,
+    # verify all zero). No forward/logits (that is v0.3 Phase B). Self-skips
+    # (77) when the checkpoint is absent.
+    add_executable(test_qwen35_full_model cuda/test_qwen35_full_model.cpp)
+    target_link_libraries(test_qwen35_full_model PRIVATE cudalm)
+    add_test(NAME test_qwen35_full_model
+             COMMAND test_qwen35_full_model
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR})
+    set_tests_properties(test_qwen35_full_model PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+    # v0.3 Phase B: full single-token forward golden hard gate. Runs the
+    # COMPLETE model (embedding -> 24 layers -> final RMSNorm -> tied LM head
+    # -> logits) on deterministic tokens (A: p0; B: p0->p1->p2, runtime threads
+    # its own state) and compares embedding output + 24x layer final output +
+    # final norm + FULL logits [vocab] + 18x DeltaNet conv/recurrent state +
+    # 6x FullAttention KV rows 0..p against the pinned-quantized oracle.
+    # Self-skips (77) when the checkpoint is absent.
+    add_executable(test_qwen35_full_forward cuda/test_qwen35_full_forward.cpp)
+    target_link_libraries(test_qwen35_full_forward PRIVATE cudalm)
+    add_test(NAME test_qwen35_full_forward
+             COMMAND test_qwen35_full_forward
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR}
+                     ${CMAKE_BINARY_DIR}/data/qwen35_full)
+    set_tests_properties(test_qwen35_full_forward PROPERTIES
       SKIP_RETURN_CODE 77 TIMEOUT 1800)
   else()
     message(STATUS "tool python lacks torch/safetensors/numpy: "

@@ -952,6 +952,153 @@ def generate_microstack(cudalm_path: str, ckpt_dir: str, out_prefix: str,
 
 
 # ---------------------------------------------------------------------------
+# v0.3 Phase B: full single-token forward golden (docs/qwen35_architecture.md
+# §18). The reference pipeline is the pinned official source's math (the same
+# build_quantized_* layers the runtime loads + the tied embedding) run over
+# ALL 24 layers, the final zero-centered RMSNorm, and the tied LM head.
+# ---------------------------------------------------------------------------
+def generate_fullmodel(cudalm_path: str, ckpt_dir: str, out_prefix: str,
+                       tokens_a, tokens_b, input_seed: int) -> int:
+    st_path = os.path.join(ckpt_dir, "model.safetensors")
+    cfg_path = os.path.join(ckpt_dir, "raw", "config.json")
+    if not (os.path.isfile(st_path) and os.path.isfile(cfg_path)):
+        print(f"error: checkpoint dir {ckpt_dir!r} incomplete "
+              f"(need model.safetensors + raw/config.json)", file=sys.stderr)
+        return 2
+    if sha256_file(cfg_path) != CONFIG_SHA256:
+        print("error: config.json sha256 mismatch (not the pinned "
+              "revision)", file=sys.stderr)
+        return 1
+    if sha256_file(st_path) != CHECKPOINT_SHA256:
+        print("error: model.safetensors sha256 mismatch (not the pinned "
+              "checkpoint)", file=sys.stderr)
+        return 1
+
+    import_pinned_transformers(ckpt_dir)
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
+    global _P
+    _P = mq
+
+    v2file = v2.read_v2(cudalm_path)
+    if v2file.metadata.get("arch") != ARCH_ID:
+        print("error: v2 file arch mismatch", file=sys.stderr)
+        return 1
+    pinned = v2.Qwen35Config.qwen35_08b()
+    if v2file.config != pinned:
+        print("error: v2 file config deviates from the pinned 0.8B "
+              "contract", file=sys.stderr)
+        return 1
+    n_layers = pinned.num_hidden_layers
+    for L in range(n_layers):
+        if not (pinned.is_linear_attention(L)
+                or pinned.is_full_attention(L)):
+            print(f"error: layer {L} has an unexpected type", file=sys.stderr)
+            return 2
+
+    raw_cfg = json.load(open(cfg_path))["text_config"]
+    from transformers.models.qwen3_5.configuration_qwen3_5 import (
+        Qwen3_5TextConfig)
+    text_cfg = Qwen3_5TextConfig(**raw_cfg)
+    H = text_cfg.hidden_size
+    V = text_cfg.vocab_size
+    eps = text_cfg.rms_norm_eps
+    rope = mq.Qwen3_5TextRotaryEmbedding(text_cfg)
+
+    # Build ALL 24 quantized layers (the same W4A16 weights the runtime loads).
+    layers = []
+    for L in range(n_layers):
+        if pinned.is_linear_attention(L):
+            layers.append(build_quantized_deltanet_layer(v2file, text_cfg, L))
+        else:
+            layers.append(build_quantized_layer(v2file, text_cfg, L))
+
+    # Tied embedding + final norm weight (bf16) from the SAME v2 file.
+    embed = tensor_from_v2(v2file, "embed_tokens.weight", BF16)  # [V, H]
+    norm_w = tensor_from_v2(v2file, "norm.weight", BF16)         # [H]
+    # Final zero-centered RMSNorm: the pinned module, weight = checkpoint norm
+    # (zero-centered, effective scale 1 + w).
+    norm_mod = mq.Qwen3_5RMSNorm(H, eps=eps)
+    norm_mod.weight = torch.nn.Parameter(norm_w)
+
+    conv_dim = layers[0].linear_attn.conv_dim \
+        if pinned.is_linear_attention(0) else None
+
+    def fresh_state():
+        conv_states = [None] * n_layers
+        rec_states = [None] * n_layers
+        kv_caches = [None] * n_layers
+        for L in range(n_layers):
+            if pinned.is_linear_attention(L):
+                conv_states[L] = torch.zeros(1, conv_dim, 3, dtype=BF16)
+        return conv_states, rec_states, kv_caches
+
+    out_dir = os.path.dirname(os.path.abspath(out_prefix))
+    os.makedirs(out_dir, exist_ok=True)
+
+    def run_scenario(sc, token_ids):
+        conv_states, rec_states, kv_caches = fresh_state()
+        for pos, token_id in enumerate(token_ids):
+            if not (0 <= token_id < V):
+                print(f"error: scenario {sc} position {pos} token {token_id} "
+                      f"out of range [0, {V})", file=sys.stderr)
+                return False
+            # embedding output: embed_tokens.weight[token_id] (exact row copy).
+            # The layer input is [1, 1, H] (B=1, S=1, H); the stored golden is
+            # the [1, H] row (matches the stage [1, H] convention).
+            emb_row = embed[token_id].contiguous()  # [H]
+            x = emb_row.unsqueeze(0).unsqueeze(0)   # [1, 1, H]
+            for L in range(n_layers):
+                layer = layers[L]
+                if pinned.is_linear_attention(L):
+                    stages, conv_states[L], rec_after, conv_before, rec_before = (
+                        forward_step_deltanet(
+                            layer, x, pos, conv_states[L], rec_states[L]))
+                    rec_states[L] = rec_after
+                    specs = stage_tensors_deltanet(
+                        stages, conv_before, conv_states[L], rec_before,
+                        rec_after)
+                else:
+                    stages, kv_caches[L] = forward_step(
+                        layer, rope, x, pos, kv_caches[L])
+                    specs = [(name, dims, v2.DT_BF16, blob)
+                             for name, dims, blob in stage_tensors(
+                                 stages, kv_caches[L][0], kv_caches[L][1], pos)]
+                tensors = [v2.V2Tensor(name, dt, dims, blob)
+                           for name, dims, dt, blob in specs]
+                g = gv2.GoldenV2File(pinned, pos, L, input_seed, tensors)
+                gv2.write_golden_v2(
+                    f"{out_prefix}_{sc}_L{L}_p{pos}.cudalm", g)
+                x = stages["final_output"]
+            # final zero-centered RMSNorm (pinned module; fp32 chain, bf16 out).
+            norm_out = norm_mod(x).contiguous()  # [1, 1, H] bf16
+            # tied LM head: logits = normed @ embedding^T (fp32 acc, bf16 out).
+            logits = (norm_out.reshape(1, H).float() @ embed.float().T) \
+                .reshape(V).to(BF16)  # [V]
+            mtensors = [
+                v2.V2Tensor("model.embedding_output", v2.DT_BF16,
+                            (1, H), bytes_of(emb_row.unsqueeze(0))),
+                v2.V2Tensor("model.final_norm_output", v2.DT_BF16,
+                            (1, H), bytes_of(norm_out.reshape(1, H))),
+                v2.V2Tensor("model.logits", v2.DT_BF16, (V,),
+                            bytes_of(logits)),
+            ]
+            mg = gv2.GoldenV2File(pinned, pos, n_layers - 1, input_seed,
+                                  mtensors)
+            gv2.write_golden_v2(f"{out_prefix}_{sc}_model_p{pos}.cudalm", mg)
+        return True
+
+    if not run_scenario("A", tokens_a):
+        return 1
+    if not run_scenario("B", tokens_b):
+        return 1
+    print(f"wrote full-model goldens: scenario A {len(tokens_a)} token(s) + "
+          f"scenario B {len(tokens_b)} token(s), {n_layers} layers each, "
+          f"under {out_prefix!r} (per-(token,layer) + per-token model "
+          f"CUDLMG02)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Selftest: no checkpoint. Synthetic weights through the shared quantizer;
 # exercises the reference pipeline, invariants, container round-trip, and
 # determinism.
@@ -1098,10 +1245,30 @@ if __name__ == "__main__":
                          "0-based token sequence: 0 / 0,1 / 0,1,2 / ... "
                          "(gaps, duplicates, non-0 start and out-of-order are "
                          "rejected). e.g. 0 (scenario A) or 0,1,2 (scenario B)")
+    ap.add_argument("--fullmodel-prefix", default=None,
+                    help="v0.3 Phase B: emit the full single-token forward "
+                         "golden (all 24 layers + final norm + tied LM head) "
+                         "under <prefix>_{A,B}_L{layer}_p{pos}.cudalm and "
+                         "<prefix>_{A,B}_model_p{pos}.cudalm")
+    ap.add_argument("--fullmodel-tokens-a", default="15",
+                    help="v0.3 Phase B scenario A (fresh p=0): comma-separated "
+                         "deterministic token id(s), positions 0..n-1")
+    ap.add_argument("--fullmodel-tokens-b", default="15,16,17",
+                    help="v0.3 Phase B scenario B (sequential p0->p1->p2): "
+                         "comma-separated deterministic token id sequence")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
         sys.exit(selftest_impl())
+    if a.fullmodel_prefix:
+        if not (a.cudalm and a.checkpoint_dir):
+            ap.error("--cudalm and --checkpoint-dir are required for "
+                     "--fullmodel-prefix")
+        tokens_a = [int(x) for x in a.fullmodel_tokens_a.split(",") if x.strip()]
+        tokens_b = [int(x) for x in a.fullmodel_tokens_b.split(",") if x.strip()]
+        sys.exit(generate_fullmodel(a.cudalm, a.checkpoint_dir,
+                                    a.fullmodel_prefix, tokens_a, tokens_b,
+                                    a.input_seed))
     if a.microstack_prefix:
         if not (a.cudalm and a.checkpoint_dir):
             ap.error("--cudalm and --checkpoint-dir are required for "

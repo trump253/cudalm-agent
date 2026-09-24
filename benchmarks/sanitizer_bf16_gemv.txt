@@ -1,0 +1,39 @@
+# compute-sanitizer memcheck — CUDALM v0.3 Phase B (standalone bf16_gemv hard gate)
+#
+# Host: RTX 2080 Ti (sm_75), CUDA 11.8, driver 570.172.08, single device (CUDA_VISIBLE_DEVICES=0)
+# Tool: /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck --launch-timeout 900
+# git: 99fa68d23f26b7d8eba7e35a4b243a7a37860a7c   # commit A — the exact code under test (clean worktree)
+#
+# Scope: the NEW plain BF16 GEMV kernel (kernels/bf16_gemv.h/.cu) — the tied-LM-head
+# matmul — under the sanitizer, both execution paths:
+#   * vec4 path        : K % 8 == 0 AND 16B-aligned W/x bases (the 16B-vectorized
+#                        kernel), incl. the actual LM-head shape [N=248320, K=1024]
+#                        (509 MB W buffer) + N=1/7/100/1024/4096, K=8/16/64/512/1024;
+#   * scalar fallback  : K % 8 != 0 (K=1000/1025/1/3/7/9) AND a 2-byte-offset
+#                        (2-byte-aligned but not 16B-aligned, a legal __nv_bfloat16
+#                        access) W/x base on a K%8==0 shape;
+#   * cross-check      : scalar (misaligned) vs vec4 (aligned) on the SAME data;
+#   * zero row         : a fully-zero W row -> bit-exact zero output.
+# Each path is compared against a CPU FP32-accumulate -> BF16 RNE reference (no
+# checkpoint / no Python — pure kernel test).
+#
+#   $ /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck --launch-timeout 900 \
+#       build/tests/test_bf16_gemv
+#
+# Result (condensed):
+========= COMPUTE-SANITIZER
+  vec4  (LM-head shape)  N=248320 K=1024  max_abs_err=0.125 OK   # 509 MB W
+  vec4                         N=100    K=8     max_abs_err=0 OK
+  ...(vec4: N=1/7/100/1024/4096, K=8/16/64/512/1024 all OK)...
+  scalar (K%8!=0)        N=5      K=1000 max_abs_err=0 OK
+  scalar (K%8!=0)              N=5      K=1025  max_abs_err=0 OK
+  ...(scalar K%8!=0: K=1/3/7/9/1000/1025 all OK)...
+  scalar (misaligned)          N=37     K=1024  max_abs_err=0 OK
+  scalar vs vec4 (same data) max_abs_err=0 OK
+  zero_row                     zero row -> bit-exact 0 OK
+[PASS] test_bf16_gemv (vec4 K%8==0 + scalar K%8!=0/misaligned + zero-row, FP32-ref -> BF16 RNE)
+========= ERROR SUMMARY: 0 errors
+#
+# => 0 memory errors across the bf16_gemv vec4 path (incl. the 509 MB LM-head shape)
+#    + the scalar fallback (K%8!=0 and misaligned) + the scalar-vs-vec4 cross-check + the
+#    zero-row check under compute-sanitizer memcheck.
