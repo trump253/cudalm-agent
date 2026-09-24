@@ -1099,6 +1099,222 @@ def generate_fullmodel(cudalm_path: str, ckpt_dir: str, out_prefix: str,
 
 
 # ---------------------------------------------------------------------------
+# v0.4 Phase A: generation-level golden (pinned-quantized oracle runs a
+# single-request SERIAL prefill + GREEDY decode, exactly mirroring the C++
+# Qwen35Generator loop). Emits a CUDLMW02 container (loadable by the C++
+# WeightFileV2 loader) holding, per scenario:
+#   * the generated token sequence + stop reason (metadata);
+#   * EVERY generation-step FULL logits [vocab] bf16 (tensor "gen.logits.t{k}",
+#     where "gen.logits.t{k}" is the logits that predict generated[k]);
+#   * (optional, save_state) the FINAL persistent state: 18x DeltaNet
+#     conv+recurrent + 6x FullAttention K/V used rows.
+# The greedy argmax maximizes the numeric bf16 logit value; ties -> lowest
+# token id (torch.argmax on the bf16 logits == the C++ argmax_bf16 contract).
+# ---------------------------------------------------------------------------
+def generate_generation(cudalm_path: str, ckpt_dir: str, out_prefix: str,
+                        scenarios, input_seed: int) -> int:
+    """scenarios: a list of (name, prompt_tokens, max_new_tokens, eos, save_state)."""
+    st_path = os.path.join(ckpt_dir, "model.safetensors")
+    cfg_path = os.path.join(ckpt_dir, "raw", "config.json")
+    if not (os.path.isfile(st_path) and os.path.isfile(cfg_path)):
+        print(f"error: checkpoint dir {ckpt_dir!r} incomplete "
+              f"(need model.safetensors + raw/config.json)", file=sys.stderr)
+        return 2
+    if sha256_file(cfg_path) != CONFIG_SHA256:
+        print("error: config.json sha256 mismatch (not the pinned revision)",
+              file=sys.stderr)
+        return 1
+    if sha256_file(st_path) != CHECKPOINT_SHA256:
+        print("error: model.safetensors sha256 mismatch (not the pinned "
+              "checkpoint)", file=sys.stderr)
+        return 1
+
+    import_pinned_transformers(ckpt_dir)
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
+    global _P
+    _P = mq
+
+    v2file = v2.read_v2(cudalm_path)
+    if v2file.metadata.get("arch") != ARCH_ID:
+        print("error: v2 file arch mismatch", file=sys.stderr)
+        return 1
+    pinned = v2.Qwen35Config.qwen35_08b()
+    if v2file.config != pinned:
+        print("error: v2 file config deviates from the pinned 0.8B contract",
+              file=sys.stderr)
+        return 1
+    n_layers = pinned.num_hidden_layers
+    max_seq_len = pinned.max_seq_len
+
+    raw_cfg = json.load(open(cfg_path))["text_config"]
+    from transformers.models.qwen3_5.configuration_qwen3_5 import (
+        Qwen3_5TextConfig)
+    text_cfg = Qwen3_5TextConfig(**raw_cfg)
+    H = text_cfg.hidden_size
+    V = text_cfg.vocab_size
+    eps = text_cfg.rms_norm_eps
+    rope = mq.Qwen3_5TextRotaryEmbedding(text_cfg)
+
+    layers = []
+    for L in range(n_layers):
+        if pinned.is_linear_attention(L):
+            layers.append(build_quantized_deltanet_layer(v2file, text_cfg, L))
+        else:
+            layers.append(build_quantized_layer(v2file, text_cfg, L))
+    embed = tensor_from_v2(v2file, "embed_tokens.weight", BF16)  # [V, H]
+    norm_w = tensor_from_v2(v2file, "norm.weight", BF16)         # [H]
+    norm_mod = mq.Qwen3_5RMSNorm(H, eps=eps)
+    norm_mod.weight = torch.nn.Parameter(norm_w)
+    conv_dim = layers[0].linear_attn.conv_dim \
+        if pinned.is_linear_attention(0) else None
+
+    def fresh_state():
+        conv_states = [None] * n_layers
+        rec_states = [None] * n_layers
+        kv_caches = [None] * n_layers
+        for L in range(n_layers):
+            if pinned.is_linear_attention(L):
+                conv_states[L] = torch.zeros(1, conv_dim, 3, dtype=BF16)
+        return conv_states, rec_states, kv_caches
+
+    def forward_one(x, pos, conv_states, rec_states, kv_caches):
+        """Run ONE token at `pos` through all 24 layers (updating the
+        persistent state in place) + return the FULL logits [V] bf16 (the tied
+        LM head over the final zero-centered RMSNorm output)."""
+        for L in range(n_layers):
+            layer = layers[L]
+            if pinned.is_linear_attention(L):
+                stages, conv_states[L], rec_after, _, _ = forward_step_deltanet(
+                    layer, x, pos, conv_states[L], rec_states[L])
+                rec_states[L] = rec_after
+            else:
+                stages, kv_caches[L] = forward_step(
+                    layer, rope, x, pos, kv_caches[L])
+            x = stages["final_output"]
+        norm_out = norm_mod(x).contiguous()  # [1, 1, H] bf16
+        return (norm_out.reshape(1, H).float() @ embed.float().T) \
+            .reshape(V).to(BF16)  # [V]
+
+    def greedy_pick(logits: torch.Tensor) -> int:
+        # maximize the numeric bf16 logit value; ties -> lowest token id.
+        return int(torch.argmax(logits).item())
+
+    out_dir = os.path.dirname(os.path.abspath(out_prefix))
+    os.makedirs(out_dir, exist_ok=True)
+
+    def run_scenario(name, prompt_tokens, max_new_tokens, eos, save_state):
+        for tid in prompt_tokens:
+            if not (0 <= tid < V):
+                print(f"error: scenario {name} prompt token {tid} out of range "
+                      f"[0, {V})", file=sys.stderr)
+                return False
+        if not (0 <= eos < V):
+            print(f"error: scenario {name} eos {eos} out of range [0, {V})",
+                  file=sys.stderr)
+            return False
+
+        conv_states, rec_states, kv_caches = fresh_state()
+        N = len(prompt_tokens)
+        t_used = 0  # total forward_one calls == the KV-cache used rows
+
+        # ---- serial prefill: positions 0..N-1 ------------------------------
+        current_logits = None
+        for pos in range(N):
+            x = embed[prompt_tokens[pos]].contiguous().unsqueeze(0).unsqueeze(0)
+            current_logits = forward_one(x, pos, conv_states, rec_states,
+                                         kv_caches)
+            t_used += 1
+
+        generated = []
+        step_logits = []  # step_logits[k] predicts generated[k]
+        stop_code = 1  # StopReason::MaxNewTokens (default)
+
+        if max_new_tokens == 0:
+            stop_code = 1  # empty generation, no decode (documented)
+        elif N >= max_seq_len:
+            stop_code = 2  # no room for generation (prompt filled the seq)
+        else:
+            # ---- greedy decode (mirrors Qwen35Generator::generate) ---------
+            next_token = greedy_pick(current_logits)  # prefill-last -> t0
+            for step in range(max_new_tokens):
+                if N + step >= max_seq_len:
+                    stop_code = 2  # MaxSeqLen; the candidate is not placed
+                    break
+                step_logits.append(current_logits)  # predicts next_token
+                generated.append(next_token)
+                if next_token == eos:
+                    stop_code = 0  # Eos; included; NOT forwarded
+                    break
+                if step + 1 >= max_new_tokens:
+                    stop_code = 1  # MaxNewTokens; included; NOT forwarded
+                    break
+                x = embed[next_token].contiguous().unsqueeze(0).unsqueeze(0)
+                current_logits = forward_one(x, N + step, conv_states,
+                                             rec_states, kv_caches)
+                t_used += 1
+                next_token = greedy_pick(current_logits)
+
+        # ---- assemble the CUDLMW02 container -------------------------------
+        tensors = [
+            v2.V2Tensor(f"gen.logits.t{k}", v2.DT_BF16, (V,),
+                        bytes_of(s))
+            for k, s in enumerate(step_logits)
+        ]
+        if save_state:
+            for L in range(n_layers):
+                if pinned.is_linear_attention(L):
+                    ca = conv_states[L][0].contiguous()  # bf16 [conv_dim, 3]
+                    tensors.append(v2.V2Tensor(
+                        f"gen.state.conv.L{L}", v2.DT_BF16,
+                        (int(ca.shape[0]), int(ca.shape[1])), bytes_of(ca)))
+                    ra = rec_states[L][0].contiguous()  # fp32 [n_v,128,128]
+                    tensors.append(v2.V2Tensor(
+                        f"gen.state.rec.L{L}", v2.DT_FP32,
+                        (int(ra.shape[0]), int(ra.shape[1]),
+                         int(ra.shape[2])), bytes_of(ra)))
+                else:
+                    Kc, Vc = kv_caches[L]  # [1, kv, t_used, hd] each
+                    ks = Kc[0].contiguous()  # bf16 [kv, t_used, hd]
+                    vs = Vc[0].contiguous()
+                    rows = int(ks.shape[0] * ks.shape[1])
+                    tensors.append(v2.V2Tensor(
+                        f"gen.state.kv.k.L{L}", v2.DT_BF16,
+                        (rows, int(ks.shape[-1])), bytes_of(ks)))
+                    tensors.append(v2.V2Tensor(
+                        f"gen.state.kv.v.L{L}", v2.DT_BF16,
+                        (rows, int(vs.shape[-1])), bytes_of(vs)))
+
+        metadata = {
+            "arch": "qwen35-gen-v1",
+            "gen.scenario": name,
+            "gen.prompt": ",".join(str(t) for t in prompt_tokens),
+            "gen.max_new_tokens": str(max_new_tokens),
+            "gen.eos": str(eos),
+            "gen.stop_reason": str(stop_code),
+            "gen.num_generated": str(len(generated)),
+            "gen.t_used": str(t_used),
+            "gen.tokens": ",".join(str(t) for t in generated),
+            "transformers_commit": TRANSFORMERS_COMMIT,
+            "checkpoint_sha256": CHECKPOINT_SHA256,
+        }
+        gf = v2.V2File(pinned, metadata, tensors)
+        with open(f"{out_prefix}_gen_{name}.cudalm", "wb") as f:
+            f.write(gf.to_bytes())
+        print(f"wrote generation golden {name}: prompt {len(prompt_tokens)} "
+              f"tok, generated {len(generated)} tok, stop="
+              f"{['eos','max_new_tokens','max_seq_len'][stop_code]}, "
+              f"{len(step_logits)} step logits"
+              f"{', + final state' if save_state else ''}")
+        return True
+
+    for (name, prompt_tokens, max_new_tokens, eos, save_state) in scenarios:
+        if not run_scenario(name, prompt_tokens, max_new_tokens, eos,
+                            save_state):
+            return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Selftest: no checkpoint. Synthetic weights through the shared quantizer;
 # exercises the reference pipeline, invariants, container round-trip, and
 # determinism.
@@ -1256,6 +1472,26 @@ if __name__ == "__main__":
     ap.add_argument("--fullmodel-tokens-b", default="15,16,17",
                     help="v0.3 Phase B scenario B (sequential p0->p1->p2): "
                          "comma-separated deterministic token id sequence")
+    ap.add_argument("--gen-prefix", default=None,
+                    help="v0.4 Phase A: emit the generation-level golden "
+                         "(CUDLMW02) under <prefix>_gen_{name}.cudalm")
+    ap.add_argument("--gen-a-tokens", default=None,
+                    help="v0.4 Phase A scenario A (short prompt): "
+                         "comma-separated deterministic token id sequence")
+    ap.add_argument("--gen-a-max", type=int, default=8,
+                    help="v0.4 Phase A scenario A: max_new_tokens")
+    ap.add_argument("--gen-a-eos", type=int, default=248319,
+                    help="v0.4 Phase A scenario A: eos_token_id")
+    ap.add_argument("--gen-b-tokens", default=None,
+                    help="v0.4 Phase A scenario B (longer prompt): "
+                         "comma-separated deterministic token id sequence")
+    ap.add_argument("--gen-b-max", type=int, default=16,
+                    help="v0.4 Phase A scenario B: max_new_tokens")
+    ap.add_argument("--gen-b-eos", type=int, default=248319,
+                    help="v0.4 Phase A scenario B: eos_token_id")
+    ap.add_argument("--gen-b-state", default="1",
+                    help="v0.4 Phase A scenario B: save the final persistent "
+                         "state (1) or not (0)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -1269,6 +1505,24 @@ if __name__ == "__main__":
         sys.exit(generate_fullmodel(a.cudalm, a.checkpoint_dir,
                                     a.fullmodel_prefix, tokens_a, tokens_b,
                                     a.input_seed))
+    if a.gen_prefix:
+        if not (a.cudalm and a.checkpoint_dir):
+            ap.error("--cudalm and --checkpoint-dir are required for "
+                     "--gen-prefix")
+        def _ints(s):
+            return [int(x) for x in s.split(",") if x.strip()]
+        scenarios = []
+        if a.gen_a_tokens:
+            scenarios.append(("A", _ints(a.gen_a_tokens), a.gen_a_max,
+                              a.gen_a_eos, False))
+        if a.gen_b_tokens:
+            scenarios.append(("B", _ints(a.gen_b_tokens), a.gen_b_max,
+                              a.gen_b_eos, a.gen_b_state == "1"))
+        if not scenarios:
+            ap.error("--gen-prefix requires --gen-a-tokens and/or "
+                     "--gen-b-tokens")
+        sys.exit(generate_generation(a.cudalm, a.checkpoint_dir, a.gen_prefix,
+                                     scenarios, a.input_seed))
     if a.microstack_prefix:
         if not (a.cudalm and a.checkpoint_dir):
             ap.error("--cudalm and --checkpoint-dir are required for "

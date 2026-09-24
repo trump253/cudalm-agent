@@ -15,6 +15,14 @@ cudalm_add_test(test_qwen35_config test_qwen35_config cpu/test_qwen35_config.cpp
 cudalm_add_test(test_qwen35_deltanet_config test_qwen35_deltanet_config
                 cpu/test_qwen35_deltanet_config.cpp)
 
+# v0.4 Phase A: greedy generation helpers (CPU-only, no checkpoint).
+#   * argmax: maximize the numeric BF16 logit value; tie -> lowest token id
+#     (normal / negative / exact-tie / single / bf16-rounding-tie).
+#   * stop controller: EOS (immediate + included + no forward after) /
+#     max_new_tokens / max_seq_len / EOS-priority + the pure decisions.
+cudalm_add_test(test_greedy_argmax test_greedy_argmax cpu/test_greedy_argmax.cpp)
+cudalm_add_test(test_greedy_stop test_greedy_stop cpu/test_greedy_stop.cpp)
+
 # --- CUDA tests ---------------------------------------------------------------
 cudalm_add_test(test_cuda_smoke test_cuda_smoke cuda/test_cuda_smoke.cpp)
 cudalm_add_test(test_elementwise_rmsnorm test_elementwise_rmsnorm cuda/test_elementwise_rmsnorm.cpp)
@@ -359,6 +367,23 @@ if(CUDALM_PYTHON3)
                      ${CMAKE_SOURCE_DIR}
                      ${CMAKE_BINARY_DIR}/data/qwen35_full)
     set_tests_properties(test_qwen35_full_forward PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
+      # v0.4 Phase A: generation-level golden hard gate (single-request serial
+    # prefill + greedy decode). Scenario A (short prompt) + B (longer prompt,
+    # final persistent state) + C (repeat-generate contamination). Compares
+    # EVERY generated token id + EVERY generation-step FULL logits [vocab] +
+    # the final hybrid persistent state against the pinned-quantized oracle.
+    # Self-skips (77) when the checkpoint is absent.
+    add_executable(test_qwen35_generation cuda/test_qwen35_generation.cpp)
+    target_link_libraries(test_qwen35_generation PRIVATE cudalm)
+    add_test(NAME test_qwen35_generation
+             COMMAND test_qwen35_generation
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR}
+                     ${CMAKE_BINARY_DIR}/data/qwen35_gen)
+    set_tests_properties(test_qwen35_generation PROPERTIES
       SKIP_RETURN_CODE 77 TIMEOUT 1800)
   else()
     message(STATUS "tool python lacks torch/safetensors/numpy: "
