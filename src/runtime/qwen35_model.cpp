@@ -1,8 +1,12 @@
-// CUDALM — Qwen3.5 full model runtime skeleton implementation (v0.3 Phase A).
+// CUDALM — Qwen3.5 full model runtime implementation (v0.3: Phase A skeleton
+// + Phase B full single-token forward).
 // Reuses the frozen v0.2 single-layer runtimes (Qwen35FullAttentionLayer /
-// Qwen35DeltaNetLayer); adds only the model-level ownership (embedding, final
-// norm, tied LM head), the per-layer dispatch over all 24 layers, and the
-// whole-model state reset. No kernel is copied.
+// Qwen35DeltaNetLayer); adds the model-level ownership (embedding, final
+// norm, tied LM head), the per-layer dispatch over all 24 layers, the
+// whole-model state reset, and the complete single-token forward
+// (forward_token: embedding -> 24 layers -> final RMSNorm -> tied LM head ->
+// logits, docs §18). The only NEW kernel is the tied-LM-head bf16 GEMV
+// (kernels/bf16_gemv); no v0.2 single-layer kernel is copied.
 
 #include "cudalm/qwen35_model.h"
 

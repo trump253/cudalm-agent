@@ -705,10 +705,10 @@ micro-stack 最终输出（layer 3 final）。
   - **B（p=0→1→2 顺序）**：t=0 位级精确；t=1/t=2 逐层 stage + 状态在复合
     容差内（worst bf16 3.9e-2、fp32 3.1e-3）；逐层链（layer L 输入 ==
     layer L-1 输出）+ micro-stack final 全 OK。
-- 完整 `ctest`：**33/33 PASS**（旧 v0.1/v0.1.1 回归 + Phase A 摄入 +
+- 完整 `ctest`：**34/34 PASS**（旧 v0.1/v0.1.1 回归 + Phase A 摄入 +
   Phase B 单元 + Phase B golden + Phase C 契约 + Phase C golden +
   **Phase D micro-stack golden** + Phase D `--tokens` 校验 + v0.3 Phase A
-  full-model + v0.3 Phase B full-forward）。
+  full-model + v0.3 Phase B full-forward + **standalone bf16_gemv**）。
 - `compute-sanitizer --tool memcheck`：**0 错误**（micro-stack golden
   `--no-gen` CUDA-only 路径，**覆盖连续多 token micro-stack 运行**——场景 B
   的 p=0→1→2 全链；证据 `benchmarks/sanitizer_qwen35_hybrid_microstack.txt`）。
@@ -846,8 +846,8 @@ checkpoint = `Qwen3.5-0.8B-Base`（`raw/config.json` + `model.safetensors`，
   （DeltaNet 经 `seed_state` H2D；FA 经 `cudaMemsetAsync`），reset 后逐层回读
   全部归零。
 - 新增 `test_qwen35_full_model`（CPU 结构门 + GPU 所有权/状态门；无 checkpoint
-  时 self-skip 77）。完整 ctest **33/33 PASS**（旧 31 全回归 + 1 Phase A
-  full-model + 1 Phase B full-forward）；
+  时 self-skip 77）。完整 ctest **34/34 PASS**（旧 31 全回归 + 1 Phase A
+  full-model + 1 Phase B full-forward + 1 standalone bf16_gemv）；
   `check_no_torch.sh` **CLEAN**；
   `compute-sanitizer --tool memcheck` **0 错误**（`--no-gen` CUDA-only 路径，
   覆盖全模型 load + 24 层 seed + reset + unload 的**新 CUDA 分配生命周期**）。
@@ -911,28 +911,62 @@ logits [248320]`。**不做** generation / tokenizer / sampling / benchmark 优�
   （`kernels/gemv/gemv_vec4_row.cu`：16B 向量 load、每行一 block、fp32 累加、
   warp+shared 归约）适配到 raw pointer + cudaStream_t + BF16 + `[V=248320,
   K=1024]`；标量回退路径同 `gemv_scalar_kernel`。详见 `docs/provenance.md`。
+- **独立 numeric 硬门 `test_bf16_gemv`（不靠 full-model logits 证明 kernel
+  正确性）**：deterministic BF16 输入 vs **CPU FP32-accumulate → BF16 RNE
+  参考**（`compare_bf16_stages` 1e-2，抓 O(magnitude) 的错索引/错累加/错舍入/
+  错 dtype），覆盖：**vec4 路径**（K%8==0 ∧ 16B 对齐，含真实 LM-head 形状
+  `[N=248320,K=1024]` + N=1/7/100/1024/4096、K=8/16/64/512）；**scalar 回退**
+  （K%8!=0：K=1/3/7/9/1000/1025 **及** K%8==0 但 2 字节错位基址）；scalar-vs-
+  vec4 同数据交叉校验；全零 weight 行 → bit-exact 0。
 - **golden 容差**：24 层 BF16 链 + fp32 recurrent 状态跨层复合误差，从 v0.2
   标准出发（bf16 stage atol=rtol=1e-2；fp32 状态 atol=1e-5/rtol=1e-4 紧标准）。
   最终 **FULL logits `[248320]`** 做**全向量** golden 比较（非 top-k）；若实测
-  24 层链需要放宽，只按实测设**最小必要 envelope** 并记录 rationale（§18.2）。
+  24 层链需要放宽，只按实测设 **per-layer / depth-aware 最小必要 envelope** 并
+  记录 rationale（§18.2）。
 
-### 18.2 实测最小必要 envelope 与 rationale
+### 18.2 实测最小必要 envelope（**per-layer / depth-aware**）与 rationale
 
 `test_qwen35_full_forward`（真实 checkpoint，A：p0 fresh；B：p0→p1→p2 顺序、
 runtime 自线程状态）对**每 token**比较：embedding / 24× 层 final / final norm /
 **FULL logits `[248320]`** / 18× DeltaNet conv+recurrent / 6× FA K/V rows 0..p。
-tolerance = 各类别在确定性 A+B 运行的**实测 max 误差** + ~10-15% 余量（下表）。
 embedding 为纯行拷贝，**bit-exact（max=0）**。
 
-| 类别 | dtype | 实测 max | 采用 atol（rtol=0） |
-| --- | --- | --- | --- |
-| model.embedding_output | bf16 | 0（bit-exact） | 0 |
-| 24× layer final_output | bf16 | 0.0781（@L23） | 0.09 |
-| model.final_norm_output | bf16 | 0.4453 | 0.5 |
-| model.logits `[248320]` | bf16 | 0.3125 | 0.35 |
-| 18× DeltaNet conv_after | bf16 | 0.2813（场景 B） | 0.31 |
-| 6× FA K/V rows | bf16 | 0.1094 (k) / 0.0938 (v) | 0.12 |
-| 18× DeltaNet recurrent | fp32 | 0.0472 | 0.055 |
+**per-layer / depth-aware envelope（取代旧的"单类共享 tolerance"）**：每个**层**
+的 threshold = 该层在确定性 A+B 运行的**实测 worst × 1.3 + 1e-3**（小余量），
+**不是**所有层共享一个值（旧的 layer=0.09 / conv=0.31 / recurrent=0.055 /
+KV=0.12 已废弃）。这样：
+- **L0/早期层保持接近 v0.2 紧标准**：L0 layer-final 实测 4.88e-4 →
+  threshold ~1.6e-3（比 v0.2 的 1e-2 **更紧**）；L0 conv 实测 0（bit-exact）；
+- **不允许 L23 的误差上限放宽 L0**：每层 threshold 由**该层自身**实测 worst
+  决定（L23 layer-final 7.8e-2 → threshold ~1.0e-1），一个 L23 量级的 bug 落在
+  L0 会被 L0 的紧 threshold（~1.6e-3）抓住（共享 0.09 会漏掉）；
+- **final norm / FULL logits 保留模型级 envelope**（下表末两行）。
+
+代表性层实测 worst → 采用 atol（完整 24 层表在测试
+`kLayerFinalAtol[24]` / `kConvAtol[24]` / `kRecurAtol[24]` / `kKvAtol[24]`；
+错误类别的层不比较、threshold=0）：
+
+| 类别（层） | dtype | 实测 worst → 采用 atol |
+| --- | --- | --- |
+| layer-final L0 | bf16 | 4.88e-4 → 1.6e-3 |
+| layer-final L6 | bf16 | 1.17e-2 → 1.6e-2 |
+| layer-final L12 | bf16 | 1.17e-2 → 1.6e-2 |
+| layer-final L18 | bf16 | 4.69e-2 → 6.2e-2 |
+| layer-final L23 | bf16 | 7.81e-2 → 1.0e-1 |
+| DeltaNet conv L0 | bf16 | 0（bit-exact）→ 2.1e-2 |
+| DeltaNet conv L20（peak） | bf16 | 0.281 → 0.367 |
+| DeltaNet recurrent L0 | fp32 | 7.94e-4 → 2.0e-3 |
+| DeltaNet recurrent L18（peak） | fp32 | 4.72e-2 → 6.2e-2 |
+| FA KV L3 | bf16 | 0.0625 → 8.2e-2 |
+| FA KV L15（peak） | bf16 | 0.109 → 0.143 |
+| model.final_norm_output | bf16 | 0.4453 → 0.580（模型级） |
+| model.logits `[248320]` | bf16 | 0.3125 → 0.407（模型级） |
+
+**"平滑增长"由 test 强制（非仅文档）**：`check_smooth_growth` 断言每个类别的
+**后段**（L16..23）实测 worst **>** **前段**（L0..7）实测 worst：
+layer-final 0.078 > 0.012；conv 0.281 > 0.125；recurrent 0.047 > 0.013；
+KV 0.094 > 0.063。若某次回归使误差不再随深度增长（例如早期层突然和晚期层一样
+大），该断言 FAIL。
 
 **为什么是这些量级（而非 v0.2 的 1e-2）**：v0.2 标准是**单层**（或 4 层
 micro-stack，worst 3.9e-2）的界。完整 24 层 BF16 链把每层 ~1-ulp 的 GEMV
@@ -952,10 +986,16 @@ fp32 matmul）**逐层复合**：layer final 误差随深度**平滑单调**增�
 ### 18.3 签核证据（本次运行，RTX 2080 Ti / CUDA 11.8）
 
 - 真实 checkpoint 完整 forward PASS：A（p0 fresh）+ B（p0→p1→p2 顺序，runtime
-  自线程状态）全部类别在 §18.2 envelope 内（`test_qwen35_full_forward`）。
-- 完整 ctest **33/33 PASS**（旧 31 全回归 + 1 v0.3 Phase A full-model +
-  **1 v0.3 Phase B full-forward**）。
+  自线程状态）全部类别在 §18.2 **per-layer / depth-aware envelope** 内，且
+  **test 强制的平滑增长断言** PASS（`test_qwen35_full_forward`）。
+- 独立 `test_bf16_gemv` PASS（vec4 含 `[248320,1024]` + scalar K%8!=0/错位 +
+  scalar-vs-vec4 + 全零行，vs CPU FP32→BF16 RNE 参考）。
+- 完整 ctest **34/34 PASS**（旧 31 全回归 + 1 v0.3 Phase A full-model +
+  **1 v0.3 Phase B full-forward + 1 standalone bf16_gemv**）。
 - `scripts/check_no_torch.sh` **CLEAN**（include/、src/ 无 torch/pybind）。
-- `compute-sanitizer --tool memcheck` **0 错误**（`--no-gen` CUDA-only 路径，
-  覆盖**新增 `bf16_gemv` LM-head kernel + 完整 24 层 forward** 的新 CUDA 分配
-  生命周期）。
+- `compute-sanitizer --tool memcheck` **0 错误**，两份 evidence：
+  - `benchmarks/sanitizer_qwen35_full_forward.txt`（`--no-gen` CUDA-only，覆盖
+    **完整 24 层 forward + 新增 `bf16_gemv` LM-head GEMV + A/B 顺序路径** 的新
+    CUDA 分配生命周期）；
+  - `benchmarks/sanitizer_bf16_gemv.txt`（覆盖 **bf16_gemv vec4 路径 + scalar
+    回退（K%8!=0 及错位）**）。

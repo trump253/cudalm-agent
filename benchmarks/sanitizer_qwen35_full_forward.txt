@@ -1,0 +1,60 @@
+# compute-sanitizer memcheck — CUDALM v0.3 Phase B (Qwen3.5 full single-token forward)
+#
+# Host: RTX 2080 Ti (sm_75), CUDA 11.8, driver 570.172.08, single device (CUDA_VISIBLE_DEVICES=0)
+# Tool: /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck --launch-timeout 900
+# git: 0b657986b643666cd17f7925d8233f7640435a12
+#
+# Scope: the COMPLETE 24-layer forward under the sanitizer (the new CUDA work introduced
+# by v0.3 Phase B on top of the Phase A full-model lifecycle):
+#   * full 24-layer forward   : embedding -> 18x Qwen35DeltaNetLayer + 6x
+#                              Qwen35FullAttentionLayer (each stage buffer H2D/D2D/D2H);
+#   * new bf16_gemv LM-head   : tied-LM-head GEMV over the 509 MB embedding buffer
+#                              [N=248320, K=1024], fp32 acc + one bf16 RNE (the
+#                              'model.logits (FULL [vocab])' comparison exercises it);
+#   * A/B sequential path     : scenario A (fresh p=0) + scenario B (p0->p1->p2, the
+#                              runtime threads its OWN persistent state across the
+#                              sequential steps — conv_state / recurrent_state / KV
+#                              rows 0..p all read+write under the sanitizer);
+#   * depth-aware envelope    : per-layer tolerances + the test-enforced smooth-growth
+#                              check (later-depth measured worst > earlier-depth).
+#
+# Run with the test's --no-gen flag (CUDA-only path) so compute-sanitizer does not wrap
+# a std::system Python child (CUDA 11.8 reaper deadlock); the full-model .cudalm + the
+# full-forward goldens are pre-generated.
+#
+#   $ /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck --launch-timeout 900 \
+#       build/tests/test_qwen35_full_forward \
+#       build/data/qwen35_08b_full.cudalm /root/models/Qwen3.5-0.8B-Base \
+#       /root/py311/venv/bin/python <src_dir> build/data/qwen35_full --no-gen
+#
+# Result (condensed — full per-layer/per-state output omitted):
+========= COMPUTE-SANITIZER
+[scenario A, position 0]
+[scenario B, position 0]
+[scenario B, position 1]
+[scenario B, position 2]
+  layer.final_output[L0]                   max_abs=0.00048828125 OK
+  DeltaNet.conv_after[L0]                  max_abs=0 OK
+  layer.final_output[L0]                   max_abs=0.00048828125 OK
+  layer.final_output[L12]                  max_abs=0.01171875 OK
+  DeltaNet.conv_after[L12]                 max_abs=0.125 OK
+  layer.final_output[L12]                  max_abs=0.01171875 OK
+  layer.final_output[L23]                  max_abs=0.078125 OK
+  layer.final_output[L23]                  max_abs=0.078125 OK
+  layer.final_output[L23]                  max_abs=0.0625 OK
+  model.embedding_output                   max_abs=0 OK
+  model.final_norm_output                  max_abs=0.4453125 OK
+  model.logits (FULL [vocab])              max_abs=0.3125 OK
+  model.embedding_output                   max_abs=0 OK
+  ...(all 24 layers + 18x DeltaNet conv/recurrent + 6x FA K/V rows 0..p compared OK)...
+[depth-aware smooth-growth check]
+  smooth-growth layer_final early(L0..7)=0.0117188 late(L16..23)=0.078125
+  smooth-growth conv       early(L0..7)=0.125 late(L16..23)=0.28125
+  smooth-growth recurrent  early(L0..7)=0.0127276 late(L16..23)=0.0471911
+  smooth-growth kv         early(L0..7)=0.0625 late(L16..23)=0.09375
+[PASS] qwen35_full_forward (A p0 + B p0->p1->p2, 24 layers + full logits + all states)
+========= ERROR SUMMARY: 0 errors
+#
+# => 0 memory errors across the full 24-layer forward + the new bf16_gemv LM-head GEMV
+#    (tied, over the 509 MB embedding) + the A/B sequential path (the runtime's own
+#    threaded persistent state) under compute-sanitizer memcheck.

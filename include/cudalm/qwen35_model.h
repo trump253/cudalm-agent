@@ -1,4 +1,5 @@
-// CUDALM — Qwen3.5 full model runtime skeleton (v0.3, Phase A).
+// CUDALM — Qwen3.5 full model runtime (v0.3: Phase A skeleton + Phase B full
+// single-token forward).
 //
 // Owns the COMPLETE 24-layer Qwen3.5-0.8B text model: the token embedding,
 // every decoder layer (dispatched Gated DeltaNet vs full attention by the
@@ -7,10 +8,16 @@
 // frozen v0.2 single-layer runtimes (Qwen35FullAttentionLayer /
 // Qwen35DeltaNetLayer) — no single-layer kernel is copied or re-derived.
 //
-// v0.3 Phase A scope = structure + weight ownership + state lifecycle only.
-// This class does NOT run a full forward / compute logits (that is v0.3 Phase
-// B); load() uploads the weights, reset_state() resets every layer's
-// persistent state, and the accessors expose the owned tensors.
+// v0.3 scope:
+//   * Phase A = structure + weight ownership + state lifecycle: load() uploads
+//     the weights, reset_state() resets every layer's persistent state, and
+//     the accessors expose the owned tensors.
+//   * Phase B = the COMPLETE single-token forward (forward_token): embedding
+//     -> 24 layers -> final RMSNorm -> tied LM head -> logits [vocab] (docs
+//     §18). It reuses the v0.2 layer runtimes, threads the runtime's OWN
+//     persistent state (a sequential forward threads state), and exposes the
+//     embedding output / each layer final / final-norm output / full logits.
+//     No generation / sampling / Paged KV / batching (out of scope).
 //
 // Weight tying (pinned 0.8B, config tie_word_embeddings=true): the LM head has
 // NO separate tensor; it ALIASES the embedding (lm_head weight ==

@@ -235,8 +235,9 @@ tied LM head / 统一 reset_state）为 CUDALM 原生，无可移植的上游 ke
 验收证据（RTX 2080 Ti）：真实 checkpoint 全量转换 PASS（506 张量 / 766 MB /
 layers 0..23）；24/24 层 validate PASS + 层排表 exact（全注意力 3,7,11,15,19,23）
 + embedding/final-norm/LM-head 张量契约 PASS；full model load/unload PASS；
-`reset_state()` 覆盖全部 24 层；完整 ctest 33/33 PASS（旧 31 全回归 + 1 Phase A
- full-model + 1 Phase B full-forward）；compute-sanitizer
+`reset_state()` 覆盖全部 24 层；完整 ctest 34/34 PASS（旧 31 全回归 + 1 Phase A
+ full-model + 1 Phase B full-forward + 1 standalone bf16_gemv）；
+ compute-sanitizer
 memcheck 0 错误（`--no-gen` CUDA-only 路径，覆盖全模型 load + 24 层 seed +
 reset + unload 的新 CUDA 分配生命周期）；no-torch 守卫 CLEAN。详见
 `docs/qwen35_architecture.md` §17。
@@ -295,16 +296,32 @@ LM-head 需要一个**新** BF16 GEMV（`[V=248320, K=1024]`，tied：W = embedd
   CUDLMG02（`model.embedding_output`/`model.final_norm_output`/`model.logits`
   `[248320]` 全向量）。确定性 token：A=[15]，B=[15,16,17]。
 
-### 测试（`tests/cuda/test_qwen35_full_forward.cpp`）
+### 测试
 
-- 真实 checkpoint 硬门：A（p0 fresh）+ B（p0→p1→p2，runtime 自线程状态）
-  逐 token 比较 embedding（bit-exact）/ 24× 层 final / final norm /
-  **FULL logits [248320]** / 18× DeltaNet conv+recurrent / 6× FA K/V rows
-  0..p，tolerance = 实测最小必要 envelope（§18.2）。`--no-gen` 供 memcheck。
-- `tests/CMakeLists.txt` 注册（real-checkpoint 门，self-skip 77，TIMEOUT 1800）。
+**独立 `bf16_gemv` numeric 硬门（`tests/cuda/test_bf16_gemv.cpp`，无
+checkpoint）**：kernel 正确性**不靠** full-model logits 证明。deterministic
+BF16 输入 vs **CPU FP32-accumulate → BF16 RNE** 参考（`compare_bf16_stages`
+1e-2，抓 O(magnitude) 的错索引/错累加/错舍入/错 dtype），覆盖 **vec4 路径**
+（K%8==0 ∧ 16B 对齐，含真实 LM-head `[N=248320,K=1024]` + 多 N/K）、**scalar
+回退**（K%8!=0 及 K%8==0 但 2 字节错位基址）、scalar-vs-vec4 同数据交叉、
+全零 weight 行 → bit-exact 0。
+
+**full-forward golden 硬门（`tests/cuda/test_qwen35_full_forward.cpp`）**：
+真实 checkpoint，A（p0 fresh）+ B（p0→p1→p2，runtime 自线程状态）逐 token
+比较 embedding（bit-exact）/ 24× 层 final / final norm / **FULL logits
+[248320]** / 18× DeltaNet conv+recurrent / 6× FA K/V rows 0..p，tolerance =
+**per-layer / depth-aware 最小必要 envelope**（每层 = 该层实测 worst × 1.3 +
+1e-3，L0 紧、L23 松、L23 不放宽 L0；final norm / logits 保留模型级，§18.2），
+且 `check_smooth_growth` **test 强制**误差随深度增长（后段 L16..23 实测 worst >
+前段 L0..7）。`--no-gen` 供 memcheck。
+
+`tests/CMakeLists.txt` 注册：`test_bf16_gemv`（纯 kernel，always）+
+`test_qwen35_full_forward`（real-checkpoint 门，self-skip 77，TIMEOUT 1800）。
 
 验收证据（RTX 2080 Ti / CUDA 11.8）：完整 forward A+B 全类别 PASS（§18.2
-envelope）；完整 ctest **33/33 PASS**；`check_no_torch.sh` **CLEAN**；
-`compute-sanitizer --tool memcheck` **0 错误**（`--no-gen` CUDA-only，覆盖新
-`bf16_gemv` LM-head kernel + 完整 24 层 forward）。详见
+per-layer envelope + 平滑增长断言）；`test_bf16_gemv` PASS；完整 ctest
+**34/34 PASS**；`check_no_torch.sh` **CLEAN**；`compute-sanitizer --tool
+memcheck` **0 错误**，两份 evidence：`benchmarks/sanitizer_qwen35_full_forward.txt`
+（完整 24 层 forward + 新 `bf16_gemv` LM-head GEMV + A/B 顺序路径）+
+`benchmarks/sanitizer_bf16_gemv.txt`（vec4 + scalar 回退）。详见
 `docs/qwen35_architecture.md` §18.
