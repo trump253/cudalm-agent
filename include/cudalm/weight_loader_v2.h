@@ -56,6 +56,13 @@ class WeightFileV2 {
   Status validate_layer(int layer_idx) const;
   // Model-level tensor: `norm.weight` [hidden_size] bf16.
   Status validate_model_norm() const;
+  // Model-level tensor (v0.3 full model): `embed_tokens.weight`
+  // [vocab_size, hidden_size] bf16 (also serves as the tied LM head).
+  Status validate_model_embedding() const;
+  // Full-model tensor set (v0.3): embedding + final norm + every decoder
+  // layer + the tie_word_embeddings metadata (the pinned Qwen3.5-0.8B ties the
+  // LM head to the embedding, so there is no separate lm_head tensor).
+  Status validate_full_model() const;
 
  private:
   Qwen35Config config_{};

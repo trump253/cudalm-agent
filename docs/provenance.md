@@ -188,3 +188,54 @@ fp32 3.1e-3，在跨层复合容差内）；30/30 ctest；compute-sanitizer memc
 错误（覆盖连续多 token micro-stack 运行，
 `benchmarks/sanitizer_qwen35_hybrid_microstack.txt`）；no-torch 守卫 CLEAN。
 详见 `docs/qwen35_architecture.md` §16。
+
+## CUDALM v0.3 Phase A（Qwen3.5 全模型结构 + 权重摄入口径）
+
+Phase A 在 v0.2 之上完成**完整 24 层模型**的结构 + 权重摄入口径 + 模型级
+runtime 骨架（embedding / 24 层 / 最终 norm / tied LM head 的**所有权**与
+**状态生命周期**）。**无新 kernel、无新上游移植**：`Qwen35Model` 是纯接线
+（模型级张量 + 24 层逐层 dispatch + 统一 reset_state），数学语义完全来自
+**复用的冻结 v0.2 单层运行时**（`Qwen35FullAttentionLayer` /
+`Qwen35DeltaNetLayer`）。本 Phase **不跑**全模型 forward / logits（Phase B）。
+事实源：官方 pinned transformers（`fc9137225880`）+ 真实 checkpoint
+（`Qwen/Qwen3.5-0.8B-Base`）——全模型契约见 `docs/qwen35_architecture.md` §17。
+
+### 上游核查（CUDALab `cb6a6a9`，只读参考）
+
+已核查 frozen `CUDALab@cb6a6a9`：本 Phase **不新增任何 kernel**（只复用 Phase
+B/C 单层运行时 + 其已移植 kernel）。模型级 wiring（embedding / 24 层 dispatch /
+tied LM head / 统一 reset_state）为 CUDALM 原生，无可移植的上游 kernel。
+
+### CUDALM 原生（无上游）
+
+- `include/cudalm/qwen35_model.h` / `src/runtime/qwen35_model.cpp`：
+  `Qwen35Model`——`load`（`validate_full_model`：embedding + 最终 norm + 24/24 层
+  + tie metadata；逐层 `Qwen35LayerWeights::load` + 按 config 排表构造
+  `Qwen35DeltaNetLayer`(18) / `Qwen35FullAttentionLayer`(6)；embedding 上传
+  `[248320,1024]` bf16、最终 norm `[1024]` bf16、LM head **alias 词嵌入**）、
+  `reset_state`（遍历**全部 24 层**逐层独立重置，无跨层 alias）、访问器
+  （embedding/final_norm/lm_head/layer_weights/delta/attention/排表）。**仅
+  编排 + 所有权，不复制任何 kernel**。
+- `tools/convert_qwen35.py`（`--full-model`）：一次转出全 24 层 +
+  `embed_tokens.weight` + `norm.weight` + metadata `tie_word_embeddings`
+  （读 config）。**不加 `--full-model` 时逐字节不变**（不破坏 Phase A-D）。
+  `tools/common/cudalm_v2.py` 仅新增 metadata 常量 `META_TIE_WORD_EMBEDDINGS`。
+- `include/cudalm/weight_loader_v2.h` / `src/runtime/weight_loader_v2.cpp`：
+  新增 `validate_model_embedding()` + `validate_full_model()`（缺张量/shape/
+  dtype/tie 不符都 loudly fail）。
+- 测试：`tests/cuda/test_qwen35_full_model.cpp`（真实 checkpoint 硬门：
+  CPU 全模型结构契约 + GPU 所有权 + `reset_state` 覆盖全部 24 层；
+  `--no-gen` 供 memcheck）。
+
+> 注：Phase A **复用** Phase B 的 `Qwen35FullAttentionLayer` 与 Phase C 的
+> `Qwen35DeltaNetLayer`（及其全部 kernel），**不是**新的上游移植、**不新增**
+> kernel；新增的仅是全模型接线（embedding/norm/LM-head 所有权 + 24 层 dispatch
+> + 统一 reset_state）与全模型摄入。
+
+验收证据（RTX 2080 Ti）：真实 checkpoint 全量转换 PASS（506 张量 / 766 MB /
+layers 0..23）；24/24 层 validate PASS + 层排表 exact（全注意力 3,7,11,15,19,23）
++ embedding/final-norm/LM-head 张量契约 PASS；full model load/unload PASS；
+`reset_state()` 覆盖全部 24 层；旧 31 测试全回归 PASS；compute-sanitizer
+memcheck 0 错误（`--no-gen` CUDA-only 路径，覆盖全模型 load + 24 层 seed +
+reset + unload 的新 CUDA 分配生命周期）；no-torch 守卫 CLEAN。详见
+`docs/qwen35_architecture.md` §17。

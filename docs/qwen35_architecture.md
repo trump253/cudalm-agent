@@ -753,3 +753,102 @@ decode step 从同一 pre-state** 的代价——否则 p0 会因 recurrent 状�
 **Phase D 后 STOP** —— Phase D（4 层混合 micro-stack）已完成（见 §16）并
 推送 `v0.2-qwen35`；等待外部 review。**v0.2 最终 hybrid decoder micro-stack**
 （3×Gated DeltaNet + 1×FullAttention，真实 checkpoint layers 0-3）已就绪。
+
+## 17. v0.3 Full Model（Phase A：完整 24 层结构 + 权重摄入口径）
+
+Phase A（v0.3）范围 = **完整 24 层模型结构 + 权重摄入口径 + 模型级 runtime
+骨架的所有权/状态生命周期**。**不做**：tokenizer / 生成 / 采样 / scheduler /
+Paged KV / 性能优化；**不做**全模型 forward / logits（那是 v0.3 Phase B）。
+
+### 17.1 钉死的全模型契约（来自 pinned 官方源 + 真实 checkpoint，无猜测）
+
+pinned oracle = `transformers@fc9137225880`（`modeling_qwen3_5.py`），真实
+checkpoint = `Qwen3.5-0.8B-Base`（`raw/config.json` + `model.safetensors`，
+语言张量在 `model.language_model.*` 前缀下）。
+
+| 组件 | checkpoint 张量名 | shape / dtype | 官方源依据 |
+|---|---|---|---|
+| 词嵌入 | `model.language_model.embed_tokens.weight` | **BF16 `[248320, 1024]`** | `nn.Embedding(vocab_size=248320, hidden_size=1024, pad_token_id)`（modeling L1298）|
+| 24 decoder 层 | `model.language_model.layers.{0..23}.*` | 见 §7/§8 | `num_hidden_layers=24`（config）|
+| 最终 norm | `model.language_model.norm.weight` | **BF16 `[1024]`** | `Qwen3_5RMSNorm(hidden_size=1024, eps=1e-6)`（modeling L1302）|
+| LM head | **无独立张量（tied）** | 复用 embed_tokens `[248320,1024]` | `_tied_weights_keys={"lm_head.weight":"model.language_model.embed_tokens.weight"}`（L1825）；`lm_head=nn.Linear(1024,248320,bias=False)`（L1833）；`logits = hidden @ embed_weight.T`（L1957）|
+
+- **权重绑定（weight tying）**：config `tie_word_embeddings: true`（顶层 +
+  `text_config` 均 true）→ checkpoint **没有** `lm_head` 张量；LM head 与词嵌入
+  **共享同一份权重**（logits 用其转置）。本契约把 LM head 记录为「alias 词嵌入」，
+  绑定事实写进 `.cudalm` v2 **metadata**（`tie_word_embeddings=true`），不新建张量。
+- **层排表（exact hybrid schedule）**：config `layer_types` = 3×`linear_attention`
+  + 1×`full_attention` 重复 → **全注意力在 layer 3,7,11,15,19,23**（共 6 层），
+  其余 18 层 = **Gated DeltaNet**（`linear_attention`）。与 config 派生的
+  `is_full_attention(i)=(i+1)%full_attention_interval==0`（interval=4）完全一致。
+- **dtype**：权重绝大多数 BF16；DeltaNet 的 `linear_attn.A_log` `[16]` 与
+  `linear_attn.norm.weight` `[128]` 为 **FP32**（`mamba_ssm_dtype=float32`）；
+  DeltaNet recurrent 状态 **FP32** `[16,128,128]`。
+- **关键 config 值**：`hidden_size=1024`、`num_hidden_layers=24`、
+  `intermediate_size=3584`、`vocab_size=248320`、`num_attention_heads=8`、
+  `num_key_value_heads=2`、`head_dim=256`、`linear_num_key_heads=16`、
+  `linear_num_value_heads=16`、`linear_key_head_dim=128`、`linear_value_head_dim=128`、
+  `linear_conv_kernel_dim=4`、`full_attention_interval=4`、
+  `max_position_embeddings=262144`、`rms_norm_eps=1e-6`。
+- **v0.3 文本范围之外**：`model.visual.*`（视觉塔）与 `mtp.*`（多 token 预测）
+  张量**不摄**入（converter manifest 记为 `skipped`）。
+- 单层张量集见 §7（全注意力 11 张量）/ §8（DeltaNet 14 张量），此处不重复。
+
+### 17.2 .cudalm v2 全模型摄入扩展（向后兼容）
+
+`.cudalm` v2 是「命名张量容器」（name→blob）。全模型 = 在**同一容器**里新增
+模型级命名张量 + metadata，**不改** 88 字节 config blob、**不改** 既有张量集、
+**不破坏** Phase A-D 任何 fixture：
+
+- `tools/convert_qwen35.py` 新增 `--full-model`：强制全 24 层 + 写
+  `embed_tokens.weight`（BF16 `[vocab,hidden]`）+ `norm.weight`（BF16 `[hidden]`，
+  原本就写）+ metadata `tie_word_embeddings`（读 config，`true`/`false`）。
+  `manifest` 记 `full_model` + `skipped=["visual","mtp"]`（`embed_tokens` 不再 skipped）。
+- **不加 `--full-model`** 时行为**完全不变**（per-layer `--layers 0,1,2,3` 仍只写
+  该层张量 + `norm.weight`，无 embedding、无 tie metadata）——Phase A-D
+  golden/ingestion 输出逐字节保持。
+- C++ `WeightFileV2` 新增 `validate_model_embedding()`（`embed_tokens.weight`
+  `[vocab,hidden]` bf16）+ `validate_full_model()`（embedding + norm + 24/24 层
+  + tie metadata 必须为 `"true"`）；缺张量 / shape / dtype / tie 不符都 **loudly fail**。
+  `Qwen35Config` 本就含 `vocab_size`（v0.2 未用），此处直接复用。
+
+### 17.3 `Qwen35Model`（模型级 runtime 骨架，CUDALM 原生，复用 v0.2 单层）
+
+`include/cudalm/qwen35_model.h` + `src/runtime/qwen35_model.cpp`：
+
+- **embedding 所有权**：`embedding()` → device BF16 `[248320,1024]`。
+- **24 层所有权 + dispatch**：`load()` 逐层 `Qwen35LayerWeights::load` + 按
+  config 排表构造 runtime（`Qwen35DeltaNetLayer` 18 层 / `Qwen35FullAttentionLayer`
+  6 层）——**复用**冻结的 v0.2 单层运行时，**不复制任何 kernel**，**不改**冻结数学。
+- **最终 norm 所有权**：`final_norm()` → device BF16 `[1024]`。
+- **LM head 所有权（tied）**：`lm_head()` **alias 词嵌入**（同一 device buffer，
+  无独立分配；logits = hidden @ lm_head^T）；`tie_word_embeddings()=true`。
+- **统一 `reset_state(stream)`**：遍历**全部 24 层**逐层独立重置（DeltaNet 零
+  conv+recurrent；全注意力零 KV）——无跨层 alias。embedding/norm/lm_head 是权重
+  非状态，不受影响。
+- **Phase A 边界**：本类**不跑**全模型 forward / 不计算 logits（Phase B）；
+  只完成 load（上传权重）/ 所有权 / 逐层 dispatch / 状态生命周期 / unload（析构）。
+- 析构顺序：层 runtime 先于其权重集销毁（`weights_` 声明在 `layers_` 之前）；
+  embedding/norm buffer 与 alias 它们的 `TensorView`（view 平凡销毁）。
+
+### 17.4 硬门与签核证据（本次运行）
+
+- **真实 checkpoint 全量转换 PASS**：`convert_qwen35.py --full-model` 一次转出
+  **506 张量 / 766 MB / layers 0..23**（embedding `[248320,1024]` bf16 +
+  `norm.weight` `[1024]` bf16 + 24 层 + tie metadata）。
+- **24/24 层 validate PASS** + **层排表 exact**（全注意力恰在 3,7,11,15,19,23；
+  DeltaNet 18 层）+ **embedding/final-norm/LM-head 张量契约 PASS**（shape/dtype
+  精确、无独立 `lm_head` 张量、tie metadata=`"true"`）。
+- **full model load/unload PASS**：`Qwen35Model::load` 上传全模型（device 约
+  ~3.9 GB：embedding 509 MB + 6×FA KV ~3.2 GB + 24 层权重 ~250 MB），析构即 unload。
+- **`reset_state()` 覆盖全部 24 层**：把每层持久状态 seed 成非零 sentinel
+  （DeltaNet 经 `seed_state` H2D；FA 经 `cudaMemsetAsync`），reset 后逐层回读
+  全部归零。
+- 新增 `test_qwen35_full_model`（CPU 结构门 + GPU 所有权/状态门；无 checkpoint
+  时 self-skip 77）。旧 **31 测试全回归 PASS**；`check_no_torch.sh` **CLEAN**；
+  `compute-sanitizer --tool memcheck` **0 错误**（`--no-gen` CUDA-only 路径，
+  覆盖全模型 load + 24 层 seed + reset + unload 的**新 CUDA 分配生命周期**）。
+
+**Phase A 后 STOP** —— v0.3 Phase A（完整 24 层结构 + 权重摄入口径 + 模型骨架
+所有权/状态生命周期）已完成并推送 `v0.3-full-model`。**不自动开始**全模型
+forward / logits（v0.3 Phase B）。

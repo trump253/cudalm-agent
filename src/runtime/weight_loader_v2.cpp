@@ -375,6 +375,38 @@ Status WeightFileV2::validate_model_norm() const {
   return expect_tensor(*this, "norm.weight", Dtype::kBf16, {config_.hidden_size});
 }
 
+Status WeightFileV2::validate_model_embedding() const {
+  return expect_tensor(*this, "embed_tokens.weight", Dtype::kBf16,
+                       {config_.vocab_size, config_.hidden_size});
+}
+
+Status WeightFileV2::validate_full_model() const {
+  // Embedding + final norm.
+  Status s = validate_model_embedding();
+  if (!s.ok) return s;
+  s = validate_model_norm();
+  if (!s.ok) return s;
+  // Every decoder layer (0..num_hidden_layers-1), validated against the
+  // config's per-layer tensor set + hybrid type.
+  for (int i = 0; i < config_.num_hidden_layers; ++i) {
+    s = validate_layer(i);
+    if (!s.ok) {
+      s.message = "layer " + std::to_string(i) + ": " + s.message;
+      return s;
+    }
+  }
+  // Weight tying: the pinned Qwen3.5-0.8B ties the LM head to the embedding
+  // (config tie_word_embeddings=true, source _tied_weights_keys), so the
+  // metadata must be present and "true". A non-tied model (a separate
+  // lm_head.weight tensor) is out of scope for this phase.
+  const std::string* tie = meta("tie_word_embeddings");
+  if (!tie || *tie != "true")
+    return Status::error(
+        "full model: tie_word_embeddings metadata must be \"true\" (the pinned "
+        "Qwen3.5-0.8B ties the LM head to the embedding)");
+  return Status::ok_status();
+}
+
 // ---------------------------------------------------------------------------
 // Qwen35LayerWeights
 // ---------------------------------------------------------------------------

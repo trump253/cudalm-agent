@@ -317,6 +317,26 @@ if(CUDALM_PYTHON3)
                      ${CMAKE_SOURCE_DIR})
     set_tests_properties(test_qwen35_hybrid_microstack_golden PROPERTIES
       SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+    # --- v0.3 Phase A: Qwen3.5 full-model structure + ownership gate -------
+    # HARD GATE: convert the COMPLETE Qwen3.5-0.8B-Base (all 24 decoder layers
+    # + embed_tokens + final norm + tie metadata) in one shot, validate the
+    # full-model tensor contract on the host (24/24 layers, embedding/final-
+    # norm/LM-head shapes+dtype, exact hybrid schedule, weight tying), then
+    # load the full Qwen35Model (device memory) and prove reset_state() covers
+    # every one of the 24 layers (seed each layer's state non-zero, reset,
+    # verify all zero). No forward/logits (that is v0.3 Phase B). Self-skips
+    # (77) when the checkpoint is absent.
+    add_executable(test_qwen35_full_model cuda/test_qwen35_full_model.cpp)
+    target_link_libraries(test_qwen35_full_model PRIVATE cudalm)
+    add_test(NAME test_qwen35_full_model
+             COMMAND test_qwen35_full_model
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR})
+    set_tests_properties(test_qwen35_full_model PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
   else()
     message(STATUS "tool python lacks torch/safetensors/numpy: "
                    "qwen35 ingestion tests disabled")
