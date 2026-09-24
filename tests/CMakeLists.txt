@@ -210,6 +210,15 @@ if(CUDALM_PYTHON3)
   set_tests_properties(test_cudalm_v2_format PROPERTIES
     FIXTURES_REQUIRED cudalm_v2_format)
 
+  # --- v0.2: Qwen3.5 micro-stack --tokens argument validation (stdlib) -------
+  # tools/common/token_seq.py is stdlib-only (no torch): it validates the
+  # strictly-consecutive 0-anchored token sequence the hybrid micro-stack
+  # golden generator (--microstack-prefix --tokens) accepts, rejecting gaps,
+  # duplicates, non-0 starts and out-of-order entries. Runs under system
+  # python3 (no venv / checkpoint needed).
+  add_test(NAME test_qwen35_tokens_validation
+           COMMAND ${CUDALM_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/common/token_seq.py)
+  
   # --- v0.2: Qwen3.5 real-checkpoint ingestion (torch tool python) -----------
   # Requires the pinned checkpoint in /root/models (never committed) and a
   # tool python with torch + safetensors + numpy. The test self-skips (77)

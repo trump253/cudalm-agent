@@ -65,6 +65,7 @@ import torch.nn.functional as F  # noqa: E402
 import cudalm_v2 as v2  # noqa: E402
 import golden_v2 as gv2  # noqa: E402
 from w4a16_quant import dequant_reference, fidelity_stats, quantize_w4a16  # noqa: E402
+import token_seq  # noqa: E402
 
 # --- Pinned provenance (docs/qwen35_architecture.md §1) ----------------------
 MODEL_REPO = "Qwen/Qwen3.5-0.8B-Base"
@@ -1093,8 +1094,10 @@ if __name__ == "__main__":
                          "under <prefix>_L{layer}_p{pos}.cudalm for the "
                          "4-layer hybrid micro-stack (layers 0-3)")
     ap.add_argument("--tokens", default="0",
-                    help="Phase D micro-stack: comma-separated 0-based token "
-                         "sequence, e.g. 0 (scenario A) or 0,1,2 (scenario B)")
+                    help="Phase D micro-stack: strictly consecutive 0-anchored "
+                         "0-based token sequence: 0 / 0,1 / 0,1,2 / ... "
+                         "(gaps, duplicates, non-0 start and out-of-order are "
+                         "rejected). e.g. 0 (scenario A) or 0,1,2 (scenario B)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -1103,7 +1106,10 @@ if __name__ == "__main__":
         if not (a.cudalm and a.checkpoint_dir):
             ap.error("--cudalm and --checkpoint-dir are required for "
                      "--microstack-prefix")
-        tokens = [int(x) for x in a.tokens.split(",") if x.strip() != ""]
+        try:
+            tokens = token_seq.parse_token_sequence(a.tokens)
+        except ValueError as e:
+            ap.error(str(e))
         sys.exit(generate_microstack(a.cudalm, a.checkpoint_dir,
                                      a.microstack_prefix, tokens,
                                      a.input_seed))
