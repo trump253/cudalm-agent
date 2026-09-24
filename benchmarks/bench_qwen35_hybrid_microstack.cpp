@@ -111,30 +111,39 @@ struct CaseResult {
   std::vector<StatBlock> per_layer;  // 4 entries
 };
 
-// Reset the micro-stack state; if `position > 0` first decode positions
-// 0..position-1 (un-timed) to build the sequential persistent state; then
-// measure `iters` timed decode steps at `position`.
+// Every warmup + timed sample REPLAYS the identical pre-state (no snapshot/
+// restore — Phase D just re-runs the prefix): reset to zero, then untimed
+// forward(0..position-1) to rebuild the sequential pre-state, then the timed
+// forward(position). So every sample measures the SAME decode step from the
+// SAME pre-state (p0 would otherwise drift off its fresh zero state as the
+// recurrent state accumulates across samples; p512 would drift off the
+// 0..511 pre-state as each timed step advances the state):
+//   p0:    reset_state() -> timed forward(0)
+//   p512:  reset_state() -> untimed forward(0..511) -> timed forward(512)
+// The pre-state rebuild is un-timed; the stream is synced before the wall-clock
+// starts so the CPU window (and the CUDA events inside forwardTimed) wrap only
+// the timed forward(position), not the untimed prefix.
 CaseResult run_case(Qwen35HybridMicroStack& stack, const DeviceBuffer& xbuf,
                     int position, int iters, cudaStream_t stream,
                     cudaEvent_t* events, const char* state_label) {
-  stack.reset_state(stream);
-  for (int p = 0; p < position; ++p)
-    stack.forward(p, xbuf.data<__nv_bfloat16>(), stream);
   constexpr int kLayers = Qwen35HybridMicroStack::kNumLayers;
   float layer_us[kLayers];
   float whole_us = 0.f;
   std::vector<std::vector<float>> per_layer(kLayers);
   std::vector<float> whole_hist, sum_hist, wall_hist;
   const int warmup = 5;
-  for (int i = 0; i < warmup; ++i) {
-    stack.forwardTimed(position, xbuf.data<__nv_bfloat16>(), stream, events,
-                       layer_us, &whole_us);
-  }
-  for (int i = 0; i < iters; ++i) {
+  for (int it = 0; it < warmup + iters; ++it) {
+    // Rebuild the identical pre-state from scratch (reset + untimed prefix).
+    stack.reset_state(stream);
+    for (int p = 0; p < position; ++p)
+      stack.forward(p, xbuf.data<__nv_bfloat16>(), stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const bool timed = (it >= warmup);
     const auto t0 = std::chrono::steady_clock::now();
     stack.forwardTimed(position, xbuf.data<__nv_bfloat16>(), stream, events,
                        layer_us, &whole_us);
     const auto t1 = std::chrono::steady_clock::now();
+    if (!timed) continue;
     wall_hist.push_back(
         std::chrono::duration<double, std::micro>(t1 - t0).count());
     whole_hist.push_back(whole_us);

@@ -723,15 +723,29 @@ batching / scheduler / kernel 优化 / NCU。
 warmup，全局时钟预热 1500 步；evidence
 `benchmarks/results/bench_qwen35_hybrid_microstack.json`）：
 
+**状态语义（关键）**——每个 warmup/sample 都**从相同 pre-state 重建后**再计时
+（不实现 snapshot/restore，直接 replay 前缀）：
+
+```text
+p0:    reset_state() -> timed forward(0)
+p512:  reset_state() -> untimed forward(0..511) -> timed forward(512)
+```
+
+pre-state 重建不计入计时（计时窗口前的 `cudaStreamSynchronize` 保证 wall-clock
+与 CUDA event 只覆盖 timed `forward(position)`）。这样每个 sample 都测**同一条
+decode step 从同一 pre-state** 的代价——否则 p0 会因 recurrent 状态在 sample
+间累积而偏离零状态、p512 会因每步推进而偏离 0..511 的 pre-state。
+
 | 情况 | stage/layer sum | whole_microstack_gpu_us | host_api_wall_us | steps/s |
 |---|---|---|---|---|
-| **p=0**（零状态，FA 上下文深度 1）| 395.6 us | 405.5 us | 415.3 us | 2466 |
-| **p=512**（顺序状态，FA 上下文深度 513）| 425.5 us | 435.3 us | 445.2 us | 2297 |
+| **p=0**（零状态，FA 上下文深度 1）| 404.4 us | 414.7 us | 425.3 us | 2412 |
+| **p=512**（顺序状态，FA 上下文深度 513）| 436.7 us | 446.5 us | 460.2 us | 2240 |
 
 - DeltaNet 层与 position 无关（recurrent 状态是固定 `[16,128,128]` 矩阵，
-  每步就地更新）：p=0/p=512 均 ~102–106 us/层。
-- 全注意力层随上下文深度上升：p=0（1 行 KV）84.4 us → p=512（513 行 KV）
-  115.1 us。p=512 比 p=0 慢的 ~30 us 全部来自该层更深的注意力。
+  每步就地更新）：p=0/p=512 逐层一致（~102.6–113.3 us/层，layer0 略高，
+  两情况完全吻合，印证 position 无关性）。
+- 全注意力层随上下文深度上升：p=0（1 行 KV）85.0 us → p=512（513 行 KV）
+  115.9 us。p=512 比 p=0 慢的 ~32 us 全部来自该层更深的注意力。
 - **micro-stack step ≠ model token**（model 有 24 层，此处只跑前 4 层）；
   速率以 `microstack_steps_per_second_mean`（= 1e6 / whole_microstack_gpu_us
   mean）报告，**不**称 tokens/s。

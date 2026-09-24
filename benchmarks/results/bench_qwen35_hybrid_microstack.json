@@ -16,31 +16,31 @@
       "label": "p0",
       "position": 0,
       "state": "fresh zero state (full-attention context depth 1)",
-      "stage_layer_sum_us": {"mean_us": 395.615326, "min_us": 390.847961, "max_us": 428.928009, "p50_us": 393.631989},
+      "stage_layer_sum_us": {"mean_us": 404.371704, "min_us": 393.727997, "max_us": 430.783997, "p50_us": 402.463989},
       "per_layer_gpu_us": [
-        {"layer": "layer0_deltanet", "mean_us": 106.117470, "min_us": 102.591995, "max_us": 132.287994, "p50_us": 104.959999},
-        {"layer": "layer1_deltanet", "mean_us": 102.961594, "min_us": 101.120003, "max_us": 107.936005, "p50_us": 102.495995},
-        {"layer": "layer2_deltanet", "mean_us": 102.110069, "min_us": 100.351997, "max_us": 110.592003, "p50_us": 101.919998},
-        {"layer": "layer3_full_attn", "mean_us": 84.426208, "min_us": 82.687996, "max_us": 96.320000, "p50_us": 83.968002}
+        {"layer": "layer0_deltanet", "mean_us": 113.269753, "min_us": 106.559998, "max_us": 140.800003, "p50_us": 109.568001},
+        {"layer": "layer1_deltanet", "mean_us": 103.422409, "min_us": 100.351997, "max_us": 113.311996, "p50_us": 102.271996},
+        {"layer": "layer2_deltanet", "mean_us": 102.636795, "min_us": 100.351997, "max_us": 114.975998, "p50_us": 101.952003},
+        {"layer": "layer3_full_attn", "mean_us": 85.042831, "min_us": 82.400002, "max_us": 97.631996, "p50_us": 83.968002}
       ],
-    "whole_microstack_gpu_us": {"mean_us": 405.539886, "min_us": 400.608002, "max_us": 444.415985, "p50_us": 403.423981},
-    "host_api_wall_us": {"mean_us": 415.311157, "min_us": 410.096985, "max_us": 453.447998, "p50_us": 412.959015},
-      "microstack_steps_per_second_mean": 2465.848695
+    "whole_microstack_gpu_us": {"mean_us": 414.679321, "min_us": 402.432007, "max_us": 445.567993, "p50_us": 413.183990},
+    "host_api_wall_us": {"mean_us": 425.274292, "min_us": 411.641998, "max_us": 455.299011, "p50_us": 424.281006},
+      "microstack_steps_per_second_mean": 2411.501970
     },
     {
       "label": "p512",
       "position": 512,
       "state": "sequential (positions 0..deep-1 decoded; full-attention context depth deep+1)",
-      "stage_layer_sum_us": {"mean_us": 425.495514, "min_us": 421.375977, "max_us": 446.656006, "p50_us": 424.223999},
+      "stage_layer_sum_us": {"mean_us": 436.679321, "min_us": 425.376007, "max_us": 472.128021, "p50_us": 435.071991},
       "per_layer_gpu_us": [
-        {"layer": "layer0_deltanet", "mean_us": 105.844513, "min_us": 103.423996, "max_us": 128.447998, "p50_us": 104.704002},
-        {"layer": "layer1_deltanet", "mean_us": 102.693436, "min_us": 101.024002, "max_us": 108.863998, "p50_us": 102.399994},
-        {"layer": "layer2_deltanet", "mean_us": 101.818565, "min_us": 100.351997, "max_us": 117.056000, "p50_us": 101.407997},
-        {"layer": "layer3_full_attn", "mean_us": 115.138916, "min_us": 114.175995, "max_us": 121.695999, "p50_us": 114.880005}
+        {"layer": "layer0_deltanet", "mean_us": 113.315178, "min_us": 106.496002, "max_us": 152.096008, "p50_us": 109.311996},
+        {"layer": "layer1_deltanet", "mean_us": 104.571846, "min_us": 100.704002, "max_us": 117.023994, "p50_us": 102.655998},
+        {"layer": "layer2_deltanet", "mean_us": 102.882561, "min_us": 100.608002, "max_us": 116.736000, "p50_us": 102.399994},
+        {"layer": "layer3_full_attn", "mean_us": 115.909775, "min_us": 113.407997, "max_us": 125.056000, "p50_us": 115.391998}
       ],
-    "whole_microstack_gpu_us": {"mean_us": 435.309540, "min_us": 431.776001, "max_us": 456.703979, "p50_us": 433.919983},
-    "host_api_wall_us": {"mean_us": 445.223541, "min_us": 440.687012, "max_us": 466.656006, "p50_us": 443.250000},
-      "microstack_steps_per_second_mean": 2297.215909
+    "whole_microstack_gpu_us": {"mean_us": 446.511597, "min_us": 434.559998, "max_us": 481.440002, "p50_us": 444.799988},
+    "host_api_wall_us": {"mean_us": 460.242462, "min_us": 446.339996, "max_us": 494.351990, "p50_us": 458.917999},
+      "microstack_steps_per_second_mean": 2239.583490
     }
   ],
   "timing_semantics": {
