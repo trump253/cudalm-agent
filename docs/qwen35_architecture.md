@@ -317,7 +317,7 @@ g     = -exp(A_log_f32) · softplus(a_f32 + dt_bias_f32)   # fp32 [16]
 
 # delta-rule 递推，状态 S ∈ R^{16×128×128} 保持 FP32：
 for each head h (independent):
-  q_h = l2norm(q_h, eps=1e-6); k_h = l2norm(k_h, eps=1e-6)   # fp32
+  q_h = l2norm(q_h, eps=1e-6); k_h = l2norm(k_h, eps=1e-6)   # bf16（见下）
   q_h = q_h / sqrt(128)
   S_h = S_h · exp(g_h)
   m   = S_h · k_h                       # [128]（对 key 维收缩）
@@ -330,7 +330,15 @@ out  = gated_rmsnorm(core, gate=z, w=norm.w)    # §6.2
 y    = W_out @ out                              # [1024]
 ```
 
-`l2norm(x) = x · rsqrt(Σ x² + 1e-6)`（与 FLA 一致，见 §1.2）。
+`l2norm(x) = x * inv_norm`，其中 `inv_norm = torch.rsqrt((x*x).sum(dim,
+keepdim=True) + eps)`——这是 pinned torch 回退路径的 FLA 对齐 `l2norm`
+（§1.2），**在 bf16 上进行，不是纯 fp32**（早期本文的 `# fp32` 表述有误，
+以钉死源为准）。本实现逐位精确镜像的舍入序列为：`prod = bf16(x·x)`；
+`ss = fp32(Σ prod)`（bf16 乘积的 fp32 求和）；`t = bf16(ss + eps)`；
+`inv = bf16(rsqrt_bf16(t))`——注意 torch 对 **bf16 张量**的 `rsqrt` 是
+`bf16(1.0 / bf16(sqrt(f32(t))))`，即 fp32 开方舍入到 bf16、再做 fp32 倒数
+舍入到 bf16（**两次** bf16 舍入，而非单次 fp32 rsqrt）；最后
+`out = bf16(x · inv)`。
 
 **状态（每个 DeltaNet 层，显式归属）：**
 - `conv_state`：bf16 `[6144, 3]`（qkv 流最后 kernel-1=3 个 token）
@@ -460,7 +468,8 @@ RMSNorm = 全 fp32 链 → 一次 bf16 cast；RoPE = cos/sin 先 fp32→bf16 再
   gated-norm kernel）+ 真实 checkpoint golden PASS（p=0、p>0、非零 KV
   历史）【已完成，见 §14】
 - **C** —— `Qwen35DeltaNetLayer` + 状态转移 golden PASS（首 token、连续
-  token、非零前一状态；输出**和**状态都比对）【未开始】
+  token、非零前一状态；输出**和** `conv_state` **和** `recurrent_state`
+  都比对）【已完成，见 §15】
 - **D** —— 4 层混合 micro-stack golden PASS（逐层 + 全部状态 + 最终输出），
   顺序 p=0,1,2,…；benchmark 三视图；compute-sanitizer 干净；文档/证据
   更新；推送 `v0.2-qwen35`【未开始】
@@ -484,7 +493,8 @@ RMSNorm = 全 fp32 链 → 一次 bf16 cast；RoPE = cos/sin 先 fp32→bf16 再
 Phase B **已完成**并通过签核验证。范围 = 一个全注意力层
 （layers 3/7/11/15/19/23）的 Qwen3.5 专属 BF16 运行时路径、真实
 checkpoint 权重、真实 checkpoint golden 在 p=0 及带非零 KV 历史的 p>0
-均 PASS。DeltaNet（Phase C）与混合 micro-stack（Phase D）**未开始**。
+均 PASS。DeltaNet（Phase C）现已**完成**（见 §15）；混合 micro-stack
+（Phase D）**未开始**。
 
 ### 14.1 落地内容
 
@@ -548,4 +558,74 @@ checkpoint 权重、真实 checkpoint golden 在 p=0 及带非零 KV 历史的 p
 Phase B 未做任何性能调优（设计上超范围）；这些数字是 Phase D benchmark
 视图的已验证正确性基线。
 
-**Phase B 后 STOP** —— 按交接简报要求。不要自动开始 Phase C（DeltaNet）。
+---
+
+## 15. Phase C 完成记录（Qwen3.5 Gated DeltaNet）
+
+Phase C **已完成**并通过硬门验证。范围 = 一个 Gated DeltaNet 层
+（非全注意力层，本验证取 layer 0）的 CUDALM 原生解码运行时路径、真实
+checkpoint 权重、真实 checkpoint golden 在三种状态转移场景下均 PASS。
+
+### 15.1 落地内容
+
+- `qwen35_deltanet_kernels`（`.h`/`.cu`）——DeltaNet 解码 kernel：
+  `deltanet_conv_kernel`（depthwise causal conv decode，**位级精确**：
+  fp32 累加 → 一次 bf16 RNE，再对 bf16 结果做 SiLU；conv_state 为 bf16
+  位级 shift+insert）、`deltanet_gbeta_kernel`（g 以 fp32、beta 以 bf16）、
+  `deltanet_delta_kernel`（FLA 对齐的 **bf16 l2norm**（§8 修正）+ fp32
+  recurrent 状态就地递推，输出取自更新后的状态）、
+  `deltanet_gated_rmsnorm_kernel`（gated RMSNorm，两处 bf16 舍入）。
+- `Qwen35DeltaNetLayer`（`.h`/`.cpp`）——layer 0 解码层，复用冻结的
+  Phase A/B W4A16 GEMV / 零中心 RMSNorm / add / silu-mul；持有持久状态
+  （`conv_state` bf16 `[6144,3]`、`recurrent_state` fp32 `[16,128,128]`），
+  每步就地更新，提供 `reset_state` / `seed_state`。
+- **supported-config contract（本阶段硬化）**：`Qwen35DeltaNetLayer` 构造
+  前经 `qwen35_deltanet_require_supported_config` 校验；非法配置
+  （`lin_conv_kernel_dim != 4`、`linear_conv_state_len() != 3`、
+  `lin_key_head_dim != lin_value_head_dim`、`lin_key_head_dim != 128`、
+  `lin_num_k_heads != lin_num_v_heads`、非线性注意力层）一律 abort——
+  因 kernel 固定 kernel-4 / state-3 / head-dim-128 / k==v，避免对其它合法
+  `Qwen35Config` 静默 OOB / 语义错误。契约测试 `test_qwen35_deltanet_config`
+  （CPU，子进程 abort-check）。
+- `tools/generate_qwen35_golden.py` ——DeltaNet 层 golden 生成（**同一组**
+  W4A16 量化权重，无 bf16/量化状态混用）+ `--state-seed`（确定性非零
+  初始状态）。
+- `test_qwen35_deltanet_golden` ——三场景硬门（§15.2）+ `--no-gen`
+  （memcheck 用的 CUDA-only 路径）。
+
+### 15.2 状态转移硬门（三场景，均比对 输出 + conv_state + recurrent_state）
+
+oracle 与运行时使用**同一组**量化权重（`build_quantized_deltanet_layer`
+把 8 个 GEMV 换成与运行时相同的 W4A16 反量化）。三种场景：
+
+- **A 首 token**：conv_state 与 recurrent_state 全零，跑 p=0；
+- **B 连续**：运行时从**自身的** p=0 状态链到 p=1（p0→p1），不重置；
+- **C 非零初始状态**：以确定性非零 conv/recurrent 状态播种，跑 p=0。
+
+每种场景比对最终输出**以及** `conv_state` **以及** `recurrent_state`
+（连同 22 个 bf16 stage）。**容差：** 22 个 bf16 stage 用
+`compare_bf16_stages`（atol=rtol=1e-2）；`stage.g`（fp32）与
+recurrent_state 用紧 fp32 容差（atol=1e-5、rtol=1e-4）。l2norm 与 causal
+conv 已位级精确复刻（对 pinned torch op 逐元素验证 mismatch=0），故残余仅
+为 fp32 递推收缩的结合序（本实现按线程循环 vs torch `.sum`），实测 ≤ 6e-8。
+
+### 15.3 签核证据（本次运行）
+
+- `test_qwen35_deltanet_golden`（layer 0）三场景全 PASS：
+  - **A**：输出 bit-exact（worst bf16 max_abs_err = 0），`recurrent_state`
+    max_abs = 0；
+  - **B**：worst bf16 = 0.000488（1 ulp），`recurrent_state` max_abs =
+    5.96e-08；
+  - **C**：worst bf16 = 0.000244（1 ulp），`recurrent_state` max_abs =
+    7.45e-09。
+- 完整 `ctest`：**29/29 PASS**（旧 v0.1/v0.1.1 回归 + Phase A 摄入 +
+  Phase B 单元 + Phase B golden + **Phase C 契约 + Phase C golden**）。
+- `compute-sanitizer --tool memcheck`：**0 错误**（DeltaNet golden，
+  `--no-gen` CUDA-only 路径；证据 `benchmarks/sanitizer_qwen35_deltanet.txt`）。
+- `scripts/check_no_torch.sh`：**CLEAN**（include/、src/ 无 torch/pybind）。
+
+Phase C 未做性能调优（设计上超范围）；不跑 benchmark / NCU（Phase D 范围）。
+
+**Phase C 后 STOP** —— Phase C（Gated DeltaNet）已完成（见 §15）并推送
+`v0.2-qwen35`；等待外部 review，**不要自动开始 Phase D**（4 层混合
+micro-stack / benchmark / NCU）。

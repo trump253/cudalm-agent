@@ -92,3 +92,57 @@ sha256 `c2b1e5a17d9c1e27685d92ed9b382911ebb99955ecd89052d1721241adfbab6c`）。
 4.9e-04（tolerance 1e-2，`include/cudalm/stage_compare.h` 记录容差理由）；
 p=0 不变式位级成立；27/27 ctest；compute-sanitizer memcheck 0 错误；
 no-torch 守卫 CLEAN。详见 `docs/qwen35_architecture.md` §14。
+
+## CUDALM v0.2 Phase C（Qwen3.5 Gated DeltaNet，BF16 运行时路径）
+
+Phase C 在 Phase B 之上为 Qwen3.5 Gated DeltaNet 层新增 BF16 解码运行时
+（W4A16 权重契约不变：G=128、q∈[-7,7]、scale FP16、FP32 累加；激活/输出
+走 BF16，recurrent 状态保持 FP32，**绝不** bf16/量化状态混用）。事实源 =
+官方 pinned transformers（`fc9137225880`，`modeling_qwen3_5.py` sha256
+`b6f02dcd1b66610df293084e00bf9bea4fc6a7e5336ffc6ff446edc7ddcd8601`，
+生成器运行时断言）+ 真实 checkpoint（`Qwen/Qwen3.5-0.8B-Base`，同 Phase
+B revision / sha256）。
+
+### 上游核查（CUDALab `cb6a6a9`，只读参考）
+
+已核查 frozen `CUDALab@cb6a6a9`：**无** proven DeltaNet / causal-conv1d /
+recurrent kernel。`kernels/` 仅含 `gemv`、`int4gemv`、`qgemv`、`rmsnorm`、
+`rope`、`softmax`；仓库内 `delta` / `recurrent` / `conv` 字符串命中均为误报
+（`cudalab/evaluator` 的 `FILTER_LOG_DELTA` 阈值常量、注释中的 "convert"）。
+**因此 Phase C 的 DeltaNet 解码 kernel 为 CUDALM 原生（无上游移植），数学
+语义来自 pinned Qwen3.5 实现**的纯 torch 回退路径
+（`torch_recurrent_gated_delta_rule` / `torch_causal_conv1d_update` /
+FLA 对齐 `l2norm`，架构文档 §1.2 钉死）。
+
+### CUDALM 原生（无上游，依据 pinned modeling 新写）
+
+- `src/kernels/qwen35_deltanet_kernels.cu` /
+  `include/cudalm/kernels/qwen35_deltanet_kernels.h`：causal conv decode
+  （fp32 累加 → 一次 bf16 RNE → 对 bf16 结果 SiLU；conv_state 位级
+  shift+insert）、g/beta 预计算（g fp32、beta bf16）、FLA 对齐 **bf16
+  l2norm** + fp32 recurrent 状态就地递推（输出取自更新后状态；bf16 rsqrt =
+  `bf16(1.0 / bf16(sqrt(f32(t))))`，见架构文档 §8 修正）、gated RMSNorm
+  （两处 bf16 舍入）。
+- `src/runtime/qwen35_deltanet.{h,cpp}`：`Qwen35DeltaNetLayer`（复用
+  Phase A/B W4A16 GEMV + 零中心 RMSNorm + add + silu-mul；持有 conv_state
+  bf16 `[6144,3]` + recurrent_state fp32 `[16,128,128]`，就地更新，
+  `reset_state` / `seed_state`）+ `qwen35_deltanet_require_supported_config`
+  （supported-config 硬契约：kernel-4 / state-3 / head-dim-128 / k==v，
+  非法配置 abort）。
+- `tools/generate_qwen35_golden.py`（DeltaNet 分支 + `--state-seed` 确定性
+  非零初始状态）、`tools/common/golden_v2.py` +
+  `src/runtime/golden_loader_v2.cpp`（CUDLMG02 DeltaNet 张量集：23 stage +
+  4 state）。
+- 测试：`tests/cpu/test_qwen35_deltanet_config.cpp`（supported-config
+  契约，子进程 abort-check）、`tests/cuda/test_qwen35_deltanet_golden.cpp`
+  （真实 checkpoint 硬门：首 token / 连续 / 非零初始状态，均比对输出 +
+  conv_state + recurrent_state；`--no-gen` 供 memcheck）。
+
+> 注：Phase C **复用** Phase B 已移植的 `int4_gemv_bf16`（W4A16 GEMV，
+> `ca1e8e4` 谱系）作为 4 个 in_proj + out_proj + MLP 的 GEMV，**不是**新的
+> 上游移植；新增的仅是 DeltaNet 专属 kernel 与层接线。
+
+验收证据（RTX 2080 Ti）：三场景硬门全 PASS（A bit-exact、B/C 1 ulp；
+recurrent_state ≤ 5.96e-08）；29/29 ctest；compute-sanitizer memcheck 0
+错误（`benchmarks/sanitizer_qwen35_deltanet.txt`）；no-torch 守卫 CLEAN。
+详见 `docs/qwen35_architecture.md` §15。
