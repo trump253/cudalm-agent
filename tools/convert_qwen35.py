@@ -13,8 +13,10 @@ container whose tensor table follows docs/qwen35_architecture.md §4:
       layernorms, q/k_norm, conv1d.weight, dt_bias, model norm.
   * fp32 pass-through (byte-exact; stored fp32 in the official checkpoint):
       A_log, linear_attn.norm.weight (per-head gated norm).
-  * Skipped (out of v0.2 scope): vision tower, MTP module, embed_tokens
-    (tie_word_embeddings; no embedding/LM head in v0.2).
+  * Skipped (out of per-layer scope): vision tower, MTP module.
+    embed_tokens is skipped in the per-layer path (tie_word_embeddings; no
+    embedding/LM head in v0.2) but IS emitted in the v0.3 full model
+    (--full-model) as the embedding + tied LM head.
 
 All provenance (repo, revision, sha256 of config + checkpoint, transformers
 pin) is written into the container metadata; the config blob is built from
@@ -24,6 +26,7 @@ Usage:
   python3 tools/convert_qwen35.py \
       --checkpoint-dir /root/models/Qwen3.5-0.8B-Base \
       --out data/qwen35_08b.cudalm [--layers 0,1,2,3] [--manifest m.json]
+      [--full-model]   # v0.3: all 24 layers + embedding + final norm + tie
 """
 from __future__ import annotations
 
@@ -229,7 +232,12 @@ def convert(checkpoint_dir: str, out_path: str, layers, manifest_path=None,
         v2.META_TRANSFORMERS_COMMIT: TRANSFORMERS_COMMIT,
         v2.META_TRANSFORMERS_VERSION: f"git+https://github.com/huggingface/transformers@{TRANSFORMERS_COMMIT}",
         v2.META_SOURCE_DTYPE: "bf16",
-        v2.META_GENERATOR: "tools/convert_qwen35.py (CUDALM v0.2)",
+        # Full model (v0.3) is tagged v0.3; the default per-layer path keeps the
+        # historical v0.2 label so existing Phase A-D fixtures/provenance are
+        # unchanged.
+        v2.META_GENERATOR: ("tools/convert_qwen35.py (CUDALM v0.3)"
+                            if full_model
+                            else "tools/convert_qwen35.py (CUDALM v0.2)"),
     }
     if full_model:
         # Record the LM-head weight tying from the pinned config. The pinned

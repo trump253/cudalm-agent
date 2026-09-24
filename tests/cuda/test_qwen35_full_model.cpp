@@ -186,34 +186,58 @@ int gpu_own_reset(const std::string& cudalm_path) {
   }
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  // Sanity: the seed is non-zero.
+  // Sanity: the seed is non-zero in every region the reset check verifies
+  // (DeltaNet conv_state + recurrent_state; full-attention K + V head).
   {
-    float h[4];
-    CUDA_CHECK(cudaMemcpy(h, model.delta(0)->recurrent_state(), sizeof(h),
+    const Qwen35DeltaNetLayer* d0 = model.delta(0);
+    __nv_bfloat16 hc[4];
+    CUDA_CHECK(cudaMemcpy(hc, d0->conv_state(), sizeof(hc),
                           cudaMemcpyDeviceToHost));
-    CHECK(h[0] != 0.0f);
-    __nv_bfloat16 hb[4];
-    CUDA_CHECK(cudaMemcpy(hb, model.attention(3)->kv_cache().k(),
-                          sizeof(hb), cudaMemcpyDeviceToHost));
-    CHECK(__bfloat162float(hb[0]) != 0.0f);
+    CHECK(__bfloat162float(hc[0]) != 0.0f);
+    float hr[4];
+    CUDA_CHECK(cudaMemcpy(hr, d0->recurrent_state(), sizeof(hr),
+                          cudaMemcpyDeviceToHost));
+    CHECK(hr[0] != 0.0f);
+    const Qwen35KvCache& kv3 = model.attention(3)->kv_cache();
+    __nv_bfloat16 hk[4];
+    CUDA_CHECK(cudaMemcpy(hk, kv3.k(), sizeof(hk), cudaMemcpyDeviceToHost));
+    CHECK(__bfloat162float(hk[0]) != 0.0f);
+    __nv_bfloat16 hv[4];
+    CUDA_CHECK(cudaMemcpy(hv, kv3.v(), sizeof(hv), cudaMemcpyDeviceToHost));
+    CHECK(__bfloat162float(hv[0]) != 0.0f);
   }
 
   // Reset the whole model (covers all 24 layers).
   model.reset_state(stream);
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  // Every layer's state must now be zero (DeltaNet recurrent_state; FA KV).
+  // Every layer's state must now be zero. Verify BOTH of each type's seeded
+  // regions (no need to read back the whole KV — just the seeded region):
+  //   DeltaNet      : conv_state == 0  AND  recurrent_state == 0
+  //   FullAttention : seeded K head == 0  AND  seeded V head == 0
   for (int i = 0; i < 24; ++i) {
     if (model.is_linear_attention(i)) {
-      float h[32];
-      CUDA_CHECK(cudaMemcpy(h, model.delta(i)->recurrent_state(), sizeof(h),
+      const Qwen35DeltaNetLayer* d = model.delta(i);
+      // conv_state bf16 (seeded whole; verify the head is zero).
+      __nv_bfloat16 hc[32];
+      CUDA_CHECK(cudaMemcpy(hc, d->conv_state(), sizeof(hc),
                             cudaMemcpyDeviceToHost));
-      for (int j = 0; j < 32; ++j) CHECK(h[j] == 0.0f);
+      for (int j = 0; j < 32; ++j) CHECK(__bfloat162float(hc[j]) == 0.0f);
+      // recurrent_state fp32 (seeded whole; verify the head is zero).
+      float hr[32];
+      CUDA_CHECK(cudaMemcpy(hr, d->recurrent_state(), sizeof(hr),
+                            cudaMemcpyDeviceToHost));
+      for (int j = 0; j < 32; ++j) CHECK(hr[j] == 0.0f);
     } else {
-      __nv_bfloat16 h[64];
-      CUDA_CHECK(cudaMemcpy(h, model.attention(i)->kv_cache().k(), sizeof(h),
-                            cudaMemcpyDeviceToHost));
-      for (int j = 0; j < 64; ++j) CHECK(__bfloat162float(h[j]) == 0.0f);
+      const Qwen35KvCache& kv = model.attention(i)->kv_cache();
+      // Seeded K head (verify zero).
+      __nv_bfloat16 hk[64];
+      CUDA_CHECK(cudaMemcpy(hk, kv.k(), sizeof(hk), cudaMemcpyDeviceToHost));
+      for (int j = 0; j < 64; ++j) CHECK(__bfloat162float(hk[j]) == 0.0f);
+      // Seeded V head (verify zero).
+      __nv_bfloat16 hv[64];
+      CUDA_CHECK(cudaMemcpy(hv, kv.v(), sizeof(hv), cudaMemcpyDeviceToHost));
+      for (int j = 0; j < 64; ++j) CHECK(__bfloat162float(hv[j]) == 0.0f);
     }
   }
 
