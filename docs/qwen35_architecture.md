@@ -705,10 +705,10 @@ micro-stack 最终输出（layer 3 final）。
   - **B（p=0→1→2 顺序）**：t=0 位级精确；t=1/t=2 逐层 stage + 状态在复合
     容差内（worst bf16 3.9e-2、fp32 3.1e-3）；逐层链（layer L 输入 ==
     layer L-1 输出）+ micro-stack final 全 OK。
-- 完整 `ctest`：**32/32 PASS**（旧 v0.1/v0.1.1 回归 + Phase A 摄入 +
+- 完整 `ctest`：**33/33 PASS**（旧 v0.1/v0.1.1 回归 + Phase A 摄入 +
   Phase B 单元 + Phase B golden + Phase C 契约 + Phase C golden +
   **Phase D micro-stack golden** + Phase D `--tokens` 校验 + v0.3 Phase A
-  full-model）。
+  full-model + v0.3 Phase B full-forward）。
 - `compute-sanitizer --tool memcheck`：**0 错误**（micro-stack golden
   `--no-gen` CUDA-only 路径，**覆盖连续多 token micro-stack 运行**——场景 B
   的 p=0→1→2 全链；证据 `benchmarks/sanitizer_qwen35_hybrid_microstack.txt`）。
@@ -846,7 +846,8 @@ checkpoint = `Qwen3.5-0.8B-Base`（`raw/config.json` + `model.safetensors`，
   （DeltaNet 经 `seed_state` H2D；FA 经 `cudaMemsetAsync`），reset 后逐层回读
   全部归零。
 - 新增 `test_qwen35_full_model`（CPU 结构门 + GPU 所有权/状态门；无 checkpoint
-  时 self-skip 77）。完整 ctest **32/32 PASS**（旧 31 全回归 + 1 full-model）；
+  时 self-skip 77）。完整 ctest **33/33 PASS**（旧 31 全回归 + 1 Phase A
+  full-model + 1 Phase B full-forward）；
   `check_no_torch.sh` **CLEAN**；
   `compute-sanitizer --tool memcheck` **0 错误**（`--no-gen` CUDA-only 路径，
   覆盖全模型 load + 24 层 seed + reset + unload 的**新 CUDA 分配生命周期**）。
@@ -854,3 +855,107 @@ checkpoint = `Qwen3.5-0.8B-Base`（`raw/config.json` + `model.safetensors`，
 **Phase A 后 STOP** —— v0.3 Phase A（完整 24 层结构 + 权重摄入口径 + 模型骨架
 所有权/状态生命周期）已完成并推送 `v0.3-full-model`。**不自动开始**全模型
 forward / logits（v0.3 Phase B）。
+
+## 18. v0.3 Phase B —— 完整单-token forward 契约（钉死，来自 pinned 官方源）
+
+范围 = 真实 Qwen3.5-0.8B 的**完整单-token forward**（correctness bring-up）：
+`token_id → embedding → layers 0..23 → final RMSNorm → tied LM head →
+logits [248320]`。**不做** generation / tokenizer / sampling / benchmark 优化。
+
+全部来自 pinned 官方源 `transformers@fc9137225880`（`modeling_qwen3_5.py`，
+下称 `modeling`），无通用 Qwen 经验推断：
+
+- **embedding lookup（dtype/rounding）**：`Qwen3_5TextModel.forward` 里
+  `inputs_embeds = self.embed_tokens(input_ids)`（`modeling` L1325）；
+  `embed_tokens = nn.Embedding(vocab_size=248320, hidden_size=1024)`（L1298）。
+  `nn.Embedding` 是**纯索引拷贝**（无算术、无舍入）：`out[batch,t,:] =
+  weight[input_ids[batch,t], :]`。权重 BF16 → 输出 **BF16 `[1024]`**，与
+  `embed_tokens.weight[token_id]` **逐位一致**。
+- **24 层执行顺序**：`for layer_idx, decoder_layer in
+  enumerate(self.layers[:num_hidden_layers]): hidden_states =
+  decoder_layer(hidden_states, ...)`（L1370-1379）。**顺序** 0→23；第 L 层输入 =
+  第 L-1 层输出（第 0 层输入 = embedding）。每层数学 = 冻结 v0.2 Phase B/C
+  （§7/§8），此处不重复。
+- **final RMSNorm 精确语义**：`hidden_states = self.norm(hidden_states)`
+  （L1381）；`norm = Qwen3_5RMSNorm(hidden_size=1024, eps=1e-6)`（L1302）。
+  `Qwen3_5RMSNorm.forward`（L807-819）精确为：
+  `out = ( x.float() * rsqrt(mean(x.float()^2) + eps) * (1.0 + w.float()) )`
+  全链 **fp32**，末尾 **一次** `.type_as(x)` 回 BF16（RNE）。weight 初始化为
+  0（`nn.Parameter(torch.zeros(dim))`）→ **零中心**（有效缩放 = `1 + w`），
+  与 §6.1 / 现有 `qwen35_rmsnorm_zc_bf16` kernel **同一公式**（复用，不新写）。
+- **tied LM head 精确数学**：`logits = self.lm_head(hidden_states[:,
+  slice_indices, :])`（L1957）；`lm_head = nn.Linear(1024, 248320, bias=False)`
+  （L1833）；`_tied_weights_keys = {"lm_head.weight":
+  "model.language_model.embed_tokens.weight"}`（L1825）+ `post_init()` →
+  `lm_head.weight` **就是** `embed_tokens.weight`（**同一份 BF16 `[248320,1024]`**，
+  无独立张量）。单 token：`logits[v] = Σ_h normed_hidden[h] ·
+  embed_tokens.weight[v, h]`，即 `logits = normed_hidden @ embedding^T`。
+- **logits 输出 dtype**：源注释「do not upcast them to float if we are not
+  computing the loss」（L1955）；`nn.Linear(BF16 输入, BF16 权重) → BF16`
+  输出。故 `logits` = **BF16 `[248320]`**。
+- **accumulation / rounding boundaries（逐段舍入契约）**：
+  1. embedding：**无舍入**（BF16 行拷贝）；
+  2. 每层：冻结 v0.2 逐 stage 契约（BF16 stage 边界单次 RNE；DeltaNet
+     recurrent 状态 FP32）；
+  3. final norm：**fp32 全链 + 末一次 BF16 RNE**；
+  4. tied LM head：BF16 GEMV，**fp32 累加 + 每个输出元素一次 BF16 RNE**
+     （对齐 PyTorch bf16 `nn.Linear` 的 cublas fp32-acc 语义；累加**顺序**
+     与 cublas 可不同，但都是合法 fp32 顺序 → 差在 fp32 舍入界内，golden 容差
+     覆盖，见 §18.1）。
+
+### 18.1 LM head GEMV（新增 BF16 GEMV kernel）与 golden 容差
+
+- 新增 `bf16_gemv`（`kernels/bf16_gemv.h/.cu`）：`y[n] = Σ_k W[n,k]·x[k]`，
+  `W` BF16 `[N,K]`、`x` BF16 `[K]`、`y` BF16 `[N]`；**fp32 累加 + 单次 BF16
+  RNE store**。参考 frozen `CUDALab@cb6a6a9` 的 FP16 GEMV proven 结构
+  （`kernels/gemv/gemv_vec4_row.cu`：16B 向量 load、每行一 block、fp32 累加、
+  warp+shared 归约）适配到 raw pointer + cudaStream_t + BF16 + `[V=248320,
+  K=1024]`；标量回退路径同 `gemv_scalar_kernel`。详见 `docs/provenance.md`。
+- **golden 容差**：24 层 BF16 链 + fp32 recurrent 状态跨层复合误差，从 v0.2
+  标准出发（bf16 stage atol=rtol=1e-2；fp32 状态 atol=1e-5/rtol=1e-4 紧标准）。
+  最终 **FULL logits `[248320]`** 做**全向量** golden 比较（非 top-k）；若实测
+  24 层链需要放宽，只按实测设**最小必要 envelope** 并记录 rationale（§18.2）。
+
+### 18.2 实测最小必要 envelope 与 rationale
+
+`test_qwen35_full_forward`（真实 checkpoint，A：p0 fresh；B：p0→p1→p2 顺序、
+runtime 自线程状态）对**每 token**比较：embedding / 24× 层 final / final norm /
+**FULL logits `[248320]`** / 18× DeltaNet conv+recurrent / 6× FA K/V rows 0..p。
+tolerance = 各类别在确定性 A+B 运行的**实测 max 误差** + ~10-15% 余量（下表）。
+embedding 为纯行拷贝，**bit-exact（max=0）**。
+
+| 类别 | dtype | 实测 max | 采用 atol（rtol=0） |
+| --- | --- | --- | --- |
+| model.embedding_output | bf16 | 0（bit-exact） | 0 |
+| 24× layer final_output | bf16 | 0.0781（@L23） | 0.09 |
+| model.final_norm_output | bf16 | 0.4453 | 0.5 |
+| model.logits `[248320]` | bf16 | 0.3125 | 0.35 |
+| 18× DeltaNet conv_after | bf16 | 0.2813（场景 B） | 0.31 |
+| 6× FA K/V rows | bf16 | 0.1094 (k) / 0.0938 (v) | 0.12 |
+| 18× DeltaNet recurrent | fp32 | 0.0472 | 0.055 |
+
+**为什么是这些量级（而非 v0.2 的 1e-2）**：v0.2 标准是**单层**（或 4 层
+micro-stack，worst 3.9e-2）的界。完整 24 层 BF16 链把每层 ~1-ulp 的 GEMV
+**fp32 累加顺序**差异（runtime `int4_gemv_bf16`/`bf16_gemv` vs golden 的
+fp32 matmul）**逐层复合**：layer final 误差随深度**平滑单调**增长
+（L0 4.9e-4 → L9 1.6e-2 → L23 7.8e-2，**无突变**）；final norm 的 `(1+w)`
+零中心缩放把 L23 误差放大（worst 0.4453）；`[vocab]` logits GEMV 再复合
+（worst 0.3125）。
+
+**为何确定是舍入复合、而非错 stage/错权重/错 dtype（那会是 O(1)）**：
+(a) embedding **bit-exact**（lookup 正确）；(b) layer final **平滑单调**增长、
+**无单层突变**（若是某层错权重/错索引，会在该层出现 O(1) 跳变）；(c) **全部
+持久状态**（18× DeltaNet conv/recurrent + 6× FA K/V rows 0..p）在**小量级**
+内匹配且随深度增长（层内数学正确）；(d) 冻结 v0.2 单层在 micro-stack golden
+已通过 1e-2（单层正确）。
+
+### 18.3 签核证据（本次运行，RTX 2080 Ti / CUDA 11.8）
+
+- 真实 checkpoint 完整 forward PASS：A（p0 fresh）+ B（p0→p1→p2 顺序，runtime
+  自线程状态）全部类别在 §18.2 envelope 内（`test_qwen35_full_forward`）。
+- 完整 ctest **33/33 PASS**（旧 31 全回归 + 1 v0.3 Phase A full-model +
+  **1 v0.3 Phase B full-forward**）。
+- `scripts/check_no_torch.sh` **CLEAN**（include/、src/ 无 torch/pybind）。
+- `compute-sanitizer --tool memcheck` **0 错误**（`--no-gen` CUDA-only 路径，
+  覆盖**新增 `bf16_gemv` LM-head kernel + 完整 24 层 forward** 的新 CUDA 分配
+  生命周期）。

@@ -337,6 +337,25 @@ if(CUDALM_PYTHON3)
                      ${CMAKE_SOURCE_DIR})
     set_tests_properties(test_qwen35_full_model PROPERTIES
       SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+    # v0.3 Phase B: full single-token forward golden hard gate. Runs the
+    # COMPLETE model (embedding -> 24 layers -> final RMSNorm -> tied LM head
+    # -> logits) on deterministic tokens (A: p0; B: p0->p1->p2, runtime threads
+    # its own state) and compares embedding output + 24x layer final output +
+    # final norm + FULL logits [vocab] + 18x DeltaNet conv/recurrent state +
+    # 6x FullAttention KV rows 0..p against the pinned-quantized oracle.
+    # Self-skips (77) when the checkpoint is absent.
+    add_executable(test_qwen35_full_forward cuda/test_qwen35_full_forward.cpp)
+    target_link_libraries(test_qwen35_full_forward PRIVATE cudalm)
+    add_test(NAME test_qwen35_full_forward
+             COMMAND test_qwen35_full_forward
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR}
+                     ${CMAKE_BINARY_DIR}/data/qwen35_full)
+    set_tests_properties(test_qwen35_full_forward PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
   else()
     message(STATUS "tool python lacks torch/safetensors/numpy: "
                    "qwen35 ingestion tests disabled")

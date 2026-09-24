@@ -84,6 +84,35 @@ class Qwen35Model {
   // state) and are unaffected.
   void reset_state(cudaStream_t stream);
 
+  // ---- Full single-token forward (v0.3 Phase B; docs §18) ----------------
+  // Run the COMPLETE model on ONE token at `position`:
+  //   embedding[token_id] -> layer 0 -> ... -> layer 23 -> final RMSNorm
+  //   -> tied LM head (embedding^T) -> logits [vocab_size].
+  // Uses the layers' OWN persistent state (DeltaNet conv/recurrent, full-
+  // attention KV) — it is updated in place, so a sequential forward
+  // (p0, p1, p2) threads each layer's state across the steps (call
+  // reset_state() first for a fresh-state run). Precondition (host-checked,
+  // abort on violation): loaded, 0 <= token_id < vocab_size,
+  // 0 <= position < max_seq_len.
+  void forward_token(int token_id, int position, cudaStream_t stream);
+
+  // ---- Forward outputs (device; valid from forward_token until the next) --
+  // Embedding output [hidden_size] bf16 (= embed_tokens.weight[token_id]).
+  const __nv_bfloat16* embedding_output() const {
+    return embed_out_.data<__nv_bfloat16>();
+  }
+  // Final-norm output [hidden_size] bf16 (the model's last_hidden_state).
+  const __nv_bfloat16* final_norm_output() const {
+    return norm_out_.data<__nv_bfloat16>();
+  }
+  // FULL logits [vocab_size] bf16 (tied LM head over the final-norm output).
+  const __nv_bfloat16* logits() const {
+    return logits_buf_.data<__nv_bfloat16>();
+  }
+  // Each layer's final output [hidden_size] bf16 (dispatches on the layer
+  // type; null if `i` invalid or not loaded).
+  const __nv_bfloat16* layer_final_output(int i) const;
+
  private:
   using LayerObj =
       std::variant<std::unique_ptr<Qwen35DeltaNetLayer>,
@@ -103,6 +132,11 @@ class Qwen35Model {
   TensorView embed_{};
   TensorView norm_{};
   TensorView lm_head_{};
+  // Forward scratch + output buffers (allocated in load(); sized by config):
+  // embedding output [hidden], final-norm output [hidden], logits [vocab].
+  DeviceBuffer embed_out_{};
+  DeviceBuffer norm_out_{};
+  DeviceBuffer logits_buf_{};
   bool tie_ = false;
   bool loaded_ = false;
 };
