@@ -397,12 +397,14 @@ decoding 编排 kernel 可移植（其 generation 是 Python 采样循环，Phas
   1800，`--no-gen` 供 memcheck）：场景 A（短 confident prompt，8 token）+ B
   （长 confident prompt，16 token，最终状态）+ C（repeat-generate 污染门，
   **强化**：两次 generate 用 `LogitsObserver` 抓 **EVERY 生成步全 [248320]
-  logits** 逐 step **bit-exact** 比较，证明第二次 reset 后数值轨迹与第一次相
+  logits** 逐 step **原始字节（memcmp）bit-exact** 比较（**非**仅数值相等，`+0/-0`
+   等 bit 不同也 FAIL），证明第二次 reset 后数值轨迹与第一次相
   同，而非仅 greedy token 恰好没变）。比较 **EVERY 生成 token id** + **EVERY
   生成步全 [248320] logits** + stop_reason + forward_count（== t_used）+（B）
   最终混合持久状态（18× DeltaNet conv/recurrent + 6× FA K/V used rows），
   **收紧的 per-step / per-layer envelope**（每步 / 每层独立 = 实测 worst × 1.3
-  + 0.01，**非**共享 atol；recurrent 实测 ≤ 0.0326、**非** 0.5）。
+  + floor，**非**共享 atol；**BF16** logits/conv/KV 用 `+ 0.01`、**FP32**
+  recurrent 用 `+ 0.001`；recurrent 实测 ≤ 0.0326、**非** 0.5）。
 - **`test_qwen35_generation_contract`**（real-checkpoint 门，self-skip 77）：
   生成核**输入契约** hardening —— `not_loaded` / 空 prompt / 非法 token id
   （<0 与 ≥vocab）/ 非法 eos（<0 与 ≥vocab）/ `max_new_tokens < 0` /

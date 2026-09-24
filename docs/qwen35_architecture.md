@@ -1072,11 +1072,14 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    min gap **1.0625**（A=[1024,2048,3072]）/ **3.625**（B=[1024,2048,3072]×5+
    [1024]）。
  - **收紧的 per-step / per-layer envelope**：比较阈值**不**用共享 atol，而是
-   每步 / 每层独立 envelope = `实测 worst × 1.3 + 0.01`（**不让**某个 late
-   layer / worst step 放宽其他 step/layer）：per-step 全 logits envelope（A 8
+   每步 / 每层独立 envelope = `实测 worst × 1.3 + floor`（**不让**某个 late
+   layer / worst step 放宽其他 step/layer）。**BF16 与 FP32 状态用不同
+   floor**：per-step 全 logits + DeltaNet conv + FullAttention KV（均 BF16）
+   用 `+ 0.01`；DeltaNet **recurrent（FP32）** 用 `+ 0.001`（其 chain 更紧，
+   实测 worst ~0.033，远低于 0.01 floor）。envelope：per-step 全 logits（A 8
    步 / B 16 步各自）+ per-layer DeltaNet conv / recurrent / FullAttention KV
-   envelope（B 最终状态：18× conv/recurrent + 6× KV，非适用层为 0）。实测
-   worst（pinned oracle，RTX 2080 Ti）：per-step logits ≤ 0.5625（A t4）、
+   （B 最终状态：18× conv/recurrent + 6× KV，非适用层为 0）。实测 worst
+   （pinned oracle，RTX 2080 Ti）：per-step logits ≤ 0.5625（A t4）、
    conv ≤ 0.15625（L17）、recurrent ≤ 0.0326（L20，**非** 0.5）、KV ≤ 0.1875
    （L11 K）。每次运行 compare 打印 max_abs，可重新收紧到实测误差（非猜值）。
 
@@ -1089,7 +1092,8 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
  - **`test_qwen35_generation`**（real checkpoint，self-skip 77）：场景 A（短
    confident prompt，8 token）+ B（长 confident prompt，16 token，最终状态）+
    C（repeat-generate 污染门，**强化**：两次 `generate()` 用 `LogitsObserver`
-   抓 **EVERY 生成步全 [248320] logits** 逐 step **bit-exact** 比较，证明第二次
+   抓 **EVERY 生成步全 [248320] logits** 逐 step **原始字节（memcmp）bit-exact** 比较（**非**仅数值相等，`+0/-0`
+   等 bit 不同也 FAIL），证明第二次
    reset 后数值轨迹与第一次相同，而非仅 greedy token 恰好没变）。比较 **EVERY
    生成 token id** + **EVERY 生成步全 [248320] logits**（per-step envelope）+
    stop_reason + forward_count（== t_used）+（B）最终混合持久状态（18× DeltaNet

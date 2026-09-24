@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -73,8 +74,14 @@ static const int kMaxB = 16;
 // The measured worsts below are the deterministic A+B run (pinned oracle, the
 // confident prompts, RTX 2080 Ti / CUDA 11.8); the compare re-logs max_abs on
 // every run so these can be re-tightened to the measured error (not a guess).
+//
+// The BF16 state (per-step logits / DeltaNet conv / FullAttention KV) and the
+// FP32 DeltaNet recurrent state use DIFFERENT floors: the FP32 recurrent chain
+// is tighter (its measured worst is ~0.033, far below a 0.01 floor), so it gets
+// a 0.001 floor instead of the 0.01 the BF16 tensors use.
 static const double kEnvelopeFactor = 1.3;
-static const double kEnvelopeFloor = 0.01;
+static const double kEnvelopeFloor = 0.01;    // BF16: per-step logits / conv / KV
+static const double kRecEnvelopeFloor = 0.001;  // FP32: DeltaNet recurrent state
 // Scenario A per-step FULL-logits worsts (t0..t7).
 static const double kLogitsWorstA[8] = {
     0.164550781, 0.1875, 0.34375, 0.53515625, 0.5625, 0.42578125, 0.46875,
@@ -112,7 +119,9 @@ double logits_atol_b(int step) {
 double conv_atol(int L) {
   return kConvWorst[L] * kEnvelopeFactor + kEnvelopeFloor;
 }
-double rec_atol(int L) { return kRecWorst[L] * kEnvelopeFactor + kEnvelopeFloor; }
+double rec_atol(int L) {
+  return kRecWorst[L] * kEnvelopeFactor + kRecEnvelopeFloor;
+}
 double kv_atol(int L) { return kKvWorst[L] * kEnvelopeFactor + kEnvelopeFloor; }
 
 int run_cmd(const std::string& cmd) {
@@ -444,7 +453,11 @@ int test_contamination(Qwen35Model& model, cudaStream_t stream,
                          "inherited the first's state)\n");
     rc |= 1;
   }
-  // The per-step FULL logits must be identical (require bit-exact: 0.0 diff).
+  // The per-step FULL BF16 logits must be TRULY bit-exact (the second call's
+  // numerical trajectory after the reset == the first's). Use memcmp on the raw
+  // bf16 bytes: ANY bit mismatch fails — including +0/-0 etc. that a float
+  // value comparison would treat as equal. max_abs is reported for diagnostics
+  // only and is NOT the gate.
   if (c1.steps.size() != c2.steps.size()) {
     std::fprintf(stderr, "  FAIL: step count differs (%zu vs %zu)\n",
                  c1.steps.size(), c2.steps.size());
@@ -459,19 +472,19 @@ int test_contamination(Qwen35Model& model, cudaStream_t stream,
         rc |= 1;
         continue;
       }
+      if (std::memcmp(c1.steps[i].data(), c2.steps[i].data(),
+                      static_cast<std::size_t>(V) * sizeof(__nv_bfloat16)) !=
+          0) {
+        exact = false;
+      }
+      // max_abs (float) is for diagnostics only; the gate is bit-exact.
       for (int t = 0; t < V; ++t) {
-        const float a = __bfloat162float(c1.steps[i][t]);
-        const float b = __bfloat162float(c2.steps[i][t]);
-        const double d = std::fabs(a - b);
+        const double d = std::fabs(__bfloat162float(c1.steps[i][t]) -
+                                   __bfloat162float(c2.steps[i][t]));
         if (d > max_diff) max_diff = d;
-        const std::uint16_t ab =
-            *reinterpret_cast<const std::uint16_t*>(&c1.steps[i][t]);
-        const std::uint16_t bb =
-            *reinterpret_cast<const std::uint16_t*>(&c2.steps[i][t]);
-        if (ab != bb) exact = false;
       }
     }
-    if (max_diff > 0.0) rc |= 1;  // require bit-exact
+    if (!exact) rc |= 1;  // require bit-exact (memcmp == 0)
     std::fprintf(stderr, "  %-42s %zu steps, max_abs=%.9g (%s) — %s\n",
                  "C.repeat_logits", c1.steps.size(), max_diff,
                  exact ? "bit-exact" : "NOT bit-exact",
