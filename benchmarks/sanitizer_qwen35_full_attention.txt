@@ -1,0 +1,49 @@
+# compute-sanitizer memcheck — CUDALM v0.2 Phase B (Qwen3.5 Full Attention)
+#
+# Host: RTX 2080 Ti (sm_75), CUDA 11.8, single device (CUDA_VISIBLE_DEVICES=0)
+# Tool: /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck
+#        --error-exitcode 99
+#
+# Scope: every new Phase B kernel + the full Qwen35FullAttentionLayer memory
+# surface (2x 262144x256x2B bf16 KV cache, 21 stage buffers, 8.4MB attention
+# scratch, RoPE table, D2D/D2H staging). The bench leaves the KV cache at its
+# ZERO-INITIALIZED state at every position (see Notes).
+#
+#   $ compute-sanitizer --tool memcheck --error-exitcode 99 \
+#       build/tests/test_qwen35_kernels
+#   [PASS] test_qwen35_kernels
+#   ========= ERROR SUMMARY: 0 errors
+#
+#   $ compute-sanitizer --tool memcheck --error-exitcode 99 \
+#       build/tests/test_int4_gemv_bf16
+#   [PASS] test_int4_gemv_bf16
+#   ========= ERROR SUMMARY: 0 errors
+#
+#   $ compute-sanitizer --tool memcheck --error-exitcode 99 \
+#       build/benchmarks/bench_qwen35_full_attention \
+#       build/data/qwen35_08b_l3.cudalm 0 3 /tmp/bench_san.json
+#   wrote /tmp/bench_san.json
+#   ========= ERROR SUMMARY: 0 errors
+#
+#   $ compute-sanitizer --tool memcheck --error-exitcode 99 \
+#       build/benchmarks/bench_qwen35_full_attention \
+#       build/data/qwen35_08b_l3.cudalm 5 3 /tmp/bench_san5.json
+#   wrote /tmp/bench_san5.json
+#   ========= ERROR SUMMARY: 0 errors
+#
+# Notes:
+# - benchmark p=5 runs the SAME layer construction + forward path as
+#   test_qwen35_full_attention_golden, but with the KV cache at its
+#   ZERO-INITIALIZED state: it covers the p>0 addressing / memory-access
+#   surface (cache rows 0..5 read and written) at context depth 5, with
+#   zeroed history content (the bench never seeds KV history).
+# - golden p=5 uses a NON-ZERO seeded KV history (the golden test seeds its
+#   cache from the golden file via plain cudaMemcpyAsync H2D row copies —
+#   no new memory surface beyond what the bench above already exercised).
+# - test_qwen35_full_attention_golden itself could not be run under the
+#   sanitizer in this environment: the CUDA 11.8 sanitizer launcher hangs in
+#   a futex wait after the test's system()-spawned Python oracle steps
+#   (GPU idle, no CUDA context created — a compute-sanitizer/fork-exec
+#   launcher issue, not a memory fault). The unit tests above prove the
+#   sanitizer works in this environment; the bench above covers the same GPU
+#   memory surface as the golden test's C++ phase (zero-initialized KV).

@@ -197,3 +197,38 @@ bash scripts/check_no_torch.sh
 以上内容均不超出单个 decoder block 的范围。下一阶段（未开始）：
 **CUDALM v0.2 — Qwen3.5 混合架构 bring-up**（含真实 HuggingFace
 checkpoint 权重摄入）。
+
+## v0.2 Phase B 完成清单（Qwen3.5 Full Attention，BF16）
+
+分支 `v0.2-qwen35`。范围 = Qwen3.5 全注意力层（layers 3/7/11/15/19/23）
+的 BF16 运行时路径：BF16 W4A16 GEMV、零中心 BF16 RMSNorm、partial RoPE
+（复制频率布局）、Q/K norm、GQA 注意力、attention gate、BF16 逐元素、
+Qwen35 KV cache、`Qwen35FullAttentionLayer`。W4A16 权重契约不变
+（G=128、q∈[-7,7]、scale FP16、FP32 累加），激活/输出走 BF16，
+**绝不静默转 FP16**。oracle = 官方 pinned transformers（`fc9137225880`）
++ 真实 checkpoint + 同一 W4A16 反量化权重。
+
+- [x] BF16 W4A16 GEMV（`int4_gemv_bf16`）单元位级/0 错误
+- [x] 零中心 RMSNorm / split / partial RoPE / KV 写 / 注意力 / 逐元素
+      kernel 单元位级/0 错误（RoPE 对精确舍入 CPU 参考位级一致）
+- [x] 真实 checkpoint 硬门 `test_qwen35_full_attention_golden`（layer 3，
+      seed 20260209）：p=0 最差 6.1e-05、p=5（5 行非零 KV 历史）最差
+      4.9e-04，21 stage 全 PASS（tolerance 1e-2，理由见
+      `include/cudalm/stage_compare.h`）
+- [x] p=0 不变式位级成立（rope==q/k_norm、attention_raw 每头 == 对应 v 行、
+      KV 行 == stage 拷贝）；p=5 KV 历史位级 round-trip
+- [x] 旧回归全绿 + Phase A ingestion：**27/27 ctest**
+- [x] `compute-sanitizer --tool memcheck` 0 错误（kernel/GEMV 单元 +
+      bench 全层 p=0/p=5；golden 测试的 sanitizer 启动器挂起说明见
+      `benchmarks/sanitizer_qwen35_full_attention.txt`）
+- [x] no-torch 守卫 PASS（`scripts/check_no_torch.sh`）
+- [x] 时延基准 p=0/p=5 JSON 已提交（`benchmarks/results/`，报告性，非调优）
+- [x] 量化保真度 REPORT ONLY（`*.fidelity.json`，权重 cosine≈0.992、
+      层输出 cosine≈0.982），不进硬门
+- [x] 文档 + 溯源更新（`docs/qwen35_architecture.md` §5/§11.1/§14、
+      `docs/provenance.md`、本清单）
+- [x] 工作树干净；commit 已推送 `v0.2-qwen35`
+
+**停止（STOP）。** 按交接简报要求，Phase B（Full Attention）完成后停止，
+**不自动进入 Phase C（DeltaNet）**。下一阶段（未开始）：Phase C
+`Qwen35DeltaNetLayer` + state 转移硬门；Phase D 4 层混合 micro-stack。

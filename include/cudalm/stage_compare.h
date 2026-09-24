@@ -65,6 +65,17 @@ struct StageCompareResult {
   double max_rel_err = 0.0;
 };
 
+// Bit-exact IEEE-754 bfloat16 -> binary32 decode (host, no libm beyond
+// cmath). bf16 IS the high 16 bits of the fp32 representation, so the
+// decode is a pure left shift; NaN payloads are preserved in the low 16
+// mantissa bits of the float NaN, infinities/±0 map exactly.
+inline float bf16_bits_to_f32(std::uint16_t h) {
+  const std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
+  float f;
+  std::memcpy(&f, &bits, 4);
+  return f;
+}
+
 // Elementwise comparison of two fp16 arrays (raw bit patterns).
 // Pass criterion per element: |a - r| <= atol + rtol * |r|.
 // NaN/inf in `act` always fails (the comparison with NaN is false).
@@ -78,6 +89,41 @@ inline StageCompareResult compare_fp16_stages(const std::uint16_t* ref,
   for (std::size_t i = 0; i < n; ++i) {
     const double r = static_cast<double>(fp16_bits_to_f32(ref[i]));
     const double a = static_cast<double>(fp16_bits_to_f32(act[i]));
+    const double d = std::fabs(a - r);
+    const double rel = d / std::fmax(std::fabs(r), 1.0);
+    if (d > res.max_abs_err) {
+      res.max_abs_err = d;
+      res.max_abs_idx = i;
+    }
+    if (rel > res.max_rel_err) res.max_rel_err = rel;
+    if (!(d <= atol + rtol * std::fabs(r))) res.ok = false;
+  }
+  return res;
+}
+
+// Elementwise comparison of two BF16 arrays (raw bit patterns; the v0.2
+// Qwen3.5 stage path). Same pass criterion as the fp16 comparator.
+//
+// v0.2 tolerance rationale (docs/qwen35_architecture.md §14): the golden
+// and the kernels round to bf16 at the SAME stage boundaries (the official
+// bf16 dtype flow), so per-element differences are at most a few bf16 ulps
+// from (a) fp32 re-association of the GEMV/attention sums and (b) ~1-ulp
+// host/device libm differences in expf/cosf/sinf before the bf16 rounding.
+// A bf16 ulp near 1.0 is ~3.9e-3 (8-bit mantissa); the default
+// atol = rtol = 1e-2 is ~2.5 ulps — loose enough for any faithful
+// re-association, tight enough to catch wrong-stage / wrong-index /
+// wrong-weight / wrong-dtype bugs, which are O(1).
+// NaN/inf in `act` always fails (the comparison with NaN is false).
+inline StageCompareResult compare_bf16_stages(const std::uint16_t* ref,
+                                              const std::uint16_t* act,
+                                              std::size_t n,
+                                              double atol = 1e-2,
+                                              double rtol = 1e-2) {
+  StageCompareResult res;
+  res.n = n;
+  for (std::size_t i = 0; i < n; ++i) {
+    const double r = static_cast<double>(bf16_bits_to_f32(ref[i]));
+    const double a = static_cast<double>(bf16_bits_to_f32(act[i]));
     const double d = std::fabs(a - r);
     const double rel = d / std::fmax(std::fabs(r), 1.0);
     if (d > res.max_abs_err) {
