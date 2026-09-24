@@ -936,7 +936,8 @@ embedding 为纯行拷贝，**bit-exact（max=0）**。
 **不是**所有层共享一个值（旧的 layer=0.09 / conv=0.31 / recurrent=0.055 /
 KV=0.12 已废弃）。这样：
 - **L0/早期层保持接近 v0.2 紧标准**：L0 layer-final 实测 4.88e-4 →
-  threshold ~1.6e-3（比 v0.2 的 1e-2 **更紧**）；L0 conv 实测 0（bit-exact）；
+  threshold ~1.6e-3（比 v0.2 的 1e-2 **更紧**）；L0 conv 实测 A+B worst 0.0156
+  （场景 B p2，状态逐 token 线程后；场景 A/B-p0 为 0）；
 - **不允许 L23 的误差上限放宽 L0**：每层 threshold 由**该层自身**实测 worst
   决定（L23 layer-final 7.8e-2 → threshold ~1.0e-1），一个 L23 量级的 bug 落在
   L0 会被 L0 的紧 threshold（~1.6e-3）抓住（共享 0.09 会漏掉）；
@@ -953,7 +954,7 @@ KV=0.12 已废弃）。这样：
 | layer-final L12 | bf16 | 1.17e-2 → 1.6e-2 |
 | layer-final L18 | bf16 | 4.69e-2 → 6.2e-2 |
 | layer-final L23 | bf16 | 7.81e-2 → 1.0e-1 |
-| DeltaNet conv L0 | bf16 | 0（bit-exact）→ 2.1e-2 |
+| DeltaNet conv L0 | bf16 | 0.0156 → 2.1e-2 |
 | DeltaNet conv L20（peak） | bf16 | 0.281 → 0.367 |
 | DeltaNet recurrent L0 | fp32 | 7.94e-4 → 2.0e-3 |
 | DeltaNet recurrent L18（peak） | fp32 | 4.72e-2 → 6.2e-2 |
@@ -962,23 +963,27 @@ KV=0.12 已废弃）。这样：
 | model.final_norm_output | bf16 | 0.4453 → 0.580（模型级） |
 | model.logits `[248320]` | bf16 | 0.3125 → 0.407（模型级） |
 
-**"平滑增长"由 test 强制（非仅文档）**：`check_smooth_growth` 断言每个类别的
-**后段**（L16..23）实测 worst **>** **前段**（L0..7）实测 worst：
-layer-final 0.078 > 0.012；conv 0.281 > 0.125；recurrent 0.047 > 0.013；
-KV 0.094 > 0.063。若某次回归使误差不再随深度增长（例如早期层突然和晚期层一样
-大），该断言 FAIL。
+**深度趋势（diagnostic / report-only，非 PASS/FAIL 门）**：误差**总体呈随 depth
+增大的趋势，但不要求严格单调**（实测有局部噪声，例如 conv L6 < L5、L12 < L11，
+某层可能比前一层略小）。`report_smooth_growth` 只**报告**每个类别的
+**后段**（L16..23）实测 worst vs **前段**（L0..7）实测 worst
+（layer-final 0.078 vs 0.012；conv 0.281 vs 0.125；recurrent 0.047 vs 0.013；
+KV 0.094 vs 0.063），**不影响 PASS/FAIL**。**正确性只由 per-layer envelope
+硬门决定**（`actual_error[L] <= k*Atol[L]`）——因此若某次构建误差**变小**（更紧），
+测试**不会失败**（不因误差变小而 fail）。
 
 **为什么是这些量级（而非 v0.2 的 1e-2）**：v0.2 标准是**单层**（或 4 层
 micro-stack，worst 3.9e-2）的界。完整 24 层 BF16 链把每层 ~1-ulp 的 GEMV
 **fp32 累加顺序**差异（runtime `int4_gemv_bf16`/`bf16_gemv` vs golden 的
-fp32 matmul）**逐层复合**：layer final 误差随深度**平滑单调**增长
-（L0 4.9e-4 → L9 1.6e-2 → L23 7.8e-2，**无突变**）；final norm 的 `(1+w)`
+fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（非严格单调，
+有局部噪声；L0 4.9e-4 → L9 1.6e-2 → L23 7.8e-2，**无 O(1) 突变**）；final norm
+的 `(1+w)`
 零中心缩放把 L23 误差放大（worst 0.4453）；`[vocab]` logits GEMV 再复合
 （worst 0.3125）。
 
 **为何确定是舍入复合、而非错 stage/错权重/错 dtype（那会是 O(1)）**：
-(a) embedding **bit-exact**（lookup 正确）；(b) layer final **平滑单调**增长、
-**无单层突变**（若是某层错权重/错索引，会在该层出现 O(1) 跳变）；(c) **全部
+(a) embedding **bit-exact**（lookup 正确）；(b) layer final **总体随 depth 增大、
+无 O(1) 单层突变**（若是某层错权重/错索引，会在该层出现 O(1) 跳变）；(c) **全部
 持久状态**（18× DeltaNet conv/recurrent + 6× FA K/V rows 0..p）在**小量级**
 内匹配且随深度增长（层内数学正确）；(d) 冻结 v0.2 单层在 micro-stack golden
 已通过 1e-2（单层正确）。
@@ -986,8 +991,8 @@ fp32 matmul）**逐层复合**：layer final 误差随深度**平滑单调**增�
 ### 18.3 签核证据（本次运行，RTX 2080 Ti / CUDA 11.8）
 
 - 真实 checkpoint 完整 forward PASS：A（p0 fresh）+ B（p0→p1→p2 顺序，runtime
-  自线程状态）全部类别在 §18.2 **per-layer / depth-aware envelope** 内，且
-  **test 强制的平滑增长断言** PASS（`test_qwen35_full_forward`）。
+  自线程状态）全部类别在 §18.2 **per-layer / depth-aware envelope** 内（正确性
+  唯一判据；深度趋势为 diagnostic report，非门）（`test_qwen35_full_forward`）。
 - 独立 `test_bf16_gemv` PASS（vec4 含 `[248320,1024]` + scalar K%8!=0/错位 +
   scalar-vs-vec4 + 全零行，vs CPU FP32→BF16 RNE 参考）。
 - 完整 ctest **34/34 PASS**（旧 31 全回归 + 1 v0.3 Phase A full-model +

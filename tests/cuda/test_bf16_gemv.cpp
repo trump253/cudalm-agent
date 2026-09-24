@@ -14,7 +14,8 @@
 //   * vec4 path: K % 8 == 0 AND 16B-aligned W/x bases (the 16B-vectorized
 //     proven kernel) — including the actual LM-head shape [N=248320, K=1024];
 //   * scalar fallback: K % 8 != 0 (the scalar kernel);
-//   * scalar fallback: K % 8 == 0 but misaligned W/x bases (1B offset);
+//   * scalar fallback: K % 8 == 0 but misaligned W/x bases (2-byte offset —
+//     2-byte-aligned but not 16B-aligned, a legal __nv_bfloat16 access);
 //   * a zero weight row -> bit-exact zero output;
 //   * multiple N/K shapes across both paths.
 //
@@ -73,8 +74,9 @@ void ref_gemv_bf16(const __nv_bfloat16* W, const __nv_bfloat16* x, int N, int K,
 }
 
 // Run bf16_gemv on (possibly misaligned) device buffers + compare to the
-// reference. `w_off` / `x_off` are byte offsets into the W/x buffers (1 forces
-// the scalar fallback for a K%8==0 shape). Returns 0 on success.
+// reference. `w_off` / `x_off` are byte offsets into the W/x bases (a
+// non-16B-aligned offset, e.g. 2, forces the scalar fallback for a K%8==0
+// shape). Returns 0 on success.
 int run_vs_ref(cudaStream_t stream, const Bf16Fixture& fx, int N, int K,
                int w_off, int x_off, const char* label) {
   const std::size_t w_bytes =

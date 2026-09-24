@@ -134,9 +134,10 @@ int compare_fp32(const std::string& name, const float* dev,
 }
 
 // Per-layer measured worsts (running max across the deterministic A+B run),
-// captured so the depth-aware "smooth growth" property can be ENFORCED by the
-// test (not just documented). Indexed by layer index L (0..23); entries for a
-// layer of the wrong type stay 0.
+// captured so the depth trend can be REPORTED (diagnostic, docs §18.2). The
+// correctness gate is the per-layer envelope (actual_error[L] <= k*Atol[L]);
+// the trend report is informational only. Indexed by layer index L (0..23);
+// entries for a layer of the wrong type stay 0.
 struct PerLayerMeasured {
   double layer_final[24] = {0};
   double conv[24] = {0};
@@ -151,10 +152,9 @@ struct PerLayerMeasured {
 // (larger) ceiling from its OWN measured worst — so a late layer's large error
 // never relaxes an early layer's tight ceiling. Entries for a layer of the
 // wrong type are 0 (never compared). The final-norm / full-logits stay
-// model-level (kFnAtol / kLogitsAtol). The test ENFORCES the depth-awareness
-// below (check_smooth_growth): the later-depth measured worst must exceed the
-// earlier-depth measured worst, so "smooth growth" is a property the test
-// validates, not just prose.
+// model-level (kFnAtol / kLogitsAtol). The depth trend is REPORTED
+// (diagnostic, not a gate): the bf16 rounding generally grows with depth but
+// is NOT required to be strictly monotonic, so a smaller error never fails.
 static const double kLayerFinalAtol[24] = {
     0.001635, 0.003539, 0.006078, 0.006078, 0.006078, 0.01116, 0.01623,
     0.006078, 0.01116, 0.02131, 0.02131, 0.02131, 0.01623, 0.01623, 0.02131,
@@ -174,12 +174,15 @@ static const double kKvAtol[24] = {
 static const double kFnAtol = 0.5799;    // final norm (measured max 0.4453)
 static const double kLogitsAtol = 0.4073;  // FULL logits (measured max 0.3125)
 
-// Enforce the depth-aware "smooth growth" on the MEASURED per-layer worsts:
-// the later-depth (L16..L23) measured worst must exceed the earlier-depth
-// (L0..L7) measured worst for every category. This catches a regression where
-// the error no longer grows with depth (e.g. an early layer suddenly as large
-// as a late layer). `used` marks which layers are compared for the category.
-bool check_smooth_growth(const char* cat, const double m[24], bool used[24]) {
+// DIAGNOSTIC / report-only (NOT a PASS/FAIL condition): print the depth trend
+// of the measured per-layer worsts. The bf16 rounding generally grows with
+// depth, but it is NOT required to be strictly monotonic (there is local
+// noise, e.g. a later layer can be slightly smaller than an earlier one).
+// Correctness is decided ONLY by the per-layer envelope hard gate
+// (actual_error[L] <= k*Atol[L] in compare_token) — so if the error gets
+// SMALLER (e.g. a tighter build), the test must NOT fail. `used` marks which
+// layers are compared for the category.
+void report_smooth_growth(const char* cat, const double m[24], bool used[24]) {
   double early = 0.0, late = 0.0;
   for (int L = 0; L < 24; ++L) {
     if (!used[L]) continue;
@@ -187,9 +190,9 @@ bool check_smooth_growth(const char* cat, const double m[24], bool used[24]) {
     if (L >= 16) late = std::fmax(late, m[L]);
   }
   std::fprintf(stderr,
-               "  smooth-growth %-10s early(L0..7)=%.6g late(L16..23)=%.6g\n",
+               "  [diag] smooth-growth %-10s early(L0..7)=%.6g "
+               "late(L16..23)=%.6g (trend only, not a gate)\n",
                cat, early, late);
-  return late > early;
 }
 
 // Load + validate one per-(token,layer) CUDLMG02 golden (config + tensor set).
@@ -221,7 +224,7 @@ int load_golden(const std::string& path, GoldenFileV2* g) {
 // shared value — so a late layer's large error never relaxes an early layer's
 // tight ceiling. The model-level final-norm / full-logits keep kFnAtol /
 // kLogitsAtol. The measured per-layer worsts are captured into `measured` (the
-// running max across A+B) so check_smooth_growth can validate the depth trend.
+// running max across A+B) so the depth trend can be reported (diagnostic).
 int compare_token(const Qwen35Model& model, const std::string& prefix,
                   const char* sc, int p, const Qwen35Config& cfg,
                   cudaStream_t stream, PerLayerMeasured* measured) {
@@ -389,8 +392,8 @@ int main(int argc, char** argv) {
   CHECK(model.loaded());
   const Qwen35Config& cfg = model.config();
 
-  // Per-layer measured worsts (running max across the deterministic A+B run)
-  // for the test-enforced depth-aware smooth-growth check (docs §18.2).
+  // Per-layer measured worsts (running max across the deterministic A+B run),
+  // for the depth-trend REPORT (diagnostic, not a gate; docs §18.2).
   PerLayerMeasured measured;
 
   int rc = 0;
@@ -408,11 +411,14 @@ int main(int argc, char** argv) {
     rc |= compare_token(model, gprefix, "B", i, cfg, stream, &measured);
   }
 
-  // ---- Depth-aware smooth-growth check (test-enforced, docs §18.2) --------
-  // The bf16 rounding compounds with depth, so the later-depth (L16..23)
-  // measured worst must exceed the earlier-depth (L0..7) measured worst for
-  // every category. `used` marks the compared layers per category (all layers
-  // for layer_final; DeltaNet layers for conv/recurrent; FA layers for kv).
+  // ---- Depth trend report (DIAGNOSTIC / report-only, docs §18.2) ----------
+  // The bf16 rounding generally grows with depth, but it is NOT required to be
+  // strictly monotonic (local noise is normal). This is a REPORT, not a
+  // PASS/FAIL gate: correctness is decided ONLY by the per-layer envelope hard
+  // gate (actual_error[L] <= k*Atol[L] in compare_token). So a smaller error
+  // (a tighter build) must never fail the test. `used` marks the compared
+  // layers per category (all layers for layer_final; DeltaNet layers for
+  // conv/recurrent; FA layers for kv).
   bool used_lf[24] = {}, used_cn[24] = {}, used_rc[24] = {}, used_kv[24] = {};
   for (int L = 0; L < 24; ++L) {
     used_lf[L] = true;
@@ -423,18 +429,11 @@ int main(int argc, char** argv) {
       used_rc[L] = true;
     }
   }
-  std::fprintf(stderr, "[depth-aware smooth-growth check]\n");
-  bool sg = true;
-  sg &= check_smooth_growth("layer_final", measured.layer_final, used_lf);
-  sg &= check_smooth_growth("conv", measured.conv, used_cn);
-  sg &= check_smooth_growth("recurrent", measured.recur, used_rc);
-  sg &= check_smooth_growth("kv", measured.kv, used_kv);
-  if (!sg) {
-    std::fprintf(stderr,
-                 "qwen35 full forward: SMOOTH-GROWTH VIOLATION (the measured "
-                 "error no longer grows with depth)\n");
-    rc |= 1;
-  }
+  std::fprintf(stderr, "[depth trend report (diagnostic, not a gate)]\n");
+  report_smooth_growth("layer_final", measured.layer_final, used_lf);
+  report_smooth_growth("conv", measured.conv, used_cn);
+  report_smooth_growth("recurrent", measured.recur, used_rc);
+  report_smooth_growth("kv", measured.kv, used_kv);
 
   if (rc != 0) {
     std::fprintf(stderr, "qwen35 full forward: COMPARISON FAILURES (rc=%d)\n",

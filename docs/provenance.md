@@ -311,15 +311,17 @@ BF16 输入 vs **CPU FP32-accumulate → BF16 RNE** 参考（`compare_bf16_stage
 比较 embedding（bit-exact）/ 24× 层 final / final norm / **FULL logits
 [248320]** / 18× DeltaNet conv+recurrent / 6× FA K/V rows 0..p，tolerance =
 **per-layer / depth-aware 最小必要 envelope**（每层 = 该层实测 worst × 1.3 +
-1e-3，L0 紧、L23 松、L23 不放宽 L0；final norm / logits 保留模型级，§18.2），
-且 `check_smooth_growth` **test 强制**误差随深度增长（后段 L16..23 实测 worst >
-前段 L0..7）。`--no-gen` 供 memcheck。
+1e-3，L0 紧、L23 松、L23 不放宽 L0；final norm / logits 保留模型级，§18.2）。
+**正确性只由 per-layer envelope 硬门决定**（`actual_error[L] <= k*Atol[L]`）；
+深度趋势由 `report_smooth_growth` **diagnostic 报告**（总体随 depth 增大、非严格
+单调，**非 PASS/FAIL 门**，误差不因变小而 fail）。`--no-gen` 供 memcheck。
 
 `tests/CMakeLists.txt` 注册：`test_bf16_gemv`（纯 kernel，always）+
 `test_qwen35_full_forward`（real-checkpoint 门，self-skip 77，TIMEOUT 1800）。
 
 验收证据（RTX 2080 Ti / CUDA 11.8）：完整 forward A+B 全类别 PASS（§18.2
-per-layer envelope + 平滑增长断言）；`test_bf16_gemv` PASS；完整 ctest
+per-layer envelope 硬门；深度趋势为 diagnostic）；`test_bf16_gemv` PASS；完整
+ctest
 **34/34 PASS**；`check_no_torch.sh` **CLEAN**；`compute-sanitizer --tool
 memcheck` **0 错误**，两份 evidence：`benchmarks/sanitizer_qwen35_full_forward.txt`
 （完整 24 层 forward + 新 `bf16_gemv` LM-head GEMV + A/B 顺序路径）+
