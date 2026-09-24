@@ -56,6 +56,18 @@
 
 namespace cudalm {
 
+// Validates that `cfg` is a Gated DeltaNet configuration the Phase C kernels
+// actually support (the pinned Qwen3.5-0.8B) and that `layer_idx` is a
+// linear-attention layer. The DeltaNet decode kernels hardcode a depthwise
+// causal conv of kernel 4 (conv_state len 3), an fp32 recurrent state of head
+// dim 128, and no repeat_interleave (num_k_heads == num_v_heads), so a
+// config outside this contract would silently corrupt or go out of bounds
+// rather than fail loud. This is the single gate the constructor and the CPU
+// contract test both check. Aborts on any violation (CUDALM has no
+// error-returning path in v0.2).
+void qwen35_deltanet_require_supported_config(const Qwen35Config& cfg,
+                                              int layer_idx);
+
 class Qwen35DeltaNetLayer {
  public:
   // `weights` must outlive the layer (non-owning) and must have been loaded

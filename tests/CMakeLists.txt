@@ -9,6 +9,12 @@ cudalm_add_test(test_weight_file_cpu test_weight_file_cpu cpu/test_weight_file.c
 # derived dims, hybrid schedule, validity rules, 88-byte config blob).
 cudalm_add_test(test_qwen35_config test_qwen35_config cpu/test_qwen35_config.cpp)
 
+# v0.2 Phase C: Gated DeltaNet supported-config contract (the decode kernels
+# hardcode kernel-4 / state-3 / head-dim-128 / k==v heads); the pinned config
+# must be accepted and each violation must fatal-abort (child-process check).
+cudalm_add_test(test_qwen35_deltanet_config test_qwen35_deltanet_config
+                cpu/test_qwen35_deltanet_config.cpp)
+
 # --- CUDA tests ---------------------------------------------------------------
 cudalm_add_test(test_cuda_smoke test_cuda_smoke cuda/test_cuda_smoke.cpp)
 cudalm_add_test(test_elementwise_rmsnorm test_elementwise_rmsnorm cuda/test_elementwise_rmsnorm.cpp)

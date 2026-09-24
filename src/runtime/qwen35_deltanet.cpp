@@ -20,17 +20,40 @@ std::size_t bf_bytes(std::size_t n) { return n * sizeof(__nv_bfloat16); }
 std::size_t f32_bytes(std::size_t n) { return n * sizeof(float); }
 }  // namespace
 
+void qwen35_deltanet_require_supported_config(const Qwen35Config& c,
+                                              int layer_idx) {
+  CUDALM_PRECONDITION(
+      c.is_linear_attention(layer_idx),
+      "Qwen35DeltaNetLayer: layer must be linear-attention (Gated DeltaNet)");
+  CUDALM_PRECONDITION(
+      c.lin_conv_kernel_dim == 4,
+      "Qwen35DeltaNetLayer: the conv kernel hardcodes a depthwise causal conv "
+      "of kernel 4 (conv_dim*3 state, conv_dim*4 input buffer)");
+  CUDALM_PRECONDITION(
+      c.linear_conv_state_len() == 3,
+      "Qwen35DeltaNetLayer: the conv state must hold kernel-1 == 3 tokens");
+  CUDALM_PRECONDITION(
+      c.lin_key_head_dim == c.lin_value_head_dim,
+      "Qwen35DeltaNetLayer: key/value head dims must be equal (the kernels do "
+      "not repeat_interleave)");
+  CUDALM_PRECONDITION(
+      c.lin_key_head_dim == 128,
+      "Qwen35DeltaNetLayer: the delta-rule and gated-RMSNorm kernels hardcode "
+      "head dim 128");
+  CUDALM_PRECONDITION(
+      c.lin_num_k_heads == c.lin_num_v_heads,
+      "Qwen35DeltaNetLayer: num_k_heads must equal num_v_heads (no "
+      "repeat_interleave)");
+}
+
 Qwen35DeltaNetLayer::Qwen35DeltaNetLayer(const Qwen35LayerWeights& weights,
                                          cudaStream_t stream)
     : w_(&weights), cfg_(weights.config()) {
-  CUDALM_PRECONDITION(
-      weights.config().is_linear_attention(weights.layer_idx()),
-      "Qwen35DeltaNetLayer: weights must be a linear-attention (DeltaNet) "
-      "layer");
-  CUDALM_PRECONDITION(
-      cfg_.lin_num_v_heads == cfg_.lin_num_k_heads,
-      "Qwen35DeltaNetLayer: pinned 0.8B requires num_v_heads == "
-      "num_k_heads (no repeat_interleave)");
+  // Reject any config the Phase C kernels do not support before touching a
+  // single buffer (the kernels hardcode kernel-4 / state-3 / head-dim-128 /
+  // k==v heads; a silent OOB or semantic mismatch would be far worse than a
+  // loud abort). See qwen35_deltanet_require_supported_config.
+  qwen35_deltanet_require_supported_config(cfg_, weights.layer_idx());
 
   const std::size_t H = static_cast<std::size_t>(cfg_.hidden_size);
   const std::size_t conv_dim = static_cast<std::size_t>(cfg_.linear_conv_dim());
