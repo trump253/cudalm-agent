@@ -24,12 +24,26 @@ Output: CUDLMTK1 (little-endian, deterministic, versioned, bounds-checked):
     S6 comp table      : [u32 a][u32 b][u32 c] sorted by (a,b)
     S7..S10 ranges     : [u32 lo][u32 hi]  White_Space / L / N / M
 
-The Unicode tables (S4..S10) are generated from Python's `unicodedata`
-(canonical decomposition, ccc, NFC-verified composition pairs,
-White_Space) PLUS the UAX #15 Hangul arithmetic (syllable<->jamo, jamo
-ccc 7/8) which `unicodedata.decomposition` does not expose.  Composition
-pairs are validated with `unicodedata.normalize("NFC", ...)` so the table
-is empirically exact for the standard algorithm.
+The Unicode tables (S4..S10) are generated from PINNED UCD files
+(tools/ucd/, sha256-gated by tools/common/qwen35_unicode_ref.py) — the
+pinned engine's two subsystems use DIFFERENT Unicode data versions:
+  S4 ccc + S5 decomp + S6 comp : Unicode 9.0.0
+      (the pinned normalizer = Rust crate
+      unicode-normalization-alignments 0.1.12, UNICODE_VERSION=(9,0,0);
+      its 814-entry ccc table is byte-identical to the U9 UCD ccc>0 set).
+  S7 White_Space               : UAX #44 (25 cps; version-stable).
+  S8..S10 L / N / M            : Unicode 16.0.0
+      (the pinned pre-tokenizer's regex classes come from the `regex`
+      crate dependency; a per-cp chunking sweep over all 1,112,064
+      non-surrogate cps against the pinned engine shows L∪M and N equal
+      the U16 UCD sets exactly, and \s = UAX #44 White_Space).
+PLUS the UAX #31 Hangul arithmetic (syllable<->jamo decomposition and
+L+V / S0+T composition), which the UCD files do not expose directly.
+Composition-pair candidates are derived from the U9 full-decomposition
+streams and VALIDATED against the pinned engine's U9 normalizer
+(normalizer.normalize_str(x+y) == c) — the build-time oracle of record.
+Python `unicodedata` (U14 in this environment) is NOT used for table
+generation and stays diagnostic-only.
 
 Selftest (--selftest): builds the artifact twice (byte-identical
 determinism), round-trips it through the Python reader, and verifies all
@@ -42,12 +56,12 @@ import json
 import os
 import struct
 import sys
-import unicodedata
 import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "common"))
 import qwen35_tokenizer_ref as ref  # noqa: E402
+import qwen35_unicode_ref as uref  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # CUDLMTK1 layout constants (mirrored by src/runtime/qwen35_tokenizer.cpp)
@@ -88,9 +102,13 @@ def tok_to_bytes(s):
 # ---------------------------------------------------------------------------
 # Unicode table generation
 # ---------------------------------------------------------------------------
-# UAX #44 White_Space (the set Onig/PCRE2-UCP use for \s in Unicode mode).
+# UAX #44 White_Space — the EXACT \s class of the pinned pre-tokenizer,
+# proven by a per-cp chunking sweep against the pinned engine (all 25 cps
+# are \s; every other cp is not).  U+00A0 (NBSP) is part of White_Space;
+# its earlier absence here was BLOCKER-D2.
 WHITE_SPACE = (
-    (0x0009, 0x000D), (0x0020, 0x0020), (0x0085, 0x0085), (0x1680, 0x1680),
+    (0x0009, 0x000D), (0x0020, 0x0020), (0x0085, 0x0085),
+    (0x00A0, 0x00A0), (0x1680, 0x1680),
     (0x2000, 0x200A), (0x2028, 0x2029), (0x202F, 0x202F), (0x205F, 0x205F),
     (0x3000, 0x3000),
 )
@@ -116,43 +134,39 @@ def _hangul_syllable(l, v, t):
     return HANGUL_SYL_BASE + (l * HANGUL_V_COUNT + v) * HANGUL_T_VALUES + t
 
 
-def _category_ranges(pred):
-    ranges = []
-    start = None
-    for c in range(0x110000):
-        p = pred(unicodedata.category(chr(c)))
-        if p and start is None:
-            start = c
-        elif not p and start is not None:
-            ranges.append((start, c - 1))
-            start = None
-    if start is not None:
-        ranges.append((start, 0x10FFFF))
-    return ranges
+def build_unicode_tables(tdir):
+    """Generate the S4..S10 Unicode tables.
 
+    Sources (all pinned, sha256-gated; see tools/common/qwen35_unicode_ref):
+      ccc / decomp / comp candidates : Unicode 9.0.0 — the data version of
+          the pinned normalizer (Rust crate unicode-normalization-alignments
+          0.1.12, UNICODE_VERSION=(9,0,0); its 814-entry ccc table is
+          byte-identical to the U9 UCD ccc>0 set).
+      comp verification oracle       : the pinned engine's normalizer
+          (normalizer.normalize_str == U9 NFC; the build-time oracle of
+          record).  Python unicodedata (U14 here) is NOT used — it would
+          reintroduce the U14-vs-U9 data differences (BLOCKER-D1).
+      White_Space                    : UAX #44, 25 cps, == the engine's \\s.
+      L / N / M                      : Unicode 16.0.0 — the data version of
+          the pinned pre-tokenizer's regex classes (proven by a per-cp
+          chunking sweep over all 1,112,064 non-surrogate cps: L∪M and N
+          equal the U16 UCD sets exactly; the old U14 ranges were wrong for
+          the ~5k cps added in U15/U16).
+    """
+    oracle = ref.build_tokenizer(tdir)
+    nfc = oracle.normalizer.normalize_str
 
-def build_unicode_tables():
-    ccc = {}
-    decomp = {}
-    for c in range(0x110000):
-        ch = chr(c)
-        cc = unicodedata.combining(ch)
-        if cc > 0:
-            ccc[c] = cc
-        d = unicodedata.decomposition(ch)
-        if d and "<" not in d:
-            parts = [int(x, 16) for x in d.split()]
-            # Canonical decompositions may be single-part (e.g. Greek
-            # ypogegrammeni U+1FBE -> U+03B9); they still must decompose in
-            # NFC.  Compatibility decompositions carry a "<..." marker.
-            if 1 <= len(parts) <= 16:
-                decomp[c] = parts
+    ccc = uref.ccc_table("9.0.0")         # 814 entries
+    decomp = uref.decomp_table("9.0.0")   # 2,060 entries
 
-    # --- Hangul (not exposed by unicodedata.decomposition) -----------------
-    # Jamo keep ccc=0 in the table (deliberately NOT the UCD's 7/8 values):
-    # both oracle implementations (Python unicodedata.normalize and the
-    # tokenizers Rust engine) perform NO reordering of jamo sequences, while
-    # still composing basic L/V/T.  See the constant block above.
+    # --- Hangul (UAX #31 arithmetic; not exposed as UCD rows) ----------------
+    # Jamo carry ccc=0 in the UCD (no reordering of jamo sequences — the
+    # behavior of the pinned engine and of standard NFC), and composition
+    # uses the basic jamo only:
+    #   L = 1100..1112 (19),  V = 1161..1175 (21),  T index t (1..27) jamo
+    #   = 11A8..11C2 (U+11A8 = HANGUL JONGSEONG KIYEOK = t 1, ... t 27).
+    #   U+11C3+ are unassigned/reserved and NEVER compose (verified below
+    #   against the oracle).
     for l in range(HANGUL_L_COUNT):
         for v in range(HANGUL_V_COUNT):
             # t runs 0..27 (HANGUL_T_VALUES values); range(HANGUL_T_COUNT)
@@ -168,9 +182,9 @@ def build_unicode_tables():
     #       split at a decomposition boundary,
     #   (b) x and y are single code points,
     #   (c) x and y are not composition exclusions.
-    # (a)+(b) are checked via full-decomposition streams; (c) is enforced
-    # empirically by requiring unicodedata.normalize("NFC", x+y) == c (which
-    # is also the definition of a valid composition under the oracles).
+    # (a)+(b) are checked via full-decomposition streams; (c) is enforced by
+    # requiring the pinned engine's U9 NFC (the oracle of record) to compose
+    # x+y to exactly c.
     fullD = {}
 
     def expand(c):
@@ -209,7 +223,7 @@ def build_unicode_tables():
             x = _lookup(fs[:i])
             y = _lookup(fs[i:])
             if x is not None and y is not None:
-                if unicodedata.normalize("NFC", chr(x) + chr(y)) == chr(c):
+                if nfc(chr(x) + chr(y)) == chr(c):
                     if (x, y) in pairs and pairs[(x, y)] != c:
                         raise AssertionError("ambiguous composition pair")
                     pairs[(x, y)] = c
@@ -219,9 +233,7 @@ def build_unicode_tables():
     for l in range(HANGUL_L_COUNT):
         for v in range(HANGUL_V_COUNT):
             s0 = _hangul_syllable(l, v, 0)
-            if unicodedata.normalize("NFC",
-                                     chr(HANGUL_L_BASE + l) +
-                                     chr(HANGUL_V_BASE + v)) != chr(s0):
+            if nfc(chr(HANGUL_L_BASE + l) + chr(HANGUL_V_BASE + v)) != chr(s0):
                 raise AssertionError("Hangul L+V composition mismatch")
             pairs[(HANGUL_L_BASE + l, HANGUL_V_BASE + v)] = s0
             # t runs 1..HANGUL_T_COUNT (27); the previous range(1, COUNT)
@@ -229,28 +241,27 @@ def build_unicode_tables():
             for t in range(1, HANGUL_T_COUNT + 1):
                 st = _hangul_syllable(l, v, t)
                 tj = HANGUL_T_BASE + (t - 1)
-                if unicodedata.normalize("NFC", chr(s0) +
-                                         chr(tj)) != chr(st):
+                if nfc(chr(s0) + chr(tj)) != chr(st):
                     raise AssertionError("Hangul S+T composition mismatch")
                 pairs[(s0, tj)] = st
 
-    # Completeness: extended / non-basic jamo must NEVER compose (both oracles
-    # agree); assert it so a future Unicode data change fails loudly.
+    # Completeness: extended / non-basic jamo must NEVER compose; assert it
+    # against the oracle so a future Unicode data change fails loudly.
     for l in range(190):
         for v in range(71):
             if l < HANGUL_L_COUNT and v < HANGUL_V_COUNT:
                 continue  # basic pair: composes (already added + verified)
             pair = chr(HANGUL_L_BASE + l) + chr(HANGUL_V_BASE + v)
-            if unicodedata.normalize("NFC", pair) != pair:
+            if nfc(pair) != pair:
                 raise AssertionError("unexpected Hangul L+V composition")
     pair = chr(HANGUL_SYL_BASE) + chr(0x11F7)  # reserved jongseong
-    if unicodedata.normalize("NFC", pair) != pair:
+    if nfc(pair) != pair:
         raise AssertionError("unexpected Hangul S+T composition")
 
-    # Sanity: every table pair must reproduce under Python's own NFC.
+    # Sanity: every table pair must reproduce under the pinned engine's NFC.
     for (x, y), c in pairs.items():
-        if unicodedata.normalize("NFC", chr(x) + chr(y)) != chr(c):
-            raise AssertionError("NFC-verification failed for (%x, %x)"
+        if nfc(chr(x) + chr(y)) != chr(c):
+            raise AssertionError("engine-NFC verification failed for (%x, %x)"
                                  % (x, y))
 
     return {
@@ -258,9 +269,9 @@ def build_unicode_tables():
         "decomp": sorted((c, d) for c, d in decomp.items()),
         "comp": sorted((a, b, c) for (a, b), c in pairs.items()),
         "ws": WHITE_SPACE,
-        "letter": _category_ranges(lambda cat: cat.startswith("L")),
-        "number": _category_ranges(lambda cat: cat.startswith("N")),
-        "mark": _category_ranges(lambda cat: cat.startswith("M")),
+        "letter": uref.category_ranges("16.0.0", "L"),
+        "number": uref.category_ranges("16.0.0", "N"),
+        "mark": uref.category_ranges("16.0.0", "M"),
     }
 
 
@@ -331,7 +342,7 @@ def build_artifact(tdir, model_vocab_size, eos_token_id):
                           len(content)) + content
     num_special = sum(1 for a in added if a["special"])
 
-    u = build_unicode_tables()
+    u = build_unicode_tables(tdir)
     s4 = b"".join(struct.pack("<IB", cp, cc) for cp, cc in u["ccc"])
     s5 = b""
     for cp, d in u["decomp"]:
