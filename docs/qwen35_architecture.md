@@ -1111,3 +1111,141 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    multi-token prompt + multi-step greedy decode：真实 prefill/decode 状态转换 +
    重复 tied-LM-head GEMV + KV history 增长 + DeltaNet recurrent 更新 + 最终
    状态读回）。
+
+ ## 20. v0.4 Phase B —— 原生 tokenizer + prompt→text（钉死，来自 pinned 官方源）
+
+ 范围 = **raw UTF-8 prompt → token id → 生成 → token id → raw UTF-8 text** 的
+ 全链路原生（PyTorch-free）实现：
+
+ ```
+ raw UTF-8 prompt
+   -> Qwen35Tokenizer::encode      （NFC → added-token 切分 → 左优先正则
+                                    预分词 → ByteLevel BPE）
+   -> Qwen35Generator::generate    （§19 冻结生成核；EOS = 真实 tokenizer
+                                    EOS 248044，**非** Phase A 哨兵 248319）
+   -> Qwen35Tokenizer::decode      （base 字节串 / added 字面量 / padding→""）
+   -> raw UTF-8 生成文本
+ ```
+
+ `Qwen35TextGenerator`（`include/cudalm/qwen35_text_generator.h`）是**纯
+ 拼接层**（thin facade）：encode → generate → decode 三行缝合，**不**新增任何
+ 模型状态 / 生成逻辑 / sampling / chat-template / streaming / batching ——
+ 每一字节输入输出都由既有硬门覆盖（tokenizer 语料门 + 生成 golden 门）。
+
+ ### 20.1 官方源钉死（pinned，只取 tokenizer 文件，**不**下载权重）
+
+ - 仓库 `Qwen/Qwen3.5-0.8B-Base` @ revision
+   `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68`（与 §1 同一 pinned 源）。
+ - 本地已下载于 `/root/models/Qwen3.5-0.8B-Base/tokenizer/`，4 个文件 sha256
+   钉死（`tools/common/qwen35_tokenizer_ref.py` 的 `EXPECTED_SHA256`，读取
+   前强制校验）：
+
+   | 文件 | sha256 |
+   |---|---|
+   | `tokenizer.json` | `fe000e3ed39ed12b8d2481d527d44f93c65d37e87645d2dcc80d1bf9d50d2927` |
+   | `tokenizer_config.json` | `e611fbccc7c29ef3b1cafb1cb7ea548d189968632901d678fd62be68c47885de` |
+   | `vocab.json` | `ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003` |
+   | `merges.txt` | `a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d` |
+
+ - **oracle 版本**：主 oracle = 本地 venv（py3.11.16）`tokenizers 0.22.2`
+   （Rust 引擎，pinned 语义）；交叉核对 = 系统 `tokenizers 0.15.1`。语料
+   **刻意避开** U14/U15 Unicode 数据差异区（corpus 不碰 exotic changed
+   codepoints），两版本结果一致。NFC 向量另用 `unicodedata.normalize`
+   （U14 数据）交叉验证。
+ - 词汇结构（钉死）：base BPE 词汇 **248044**（id 0..248043，GPT-2 byte
+   map：33..126/161..172/174..255 自映射，其余 68 字节 → U+0100..U+0143）；
+   added token **33** 个（id 248044..248076 = `tokenizer.json` added_tokens
+   与 `tokenizer_config.json` 的并集、config 优先；其中 **21 special +
+   12 non-special**）；**padding id 248077..248319**（model vocab 248320）
+   decode → `""`（HF/Rust 均静默丢弃，逐一对齐）；**单 EOS = 248044**
+   （= `raw/config.json` `text_config.eos_token_id`）。
+
+ ### 20.2 管线契约（逐段 oracle 验证，C++ 只做离线转录的查表）
+
+ 1. **NFC**（UAX #15，**oracle 验证过的精确算法**，非教科书 NFC）：
+    (a) 完全规范分解（含单部件分解，如 U+1FBE→U+03B9、Hangul 音节→jamo）；
+    (b) **不做**规范重排（both oracles 均不重排，jamo ccc 按 0 处理）；
+    (c) 贪心左→右合成：门控 `b_ccc==0 || (a_ccc<b_ccc && a_ccc<c_ccc &&
+       b_ccc<=c_ccc)`（a = 栈底前一项或 0）+ **精确合成表查表**。
+    Hangul：27 个可合成 T-jamo = **U+11A8..U+11C2**（U+11C3+ 为保留区，
+    **永不**合成 —— oracle 验证 `AC00+U+11F2/U+11F6` 原样不动）；
+    (L,V)→S(L,V,0)，(S(L,V,0),T_t)→S(L,V,t)，音节 = 0xAC00+(L×21+V)×28+T，
+    jongseong(T=t) = 0x11A8+(t−1)。
+ 2. **added-token 切分**：先 NFC；每位置**最长** added-token 匹配 → 单 id；
+    否则取到下一个 added-token 起点之前的最大 chunk，chunk 走正则+BPE。
+ 3. **左优先正则预分词**（leftmost-first，PCRE/Onig 语义；`(?i:)` 仅作用于
+    分支 1 的 ASCII tolower casefold）：
+
+    | # | 分支 |
+    |---|---|
+    | B1 | `(?i:'s\|'t\|'re\|'ve\|'m\|'ll\|'d)` |
+    | B2 | `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+` |
+    | B3 | `\p{N}` |
+    | B4 | ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*` |
+    | B5 | `\s*[\r\n]+` |
+    | B6 | `\s+(?!\S)` |
+    | B7 | `\s+` |
+
+    `\s`/`\pL`/`\pN`/`\pM` 用 artifact 的**精确区间表**（Unicode
+    White_Space = 09-0D/20/85/1680/2000-200A/2028/2029/202F/205F/3000 等）。
+    语义要点（oracle 对齐）：B1 优先于 B2（`'mX`→`'m`+`X`）；B2 的可选前导
+    字符可吃空格/非字母（`a   b`→`a`,`  `,` b`；nbsp 黏后词）；B6 的
+    零宽 lookahead **不消费**字符（`\s+(?!\S)` 只决定空格 run 的切分点）；
+    BPE **只在预分词内部**合并。
+ 4. **ByteLevel BPE**：`byte_fallback=false`（256 单字节 token + 全部 merge
+    产物均在词汇表内，artifact 构建时逐条校验）；每预分词独立；贪心取
+    全位置**最低 rank** merge（tie → 最左）；输出 = 拼接字节查词汇表。
+
+ ### 20.3 CUDLMTK1 artifact（确定性、全界检、fail-loud）
+
+ 离线转录：`tools/convert_qwen35_tokenizer.py`（tokenizers lib，无 checkpoint
+ 权重）→ `build/data/qwen35_tokenizer.cudaltk`（~4.7MB，gitignore）。
+ 格式（LE）：`"CUDLMTK1"` + u32 version(1) + u32 reserved(0) + u32
+ crc32（zlib，poly 0xEDB88320，覆盖 body）+ body = 15×u32 meta（全钉死
+ 常量，逐条校验）+ 10 个 size-prefixed section：S1 base 词汇（[u16 长][字节]
+ ×248044）；S2 merges（[u32 l][u32 r] ×247587）；S3 added（[u32 id][u8
+ special][u16 len][utf8] ×33）；S4 ccc 表（912）；S5 分解表（13233，含
+ Hangul 全音节含 t=27 列）；S6 合成表（12119，key=(a<<21)|b，含 Hangul
+ (S,T27) 对）；S7–S10 WS/L/N/M 区间表。C++ loader
+（`src/runtime/qwen35_tokenizer.cpp`）对 magic/version/reserved/crc/截断/
+ 重复/越界/区间重叠/非 UTF-8/词汇连续性**全部 fail loud**（
+ `test_qwen35_tokenizer` 的 load-failure 契约逐项覆盖）。
+
+ ### 20.4 安全契约（无裸特殊 token 字面量）
+
+ 全仓库（C++/Python 测试/文档）**不出现**任何 raw 特殊/控制 token 字符串
+ （EOS、im-start/im-end 等 `<|...|>` 形态）：added token 只由 artifact
+ 承载（id + utf8 字节）；测试语料中它们只以 **UTF-8 hex** 出现；文档只引用
+ id/名称/长度/sha。C++ 侧所需的一切字符串都来自 artifact 查表或拆分拼接，
+ 源码零字面量。
+
+ ### 20.5 硬门（ctest）
+
+ - **`test_qwen35_tokenizer_python_selftest`**（无 checkpoint）：converter
+   自测（确定性双跑 bit-exact、round-trip、损坏类；pinned 资产缺失 → 77）。
+ - **`test_qwen35_tokenizer`**（pinned 资产，self-skip 77）：
+   (a) loader 失败契约（空/过小/坏 magic/坏 version/坏 reserved/crc 翻转/
+   body 截断/header 截断）；(b) NFC 阶段向量（含 no-reorder、jamo T27、
+   U+11F6 不合成等 oracle 验证期望）；(c) 预分词阶段向量（leftmost-first、
+   nbsp 黏词、trailing space、CRLF、CJK）；(d) decode 契约（padding→""、
+   越界 fail loud、is_special 21/33、EOS==248044、非法 UTF-8 fail loud）；
+   (e) **跨语言精确语料**：`tools/gen_tokenizer_refs.py` 生成
+   E（encode，290 文本）/ D（decode skip_special=false，290）/ D1（
+   skip_special=true，290）/ N（NFC，31）/ P（预分词，36）共 877 行，
+   覆盖 EN/CJK/Cyrillic/Greek/emoji/mixed/whitespace/特殊 token hex ——
+   C++ 逐行与 pinned HF oracle **EXACT** 相等。
+ - **`test_qwen35_text_generation`**（real checkpoint + tokenizer，self-skip
+   77）：E2E 文本级门。4 个 **confident prompt**（2 EN + 2 CJK；
+   `tools/diag_gen_gaps.py --text` 在 pinned-quantized oracle 上选得，
+   每步 top1-top2 logit gap **> 0.4**：T1 `January, February, March,`
+   min 0.625；T2 `1, 2, 3, ..., 10,` min 2.875；T3 `一月，二月，三月，`
+   min 1.4375；T4 `一，二，三，…，十，` min 0.75）。每场景比较：
+   **native encode == pinned HF encode（EXACT）** + **greedy 生成 ==
+   pinned-quantized oracle（EXACT）** + **native decode == pinned HF decode
+   （EXACT，skip_special_tokens=False，生成 EOS 留在文本里）** + stop_reason
+   + forward_count（== t_used）+ golden `gen.prompt_text` 回环 drift 守卫；
+   污染门 T1→T3→T1 二次运行**逐字段相同**。EOS 用**真实 248044**。
+ - **oracle 扩展**：`tools/generate_qwen35_golden.py --gen-text`（新参数，
+   Phase A `--gen-a/b-tokens` 不动）：文本经 pinned HF tokenizer 编码后走
+   同一 pinned-quantized 生成 oracle，golden 额外携带 `gen.prompt_text` +
+   `gen.hf_decoded` 两个 metadata 字段。

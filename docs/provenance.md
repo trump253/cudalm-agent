@@ -423,3 +423,91 @@ decoding 编排 kernel 可移植（其 generation 是 Python 采样循环，Phas
   **multi-token prompt + multi-step greedy decode**：真实 prefill/decode 状态
   转换 + 重复 tied-LM-head GEMV + KV history 增长 + DeltaNet recurrent 更新 +
   最终状态读回）。
+
+## CUDALM v0.4 Phase B（原生 tokenizer + prompt→text，PyTorch-free 文本级全链路）
+
+范围 = **raw UTF-8 prompt → 原生 encode → token id → 冻结生成核（真实 EOS
+248044）→ 原生 decode → raw UTF-8 text**。`Qwen35TextGenerator` 是纯拼接层
+（encode → generate → decode），不新增生成逻辑 / sampling / chat-template /
+streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20。
+
+### 上游核查（pinned 官方源，只取 tokenizer 文件）
+
+- 源 = `Qwen/Qwen3.5-0.8B-Base` @ revision
+  `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68`（与 §1 / v0.3 同一 pinned
+  源）。**只下载 tokenizer 文件**（不下载 9B 模型、不下载本模型权重 ——
+  权重已由 v0.3 摄入并 sha256 钉死）：本地
+  `/root/models/Qwen3.5-0.8B-Base/tokenizer/`，4 文件 sha256 全部钉死于
+  `tools/common/qwen35_tokenizer_ref.py`（读取前强制校验，不符即 fail
+  loud）：
+
+  | 文件 | sha256 |
+  |---|---|
+  | `tokenizer.json` | `fe000e3ed39ed12b8d2481d527d44f93c65d37e87645d2dcc80d1bf9d50d2927` |
+  | `tokenizer_config.json` | `e611fbccc7c29ef3b1cafb1cb7ea548d189968632901d678fd62be68c47885de` |
+  | `vocab.json` | `ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003` |
+  | `merges.txt` | `a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d` |
+
+- **oracle**：主 = 本地 venv（py3.11.16，U14 Unicode 数据）
+  `tokenizers 0.22.2`（Rust 引擎）；交叉核对 = 系统 `tokenizers 0.15.1` +
+  `unicodedata.normalize`（NFC 向量）。语料刻意避开 U14/U15 数据差异区。
+  **无** transformers 参与 encode/decode（pinned `tokenizers` 引擎即 HF
+  runtime 的 tokenizer 本体）。
+- 转录是**纯离线查表**：C++ 运行时**不**链接/调用任何 tokenizer 库、不
+  读 JSON、不做正则库调用 —— 全部结构（词汇字节、merge rank、added token、
+  NFC 分解/合成/ccc 表、`\s/\pL/\pN/\pM` 精确区间）由 converter 预先算进
+  CUDLMTK1 artifact，C++ 只做界检 + 查表 + 贪心 BPE。
+
+### CUDALM 原生（无上游）
+
+- **NFC**（oracle 验证的精确算法，非教科书 NFC）：完全分解（含单部件）→
+  **无重排** → 贪心 L→R 合成（ccc 门控 + 精确合成表）。Hangul 27 个可
+  合成 T-jamo = U+11A8..U+11C2（U+11C3+ 保留区永不合成；artifact 分解表
+  覆盖全 11172 音节含 t=27 列、合成表含 (S, T27) 对 —— 早期 converter 的
+  `range(1, COUNT)` off-by-one 漏掉 T27 列，已在本次修掉并加 oracle 断言）。
+- **左优先正则预分词**（B1..B7，`(?i:)` 仅分支 1；`\s` 等类用 artifact
+  精确区间表）：左优先语义 + B6 零宽 lookahead（**不消费**字符）+ B2 可选
+  前导字符黏连（`a   b`→`a`,`  `,` b`；nbsp 黏后词）均逐条 oracle 对齐。
+  实现为自研节点池 matcher（RNode/RPool/Matcher，整型引用、无堆分配递归
+  状态），量词回溯 = 贪心（长→短）；所有分支不匹配 → **fail loud**（内部
+  错误，无静默 fallback）。
+- **ByteLevel BPE**（byte_fallback=false；256 单字节 + 全 merge 产物在词汇
+  内，artifact 构建时逐条校验）：每预分词独立，贪心最低 rank（tie→最左），
+  输出 = 拼接字节查表。
+- **CUDLMTK1 artifact**（~4.7MB，确定性，gitignore，**不**入库）：header
+  （magic/version/reserved/crc32）+ 15×u32 钉死 meta + 10 个 size-prefixed
+  section；C++ loader 对全部损坏类 **fail loud**（测试逐项覆盖）。
+- **安全契约**：全仓库零 raw 特殊/控制 token 字符串字面量 —— added token
+  只由 artifact 承载，语料只以 UTF-8 hex 出现，文档只引 id/名称/长度/sha。
+
+### 硬门（ctest 新增 3 项，旧门全回归）
+
+- `test_qwen35_tokenizer_python_selftest`：converter 自测（确定性 /
+  round-trip / 损坏类；资产缺失 → 77）。
+- `test_qwen35_tokenizer`：loader 失败契约 + NFC/预分词阶段向量 + decode
+  契约（padding→""、越界、is_special 21/33、EOS==248044、非法 UTF-8）+
+  **跨语言精确语料 877 行**（E=290 / D=290 / D1=290 / N=31 / P=36，EN/CJK/
+  Cyrillic/Greek/emoji/mixed/whitespace/特殊 token hex）与 pinned HF
+  oracle **EXACT**。
+- `test_qwen35_text_generation`（real checkpoint + tokenizer，self-skip 77，
+  TIMEOUT 1800）：4 个 confident 文本 prompt（2 EN + 2 CJK，min top1-top2
+  gap 0.625 / 2.875 / 1.4375 / 0.75，`tools/diag_gen_gaps.py --text` 选定）：
+  native encode == HF encode、greedy 生成 == pinned-quantized oracle、native
+  decode == HF decode（skip_special_tokens=False）、stop_reason +
+  forward_count 全 **EXACT**；EOS = **真实 248044**（非 Phase A 哨兵
+  248319）；污染门 T1→T3→T1 逐字段相同。
+- `tools/generate_qwen35_golden.py` 扩展 `--gen-text`（Phase A 参数不动）：
+  文本经 pinned HF tokenizer 编码走同一 pinned-quantized oracle，golden 附
+  `gen.prompt_text` + `gen.hf_decoded` metadata。
+- `tools/diag_gen_gaps.py` 扩展 `--text`（原始文本 prompt 的逐步 gap 分析 +
+  HF 解码回显，供 Phase B prompt 选型；Phase A `--prompt` 不动）。
+
+### 验收证据（RTX 2080 Ti / CUDA 11.8）
+
+- 完整 ctest 全 PASS（旧 38 全回归 + **3 新增**：
+  `test_qwen35_tokenizer_python_selftest` + `test_qwen35_tokenizer` +
+  `test_qwen35_text_generation`）。
+- `scripts/check_no_torch.sh` **CLEAN**（include/、src/ 无 torch/pybind ——
+  tokenizer 与文本层均为纯 C++，运行时零 Python 依赖）。
+- v0.3 模型数学 / Qwen35Model/Generator 语义 / CUDA kernel / Phase A golden
+  **零改动**（Phase A 场景 A/B + 污染门原样通过）。
