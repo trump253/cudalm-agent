@@ -7,9 +7,13 @@
 //     -> regex pre-tokenization   (leftmost-first, PCRE/Onig semantics)
 //     -> ByteLevel BPE            (248044-token base vocab, 247587 merges)
 //     -> token ids
-//   decode: token ids -> UTF-8 (byte strings for base tokens, literal UTF-8
-//   for added tokens; padding ids 248077..248319 decode to "" exactly like
-//   the pinned HuggingFace oracle).
+//   decode: token ids -> COMPLETE byte stream (raw ByteLevel bytes for base
+//   tokens, literal UTF-8 for added tokens, padding ids 248077..248319
+//   contribute nothing — exactly like the pinned HuggingFace oracle) ->
+//   lossy UTF-8 conversion of the WHOLE stream (each maximal invalid
+//   subpart -> one U+FFFD; a legal multi-byte character may be split across
+//   several base tokens and is still decoded as one character).  The output
+//   is always valid UTF-8.
 //
 // The whole pipeline is transcribed offline by
 // tools/convert_qwen35_tokenizer.py into the CUDLMTK1 artifact (vocab,

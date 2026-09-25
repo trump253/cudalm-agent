@@ -188,6 +188,81 @@ std::string utf8_encode(const std::uint32_t* cps, std::size_t n) {
   return s;
 }
 
+// Lossy UTF-8 conversion (the pinned HF/tokenizers ByteLevel decoder
+// semantics, Rust `String::from_utf8_lossy`): the input is a COMPLETE byte
+// stream (base-token bytes + added-token UTF-8, padding dropped); every
+// maximal invalid subpart is replaced by exactly ONE U+FFFD (UTS #35), a
+// valid sequence is emitted as-is.  The conversion must be done on the whole
+// stream, never per token: a legal multi-byte character may be split across
+// several base tokens (E4 + B8 + AD -> U+4E2D).
+void utf8_lossy(const std::string& bytes, std::string* out) {
+  const std::size_t n = bytes.size();
+  std::size_t i = 0;
+  auto fffd = [&out]() { out->append("\xEF\xBF\xBD"); };
+  auto is_cont = [](std::uint8_t b) { return (b & 0xC0u) == 0x80u; };
+  while (i < n) {
+    const std::uint8_t b = static_cast<std::uint8_t>(bytes[i]);
+    if (b < 0x80u) {
+      out->push_back(static_cast<char>(b));
+      ++i;
+      continue;
+    }
+    // Multi-byte lead: expected length + per-position continuation ranges.
+    int len = 0;
+    std::uint8_t lo[4] = {0, 0, 0, 0}, hi[4] = {0, 0, 0, 0};
+    if (b >= 0xC2u && b <= 0xDFu) {
+      len = 2; lo[0] = 0x80; hi[0] = 0xBF;
+    } else if (b == 0xE0u) {
+      len = 3; lo[0] = 0xA0; hi[0] = 0xBF; lo[1] = 0x80; hi[1] = 0xBF;
+    } else if (b >= 0xE1u && b <= 0xECu) {
+      len = 3; lo[0] = 0x80; hi[0] = 0xBF; lo[1] = 0x80; hi[1] = 0xBF;
+    } else if (b == 0xEDu) {
+      len = 3; lo[0] = 0x80; hi[0] = 0x9F; lo[1] = 0x80; hi[1] = 0xBF;
+    } else if (b >= 0xEEu && b <= 0xEFu) {
+      len = 3; lo[0] = 0x80; hi[0] = 0xBF; lo[1] = 0x80; hi[1] = 0xBF;
+    } else if (b == 0xF0u) {
+      len = 4; lo[0] = 0x90; hi[0] = 0xBF; lo[1] = 0x80; hi[1] = 0xBF;
+      lo[2] = 0x80; hi[2] = 0xBF;
+    } else if (b >= 0xF1u && b <= 0xF3u) {
+      len = 4; lo[0] = 0x80; hi[0] = 0xBF; lo[1] = 0x80; hi[1] = 0xBF;
+      lo[2] = 0x80; hi[2] = 0xBF;
+    } else if (b == 0xF4u) {
+      len = 4; lo[0] = 0x80; hi[0] = 0x8F; lo[1] = 0x80; hi[1] = 0xBF;
+      lo[2] = 0x80; hi[2] = 0xBF;
+    } else {
+      // Invalid lead byte (0x80..0xC1, 0xF5..0xFF): one FFFD for this byte.
+      fffd();
+      ++i;
+      continue;
+    }
+    // Consume the in-range continuation bytes, tracking the maximal
+    // subpart.  sub = subpart size including the lead.  A continuation byte
+    // IN its position range extends the subpart; the first byte that is not
+    // a continuation byte, that is OUT of the position range, or EOF ends
+    // the subpart BEFORE it (that byte then starts its own subpart — the
+    // pinned engine gives every such byte its own U+FFFD; oracle-verified
+    // on ED+A0+80 -> 3 x FFFD, F4+90+80+80 -> 4 x FFFD, E0+80+80 -> 3 x
+    // FFFD).  With the per-position ranges above, a fully-consumed sequence
+    // is always a valid code point — no surrogates / no > U+10FFFF — so the
+    // bytes can be copied verbatim.
+    std::size_t sub = 1;
+    for (int j = 1; j < len; ++j) {
+      if (i + j >= n) break;
+      const std::uint8_t cj = static_cast<std::uint8_t>(bytes[i + j]);
+      if (!is_cont(cj)) break;
+      if (cj < lo[j - 1] || cj > hi[j - 1]) break;
+      sub = j + 1;
+    }
+    if (sub == static_cast<std::size_t>(len)) {
+      out->append(bytes, i, len);
+      i += len;
+    } else {
+      fffd();
+      i += sub;
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Regex pre-tokenizer (pinned Qwen3.5 pattern, leftmost-first semantics).
 //
@@ -1131,23 +1206,31 @@ Status Qwen35Tokenizer::decode(const std::uint32_t* ids, std::size_t n,
                                bool skip_special_tokens,
                                std::string* out_utf8) const {
   out_utf8->clear();
+  // 1) token ids -> COMPLETE byte stream: base tokens contribute their raw
+  //    ByteLevel bytes (NOT validated here — a legal character may be split
+  //    across tokens), added tokens contribute their literal UTF-8 (dropped
+  //    when special && skip_special_tokens), padding ids contribute nothing
+  //    (the pinned HF/Rust oracle silently drops them).
+  std::string bytes;
   for (std::size_t i = 0; i < n; ++i) {
     const std::uint32_t id = ids[i];
     if (id >= model_vocab_size_)
       return Status::error("decode: id out of range");
     if (id < base_vocab_size_) {
-      out_utf8->append(base_vocab_[id]);
+      bytes.append(base_vocab_[id]);
       continue;
     }
     const std::size_t idx = id - first_added_id_;
     if (idx < added_.size()) {
       if (!(skip_special_tokens && added_[idx].special))
-        out_utf8->append(added_[idx].utf8);
+        bytes.append(added_[idx].utf8);
       continue;
     }
-    // Padding id (248077..248319): no tokenizer entry; the pinned HF/Rust
-    // oracle decodes it to "" (silently dropped) — match exactly.
   }
+  // 2) lossy UTF-8 conversion of the whole stream (maximal invalid subpart
+  //    -> one U+FFFD; valid sequences copied verbatim).  The output is
+  //    always valid UTF-8.
+  utf8_lossy(bytes, out_utf8);
   return Status::ok_status();
 }
 
