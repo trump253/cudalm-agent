@@ -1112,8 +1112,13 @@ def generate_fullmodel(cudalm_path: str, ckpt_dir: str, out_prefix: str,
 # token id (torch.argmax on the bf16 logits == the C++ argmax_bf16 contract).
 # ---------------------------------------------------------------------------
 def generate_generation(cudalm_path: str, ckpt_dir: str, out_prefix: str,
-                        scenarios, input_seed: int) -> int:
-    """scenarios: a list of (name, prompt_tokens, max_new_tokens, eos, save_state)."""
+                        scenarios, input_seed: int, hf_tok=None) -> int:
+    """scenarios: a list of (name, prompt_tokens, max_new_tokens, eos,
+    save_state, prompt_text). prompt_text is None (Phase A id scenarios) or
+    the raw UTF-8 text (Phase B --gen-text scenarios); with hf_tok set the
+    generated ids are ALSO decoded by the pinned HF tokenizer and stored as
+    the gen.hf_decoded metadata field (the C++ E2E test compares its native
+    decode against it)."""
     st_path = os.path.join(ckpt_dir, "model.safetensors")
     cfg_path = os.path.join(ckpt_dir, "raw", "config.json")
     if not (os.path.isfile(st_path) and os.path.isfile(cfg_path)):
@@ -1202,7 +1207,8 @@ def generate_generation(cudalm_path: str, ckpt_dir: str, out_prefix: str,
     out_dir = os.path.dirname(os.path.abspath(out_prefix))
     os.makedirs(out_dir, exist_ok=True)
 
-    def run_scenario(name, prompt_tokens, max_new_tokens, eos, save_state):
+    def run_scenario(name, prompt_tokens, max_new_tokens, eos, save_state,
+                     prompt_text=None):
         for tid in prompt_tokens:
             if not (0 <= tid < V):
                 print(f"error: scenario {name} prompt token {tid} out of range "
@@ -1297,6 +1303,13 @@ def generate_generation(cudalm_path: str, ckpt_dir: str, out_prefix: str,
             "transformers_commit": TRANSFORMERS_COMMIT,
             "checkpoint_sha256": CHECKPOINT_SHA256,
         }
+        if prompt_text is not None:
+            # Phase B: the raw prompt text + the pinned HF decode of the
+            # generated ids (skip_special_tokens=False). The C++ E2E test
+            # compares its native encode/decode against BOTH of these.
+            metadata["gen.prompt_text"] = prompt_text
+            metadata["gen.hf_decoded"] = hf_tok.decode(
+                generated, skip_special_tokens=False)
         gf = v2.V2File(pinned, metadata, tensors)
         with open(f"{out_prefix}_gen_{name}.cudalm", "wb") as f:
             f.write(gf.to_bytes())
@@ -1307,9 +1320,10 @@ def generate_generation(cudalm_path: str, ckpt_dir: str, out_prefix: str,
               f"{', + final state' if save_state else ''}")
         return True
 
-    for (name, prompt_tokens, max_new_tokens, eos, save_state) in scenarios:
+    for (name, prompt_tokens, max_new_tokens, eos, save_state,
+         prompt_text) in scenarios:
         if not run_scenario(name, prompt_tokens, max_new_tokens, eos,
-                            save_state):
+                            save_state, prompt_text):
             return 1
     return 0
 
@@ -1492,6 +1506,16 @@ if __name__ == "__main__":
     ap.add_argument("--gen-b-state", default="1",
                     help="v0.4 Phase A scenario B: save the final persistent "
                          "state (1) or not (0)")
+    ap.add_argument("--gen-text", action="append", default=[],
+                    help="v0.4 Phase B: raw UTF-8 text prompt, encoded by the "
+                         "pinned HF tokenizer before generation; scenario "
+                         "names T1, T2, ...; the real tokenizer EOS is used")
+    ap.add_argument("--gen-text-max", type=int, default=8,
+                    help="v0.4 Phase B: max_new_tokens for each --gen-text "
+                         "scenario")
+    ap.add_argument("--gen-text-eos", type=int, default=248044,
+                    help="v0.4 Phase B: the pinned real EOS id "
+                         "(text_config.eos_token_id)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -1511,18 +1535,30 @@ if __name__ == "__main__":
                      "--gen-prefix")
         def _ints(s):
             return [int(x) for x in s.split(",") if x.strip()]
-        scenarios = []
+        scenarios = []  # (name, prompt_tokens, max_new, eos, save_state,
+        #                text_info) with text_info = None or (raw_text,
+        #                hf_decoded) for the Phase B --gen-text scenarios.
         if a.gen_a_tokens:
             scenarios.append(("A", _ints(a.gen_a_tokens), a.gen_a_max,
-                              a.gen_a_eos, False))
+                              a.gen_a_eos, False, None))
         if a.gen_b_tokens:
             scenarios.append(("B", _ints(a.gen_b_tokens), a.gen_b_max,
-                              a.gen_b_eos, a.gen_b_state == "1"))
+                              a.gen_b_eos, a.gen_b_state == "1", None))
+        hf_tok = None
+        if a.gen_text:
+            import qwen35_tokenizer_ref as ref  # tools/common (pinned files)
+            hf_tok = ref.build_tokenizer(
+                ref.tokenizer_dir(a.checkpoint_dir))
+            for i, text in enumerate(a.gen_text):
+                ids = list(hf_tok.encode(text).ids)
+                scenarios.append((f"T{i + 1}", ids, a.gen_text_max,
+                                  a.gen_text_eos, False, text))
         if not scenarios:
             ap.error("--gen-prefix requires --gen-a-tokens and/or "
-                     "--gen-b-tokens")
+                     "--gen-b-tokens and/or --gen-text")
         sys.exit(generate_generation(a.cudalm, a.checkpoint_dir, a.gen_prefix,
-                                     scenarios, a.input_seed))
+                                     scenarios, a.input_seed,
+                                      hf_tok=hf_tok))
     if a.microstack_prefix:
         if not (a.cudalm and a.checkpoint_dir):
             ap.error("--cudalm and --checkpoint-dir are required for "

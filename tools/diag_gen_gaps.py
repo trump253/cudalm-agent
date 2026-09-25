@@ -10,6 +10,12 @@ is stable.
 Usage:
     python diag_gen_gaps.py --cudalm <path> --checkpoint-dir <dir> \
         --prompt "15,16,17" --max 8 [--prompt "..." --max 8 ...]
+
+Raw-TEXT prompts (encoded by the pinned HF tokenizer before generation;
+Phase B prompt-selection tool):
+    python diag_gen_gaps.py --cudalm <path> --checkpoint-dir <dir> \
+        --text "The capital of France is" --max 8 \
+        [--text "..." --max 8 ...]
 """
 import argparse
 import json
@@ -110,24 +116,45 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cudalm", required=True)
     ap.add_argument("--checkpoint-dir", required=True)
-    ap.add_argument("--prompt", action="append", required=True)
+    ap.add_argument("--prompt", action="append", default=[])
     ap.add_argument("--max", action="append", type=int, default=[])
+    ap.add_argument("--text", action="append", default=[])
+    ap.add_argument("--text-max", action="append", type=int, default=[])
     ap.add_argument("--eos", type=int, default=248319)
+    ap.add_argument("--decode", action="store_true",
+                    help="decode the generated ids via the pinned HF "
+                         "tokenizer (requires the tokenizer files)")
     a = ap.parse_args()
+    if not a.prompt and not a.text:
+        ap.error("provide at least one --prompt or --text")
     model = build(a.cudalm, a.checkpoint_dir)
+
+    tok = None
+    if a.text or a.decode:
+        import qwen35_tokenizer_ref as ref  # tools/common on sys.path
+        tok = ref.build_tokenizer(ref.tokenizer_dir(a.checkpoint_dir))
+
     # pair --prompt with --max (max defaults to 8)
     prompts = []
     for i, p in enumerate(a.prompt):
         toks = [int(x) for x in p.split(",") if x.strip()]
         m = a.max[i] if i < len(a.max) else 8
-        prompts.append((toks, m))
-    for toks, m in prompts:
+        prompts.append((None, toks, m))
+    for i, t in enumerate(a.text):
+        toks = list(tok.encode(t).ids)
+        m = a.text_max[i] if i < len(a.text_max) else 8
+        prompts.append((t, toks, m))
+    for text, toks, m in prompts:
         gaps, gen = gen_gap(model, toks, m, a.eos)
         mingap = min(g[1] for g in gaps)
         worst = min(gaps, key=lambda g: g[1])
         status = "CONFIDENT" if mingap > 0.4 else "near-tie!"
-        print(f"prompt={toks} max={m}")
+        label = f" (text={text!r})" if text is not None else ""
+        print(f"prompt={toks}{label} max={m}")
         print(f"  generated={gen}")
+        if tok is not None and gen:
+            print("  decoded=" + repr(
+                tok.decode(gen, skip_special_tokens=False)))
         print(f"  min_gap={mingap:.6f}  ({status})  worst step "
               f"{worst[0]}: gap={worst[1]:.6f} top1={worst[2]} top2={worst[3]}")
         for step, gap, top1, top2 in gaps:

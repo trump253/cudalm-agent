@@ -403,6 +403,26 @@ if(CUDALM_PYTHON3)
                      ${CMAKE_BINARY_DIR}/data/qwen35_gen)
     set_tests_properties(test_qwen35_generation_contract PROPERTIES
       SKIP_RETURN_CODE 77 TIMEOUT 600)
+    # v0.4 Phase B: text-level E2E hard gate (raw UTF-8 in / out). Four
+    # confident prompts (2 EN, 2 CJK; min top1-top2 logit gap > 0.4 at every
+    # step, selected via tools/diag_gen_gaps.py): native encode == pinned HF
+    # encode, greedy generation == pinned-quantized oracle, native decode ==
+    # pinned HF decode — all EXACT — with the REAL tokenizer EOS (248044),
+    # plus the text-level contamination repeat. Self-skips (77) when the
+    # checkpoint / tokenizer files are absent.
+    add_executable(test_qwen35_text_generation
+                   cuda/test_qwen35_text_generation.cpp)
+    target_link_libraries(test_qwen35_text_generation PRIVATE cudalm)
+    add_test(NAME test_qwen35_text_generation
+             COMMAND test_qwen35_text_generation
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR}
+                     ${CMAKE_BINARY_DIR}/data/qwen35_textgen)
+    set_tests_properties(test_qwen35_text_generation PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
   else()
     message(STATUS "tool python lacks torch/safetensors/numpy: "
                    "qwen35 ingestion tests disabled")
