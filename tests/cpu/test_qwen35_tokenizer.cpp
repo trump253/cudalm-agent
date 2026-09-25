@@ -18,8 +18,10 @@
 //   * LOADER FAILURE CONTRACT: every corruption class (bad magic / version /
 //     reserved / crc / truncation) must fail loud with ok == false.
 //   * STAGE VECTORS: hand-pinned NFC and pre-tokenization cases, incl. the
-//     leftmost-first apostrophe branch ("'mX" -> "'m" + "X") and the
-//     no-reordering combining sequences the oracles implement.
+//     leftmost-first apostrophe branch ("'mX" -> "'m" + "X"), the
+//     DESCENDING-CCC canonical-ordering regressions (UAX #15: canonical
+//     ordering by CCC before composition) and the jamo cases the oracles
+//     treat as ccc 0 (no jamo reordering).
 //   * DECODE CONTRACT: padding ids (248077..248319) decode to "" (the
 //     oracle silently drops them); out-of-range ids fail loud;
 //     is_special() is exact over the 33 added ids; eos id == 248044.
@@ -163,7 +165,7 @@ int test_load_failures(const std::vector<std::uint8_t>& good) {
 
 // --- stage vectors ------------------------------------------------------------
 int test_nfc_vectors(const Qwen35Tokenizer& tk) {
-  std::fprintf(stderr, "[nfc] stage vectors (oracle-verified, no reordering)\n");
+  std::fprintf(stderr, "[nfc] stage vectors (oracle-verified UAX #15)\n");
   int rc = 0;
   auto run = [&](const char* name, std::vector<std::uint32_t> in,
                  std::vector<std::uint32_t> want) -> int {
@@ -185,21 +187,53 @@ int test_nfc_vectors(const Qwen35Tokenizer& tk) {
     std::fprintf(stderr, "  %-34s OK\n", name);
     return 0;
   };
-  // Expectations verified against BOTH oracles (unicodedata.normalize and the
-  // pinned tokenizers engine): NFC = decompose, NO reorder, greedy L->R
-  // composition.  The 27 composing T-jamo are U+11A8..U+11C2 (T1..T27);
-  // U+11C3+ are unassigned/reserved and never compose (the oracle leaves
-  // AC00+U+11F2 and AC00+U+11F6 as-is).
+  // Expectations verified against BOTH oracles (unicodedata.normalize and
+  // the pinned tokenizers engine, which applies NFC inside encode): NFC =
+  // full canonical decomposition -> CANONICAL ORDERING by CCC (stable within
+  // each combining sequence; ccc == 0 is a starter boundary) -> greedy
+  // canonical composition.  The 27 composing T-jamo are U+11A8..U+11C2
+  // (T1..T27); jamo are ccc 0 in the table (the pinned oracles never
+  // reorder jamo); U+11C3+ are unassigned/reserved and never compose (the
+  // oracle leaves AC00+U+11F2 and AC00+U+11F6 as-is).
   rc |= run("e+0301 -> U+00E9", {0x65, 0x301}, {0xE9});
   rc |= run("A+0308(diaeresis) -> U+00C4", {0x41, 0x308}, {0xC4});
   rc |= run("A+0308+0301 -> U+00C4+U+0301", {0x41, 0x308, 0x301}, {0xC4, 0x301});
   rc |= run("A+0300+0301 -> U+00C0+U+0301 (greedy L->R)", {0x41, 0x300, 0x301},
       {0xC0, 0x301});
   rc |= run("A+030A(ring)+0301 -> U+01FA", {0x41, 0x30A, 0x301}, {0x1FA});
-  rc |= run("A+0301+0300 no reorder -> U+00C1+U+0300", {0x41, 0x301, 0x300},
-      {0xC1, 0x300});
-  rc |= run("0301+0300 mark-only unchanged", {0x301, 0x300}, {0x301, 0x300});
-  rc |= run("0300+A unchanged (no reorder)", {0x300, 0x41}, {0x300, 0x41});
+  rc |= run("A+0301+0300 equal ccc stable -> U+00C1+U+0300",
+      {0x41, 0x301, 0x300}, {0xC1, 0x300});
+  rc |= run("A+0301+0308 equal ccc stable -> U+00C1+U+0308",
+      {0x41, 0x301, 0x308}, {0xC1, 0x308});
+  rc |= run("0301+0300 mark-only equal ccc unchanged", {0x301, 0x300},
+      {0x301, 0x300});
+  rc |= run("0300+A unchanged (no reorder across starter)", {0x300, 0x41},
+      {0x300, 0x41});
+  // --- DESCENDING ccc: the canonical-ordering regressions.  The old
+  // implementation (no reordering) FAILS every case below: without moving
+  // the lower-ccc mark before the higher-ccc one, (starter, lower mark)
+  // never composes and the sequence stays uncomposed / mis-ordered.
+  rc |= run("A+0315+0300 DESC (232,230) -> U+00C0+U+0315", {0x41, 0x315, 0x300},
+      {0xC0, 0x315});
+  rc |= run("A+0315+0308 DESC -> U+00C4+U+0315", {0x41, 0x315, 0x308},
+      {0xC4, 0x315});
+  rc |= run("A+0315+0301 DESC -> U+00C1+U+0315", {0x41, 0x315, 0x301},
+      {0xC1, 0x315});
+  rc |= run("a+0315+0300 DESC -> U+00E0+U+0315", {0x61, 0x315, 0x300},
+      {0xE0, 0x315});
+  rc |= run("A+0315+0300+0301 3-level -> U+00C0+U+0301+U+0315",
+      {0x41, 0x315, 0x300, 0x301}, {0xC0, 0x301, 0x315});
+  rc |= run("A+0300+0315 ASC -> U+00C0+U+0315", {0x41, 0x300, 0x315},
+      {0xC0, 0x315});
+  rc |= run("0315+0300 mark-only DESC -> 0300+0315", {0x315, 0x300},
+      {0x300, 0x315});
+  rc |= run("0300+0315+0301 mark-only reorder -> 0300+0301+0315",
+      {0x300, 0x315, 0x301}, {0x300, 0x301, 0x315});
+  // precomposed + marks; recursive decomposition; Greek 1FEE -> 0385.
+  rc |= run("U+00C0+0300+0315 precomp+marks", {0xC0, 0x300, 0x315},
+      {0xC0, 0x300, 0x315});
+  rc |= run("U+0763 recursive decomp -> U+0763", {0x763}, {0x763});
+  rc |= run("U+1FEE -> U+0385 (Greek)", {0x1FEE}, {0x385});
   rc |= run("L+V+T jamo -> U+AC01", {0x1100, 0x1161, 0x11A8}, {0xAC01});
   rc |= run("L+V+T2 jamo -> U+AC02", {0x1100, 0x1161, 0x11A9}, {0xAC02});
   rc |= run("L+V+T27 jamo (U+11C2) -> U+AC1B", {0x1100, 0x1161, 0x11C2},
@@ -350,7 +384,7 @@ int test_corpus(const Qwen35Tokenizer& tk, const std::string& corpus_path) {
   std::fprintf(stderr, "[corpus] cross-language exactness (E/D/D1/N/P)\n");
   std::ifstream f(corpus_path);
   CHECK(f);
-  int nE = 0, nD = 0, nD1 = 0, nN = 0, nP = 0;
+  int nE = 0, nD = 0, nD1 = 0, nN = 0, nP = 0, nX = 0;
   int rc = 0;
   std::string line;
   int lineno = 0;
@@ -471,12 +505,34 @@ int test_corpus(const Qwen35Tokenizer& tk, const std::string& corpus_path) {
         rc |= 1;
       }
       ++nP;
+    } else if (kind == 'X') {
+      // Arbitrary token-ID decode (X <ids_csv> <skip 0|1> <expected_hex>):
+      // id sequences never produced by encode(text) — raw ByteLevel bytes,
+      // padding and added ids in arbitrary mix.  The native decode (byte
+      // stream -> lossy UTF-8) must match the pinned engine EXACTLY.
+      const auto sp1 = rest.find(' ');
+      const std::string ids_csv = rest.substr(0, sp1);
+      const std::string tail = rest.substr(sp1 + 1);
+      const auto sp2 = tail.find(' ');
+      const bool skip = tail.substr(0, sp2) == "1";
+      const std::string want = hex_decode(tail.substr(sp2 + 1));
+      const std::vector<std::uint32_t> ids = parse_ids(ids_csv);
+      std::string got;
+      Status s = tk.decode(ids.data(), ids.size(), skip, &got);
+      CHECK(s.ok);
+      if (got != want) {
+        std::fprintf(stderr,
+                     "  FAIL line %d decode-X (skip=%d) of %zu ids\n", lineno,
+                     static_cast<int>(skip), ids.size());
+        rc |= 1;
+      }
+      ++nX;
     } else {
       fail("unknown line kind");
     }
   }
-  std::fprintf(stderr, "  lines: E=%d D=%d D1=%d N=%d P=%d  %s\n", nE, nD, nD1,
-               nN, nP, rc ? "(FAILURES)" : "(all exact)");
+  std::fprintf(stderr, "  lines: E=%d D=%d D1=%d N=%d P=%d X=%d  %s\n", nE, nD,
+               nD1, nN, nP, nX, rc ? "(FAILURES)" : "(all exact)");
   return rc;
 }
 
