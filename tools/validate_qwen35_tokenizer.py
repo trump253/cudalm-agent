@@ -230,20 +230,19 @@ class Validator:
         cps = [c for c in range(0x110000)
                if not (0xD800 <= c <= 0xDFFF) and c % stride == 0]
         bad = 0
+        n = 0  # ACTUAL number of comparisons (probe 3 skips CR/LF)
         BATCH = 20000
         for i in range(0, len(cps), BATCH):
             chunk = cps[i:i + BATCH]
             t1 = ["a" + chr(c) for c in chunk]
             t2 = ["a" + chr(c) + "b" for c in chunk]
             t3 = [chr(c) + chr(c) + "x" for c in chunk if c not in (0x0D, 0x0A)]
-            for texts in (t1, t2):
+            for texts in (t1, t2, t3):
                 g = self.pre_native(texts)
                 w = self.pre_engine(texts)
+                n += len(texts)
                 bad += sum(1 for a, b in zip(g, w) if a != b)
-            g = self.pre_native(t3)
-            w = self.pre_engine(t3)
-            bad += sum(1 for a, b in zip(g, w) if a != b)
-        return self.check("class_probe", len(cps) * 3, bad,
+        return self.check("class_probe", n, bad,
                           "exhaustive/stride%d" % stride)
 
     def p_ws_battery(self):

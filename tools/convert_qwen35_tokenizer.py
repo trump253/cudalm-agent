@@ -408,6 +408,39 @@ def read_artifact(data):
 
 
 def selftest(tdir, model_vocab_size, eos_token_id):
+    # Oracle version gate regression (provenance): the pinned version is
+    # accepted; ANY other version is rejected (fail loud, no skip).
+    # The gate reads tokenizers.__version__ at call time, so a temporary
+    # patch exercises the rejection path without another environment.
+    import tokenizers
+    ver = ref.check_oracle_version()
+    assert ver == ref.EXPECTED_TOKENIZERS_VERSION, \
+        "live oracle is not the pinned %s (got %s)" % (
+            ref.EXPECTED_TOKENIZERS_VERSION, ver)
+    saved = tokenizers.__version__
+    try:
+        for bad in ("0.15.1", "0.22.3", "99.99.99", None):
+            tokenizers.__version__ = bad
+            try:
+                ref.check_oracle_version()
+            except ref.OracleVersionError:
+                pass
+            else:
+                raise AssertionError(
+                    "wrong oracle version accepted: %r" % (bad,))
+            try:
+                ref.build_tokenizer(tdir)
+            except ref.OracleVersionError:
+                pass
+            else:
+                raise AssertionError(
+                    "build_tokenizer accepted a non-pinned oracle: %r"
+                    % (bad,))
+    finally:
+        tokenizers.__version__ = saved
+    # after the patch is undone, the gate must pass again (live 0.22.2)
+    assert ref.check_oracle_version() == ref.EXPECTED_TOKENIZERS_VERSION
+
     a1 = build_artifact(tdir, model_vocab_size, eos_token_id)
     a2 = build_artifact(tdir, model_vocab_size, eos_token_id)
     assert a1 == a2, "artifact is not deterministic"

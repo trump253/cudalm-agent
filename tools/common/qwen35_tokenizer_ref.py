@@ -12,10 +12,14 @@ Pinned sources (see docs/qwen35_architecture.md §18):
   * tokenizer assets (tokenizer/ subdir of the local checkpoint):
         tokenizer.json          (Rust `tokenizers` BPE model, version 1.0)
         tokenizer_config.json   (special-token metadata, chat template)
-  * backend   : the `tokenizers` library (the same Rust engine transformers'
-        PreTrainedTokenizerFast wraps).  The pinned transformers (4.57.0.dev0
-        per raw/config.json) uses Qwen2TokenizerFast, a pure
-        PreTrainedTokenizerFast subclass — no custom encode/decode.
+  * backend   : the `tokenizers` library, PINNED to version 0.22.2
+        (EXPECTED_TOKENIZERS_VERSION).  build_tokenizer() enforces the
+        pin via check_oracle_version(): a different importable version is
+        a provenance violation that fails loud (never skipped, never
+        silently substituted — e.g. by a system tokenizers 0.15.1).
+        The pinned transformers (4.57.0.dev0 per raw/config.json) uses
+        Qwen2TokenizerFast, a pure PreTrainedTokenizerFast subclass —
+        no custom encode/decode.
 
 Effective added-token set (transformers `PreTrainedTokenizerFast.__init__`
 sync logic, verified against the transformers 4.40.2 source): the 22 added
@@ -38,6 +42,11 @@ NUM_ADDED = 33                    # ids 248044..248076
 FIRST_ADDED_ID = 248044           # == EOS token id
 MODEL_VOCAB_SIZE = 248320         # model LM-head width (padded)
 EOS_TOKEN_ID = 248044             # config text_config.eos_token_id, single EOS
+# Pinned oracle ENGINE version.  The authoritative tokenizer oracle MUST be
+# exactly this `tokenizers` (Rust engine) version: the D1/D2 data-version
+# findings (U9 normalizer / U16 regex classes, docs §20) were proven against
+# 0.22.2, and the whole correctness evidence is bound to it.
+EXPECTED_TOKENIZERS_VERSION = "0.22.2"
 # sha256 of the four pinned tokenizer files (downloaded at the pinned
 # revision; see the Phase B download record in docs/provenance.md).
 EXPECTED_SHA256 = {
@@ -52,12 +61,44 @@ EXPECTED_SHA256 = {
 }
 
 
+class OracleVersionError(RuntimeError):
+    """The authoritative `tokenizers` oracle is not the pinned version.
+
+    This is a PROVENANCE VIOLATION: it is NOT a "cannot run here" condition
+    (missing tokenizer assets are, and callers self-skip 77 for those).
+    A wrong oracle version must fail loud — never be skipped, and never be
+    silently substituted by another installed tokenizers (e.g. system
+    0.15.1).
+    """
+
+
 def _sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def check_oracle_version(expected=EXPECTED_TOKENIZERS_VERSION):
+    """Single version gate for the authoritative tokenizer oracle.
+
+    Every oracle path (converter, corpus generator, differential validator,
+    text golden, gap diagnostics) builds its oracle through
+    build_tokenizer(), which calls this gate before ANY engine use.  The
+    importable `tokenizers` library must be EXACTLY `expected`
+    (default: the pinned 0.22.2); anything else raises OracleVersionError.
+    """
+    import tokenizers
+    got = getattr(tokenizers, "__version__", None)
+    if got != expected:
+        raise OracleVersionError(
+            "oracle provenance violation: importable tokenizers version %r "
+            "!= pinned %s. The authoritative oracle must be exactly "
+            "tokenizers==%s; a different version is a provenance violation "
+            "(fail loud), never a silent fallback or a skip."
+            % (got, expected, expected))
+    return got
 
 
 def tokenizer_dir(checkpoint_dir):
@@ -112,8 +153,13 @@ def effective_added_tokens(tdir):
 def build_tokenizer(tdir):
     """Build the effective `tokenizers.Tokenizer` object (tokenizer.json
     pipeline + the 33 effective added tokens).  This is the oracle.
+
+    The engine VERSION gate runs first: if the importable tokenizers is not
+    exactly the pinned 0.22.2, OracleVersionError is raised before any
+    engine call (see check_oracle_version).
     """
     import tokenizers  # local import: keep the module importable without it
+    check_oracle_version()
 
     tk = json.load(open(os.path.join(tdir, "tokenizer.json")))
     tk["added_tokens"] = [
