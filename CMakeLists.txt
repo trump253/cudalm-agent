@@ -107,6 +107,16 @@ function(cudalm_add_test exe name)
   add_test(NAME ${name} COMMAND ${exe})
 endfunction()
 
+# --------------------------------------------------------------------------
+# Tools (differential validation against the pinned engine; NOT runtime code)
+# --------------------------------------------------------------------------
+# tools/dump_qwen35_tokenizer.cpp: dumps native encode/decode/NFC/pre-tokenize
+# stages for hex inputs so tools/validate_qwen35_tokenizer.py can compare each
+# stage EXACTLY with the pinned tokenizers engine (docs §20.5 validation).
+add_executable(tool_qwen35_tokenizer_dump
+               tools/dump_qwen35_tokenizer.cpp)
+target_link_libraries(tool_qwen35_tokenizer_dump PRIVATE cudalm)
+
 add_subdirectory(tests)
 add_subdirectory(benchmarks)
 

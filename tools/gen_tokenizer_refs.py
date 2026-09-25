@@ -34,10 +34,17 @@ The corpus deliberately covers the whole pinned contract:
   * the empty string and single-character / single-byte inputs,
   * a long mixed-language paragraph.
 
-The P (pre-tokenization) lines use the pinned regex evaluated by an
-INDEPENDENT engine (Python re, leftmost-first) with the UAX #44 White_Space
-set and unicodedata L/N/M categories — a cross-engine check of the native
-leftmost-first matcher.
+ORACLES (the pinned tokenizers engine is the oracle of record):
+  * N (NFC) lines: expected = normalizer.normalize_str(text) — the pinned
+    engine's U9 normalizer stage.  Python unicodedata (U14) is a secondary
+    diagnostic only (it legitimately differs on the 98 U14-only ccc cps and
+    the U+11935/U+11930 Divès Akuru pair — those differences are exactly
+    BLOCKER-D1 and are covered by dedicated regression lines below).
+  * P (pre-tokenization) lines: expected =
+    pre_tokenizer.pre_tokenize_str(normalize_str(text)) — the pinned
+    engine's pre-tokenizer stage on NFC'd input.  A Python re mirror of the
+    pinned pattern (U16 L/N/M ranges, UAX #44 White_Space) remains as a
+    secondary cross-check.
 
 Special/control token strings are handled only symbolically: they are read
 from the pinned tokenizer assets and never printed.
@@ -47,37 +54,26 @@ import argparse
 import os
 import re
 import sys
-import unicodedata
+import unicodedata  # diagnostic ONLY (U14 here); the oracles are the engine
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "common"))
 import qwen35_tokenizer_ref as ref  # noqa: E402
+import qwen35_unicode_ref as uref  # noqa: E402
 
 SEP = "\x1f"  # ASCII unit separator: cannot appear in the corpus data
 
-# UAX #44 White_Space (the set Onig/PCRE2-UCP use for \s in Unicode mode).
+# UAX #44 White_Space — the exact \s class of the pinned pre-tokenizer
+# (25 cps; proven by a per-cp chunking sweep against the pinned engine).
+# U+00A0 is part of White_Space (its absence here was BLOCKER-D2).
 WS_RANGES = [(0x0009, 0x000D), (0x0020, 0x0020), (0x0085, 0x0085),
-             (0x1680, 0x1680), (0x2000, 0x200A), (0x2028, 0x2029),
+             (0x00A0, 0x00A0), (0x1680, 0x1680),
+             (0x2000, 0x200A), (0x2028, 0x2029),
              (0x202F, 0x202F), (0x205F, 0x205F), (0x3000, 0x3000)]
 
 
 def hexify(s):
     return s.encode("utf-8").hex()
-
-
-def _ranges(pred):
-    out = []
-    start = None
-    for c in range(0x110000):
-        p = pred(unicodedata.category(chr(c)))
-        if p and start is None:
-            start = c
-        elif not p and start is not None:
-            out.append((start, c - 1))
-            start = None
-    if start is not None:
-        out.append((start, 0x10FFFF))
-    return out
 
 
 def _esc(c):
@@ -97,10 +93,12 @@ def _class_body(ranges):
 
 def build_pretok_pattern():
     """The pinned Qwen3.5 pre-tokenization regex (leftmost-first), rendered
-    for Python re with explicit UAX class definitions."""
-    L = _class_body(_ranges(lambda cat: cat.startswith("L")))
-    N = _class_body(_ranges(lambda cat: cat.startswith("N")))
-    M = _class_body(_ranges(lambda cat: cat.startswith("M")))
+    for Python re with explicit UAX class definitions.  The L/N/M ranges use
+    Unicode 16.0.0 (the data version of the pinned regex engine, see
+    qwen35_unicode_ref); White_Space is UAX #44 (25 cps)."""
+    L = _class_body(uref.category_ranges("16.0.0", "L"))
+    N = _class_body(uref.category_ranges("16.0.0", "N"))
+    M = _class_body(uref.category_ranges("16.0.0", "M"))
     WS = _class_body(WS_RANGES)
     CRNL = r"[\r\n]"
     cls_ws = "[" + WS + "]"
@@ -196,6 +194,38 @@ def main():
     add("a\u00a0b")
     add("\u2028\u2029")
     add("nbsp \u2000em\u2003quad")
+    # --- BLOCKER-D2 regressions (U+00A0 in the pre-tokenizer \s class) -----
+    # Final-encode cases where the OLD 9-range White_Space produced a
+    # DIFFERENT token id sequence (NBSP was chunked as a word prefix /
+    # B4 symbol run instead of a B6 whitespace run).
+    add("a\u00a0\u00a0b")
+    add("\u00a0\u00a0word")
+    add("word\u00a0\u00a0")
+    add(" \u00a0\u00df")
+    add("x \u00a0 y")
+    add("\u00a0")
+    # --- BLOCKER-D1 regressions (U9-vs-U14 normalization data) -------------
+    # ccc version-difference cases: U+1715 (ccc 9 in U14, 0 in U9) and
+    # U+09FE (ccc 230 in U14, 0 in U9) are STARTERS under the pinned U9
+    # normalizer, so "A <cp> U+0337" keeps text order (engine) whereas the
+    # U14 data reorders it to "A U+0337 <cp>".  Each is covered at the N
+    # stage (below) AND at the final-encode stage (here).
+    add("\u0041\u1715\u0337")
+    add("\u0041\u09fe\u0337")
+    # decomposition/composition version-difference case: U+11938 (Divès
+    # Akuru) decomposes to U+11935 U+11930 in U14, but the pinned U9
+    # normalizer treats the pair as atomic (no pair, no decomposition).
+    add("\U00011935\U00011930")
+    add("\U00011935\U00011930x")
+    # --- regex class version regressions (U16 data of the pinned regex) ----
+    # Letters / digits / marks added in U15/U16: the pinned pre-tokenizer
+    # treats them as \pL/\pN/\pM (single word/number chunks); the old U14
+    # L/N/M ranges classified them as "other".
+    add("a\U00011f02b")          # Kawi letter (U16 L)
+    add("a\U00011f50b")          # Kawi digit (U16 N)
+    add("a\u0897b")              # mark added in U15 (M)
+    add("\U000105c0\U000105c1")  # Vithkuqi extension (U16 L)
+    add("5\u10d40x")             # Osmanya digit (U16 N)
     # --- accented / script ---------------------------------------------------
     add("héllo wörld café naïve résumé señor")
     add("e\u0301")                 # decomposed e-acute
@@ -312,18 +342,42 @@ def main():
         "e\u0301", "A\u0308", "A\u0344\u0301",
         "h\u0331", "\u0061\u0327\u0042", "\u0430\u0306\u0301",
         "\u0915\u094d\u0915\u094d",
+        # (11) BLOCKER-D1 regressions — U9-vs-U14 data differences.  The 98
+        # cps with a U14-only ccc (ccc 0 in the pinned U9 normalizer) are
+        # STARTERS: "A <cp> U+0337(7)" keeps text order under U9 but U14
+        # reorders it to "A U+0337 <cp>".  The OLD U14 tables fail every one
+        # of these lines; the pinned U9 engine (and the fixed native
+        # normalizer) keeps the order.
+        "A\u1715\u0337", "A\u11839\u0337",            # ccc-9 band (U14)
+        "A\u09fe\u0337", "A\u10d24\u0337",            # ccc-230 band (U14)
+        "A\u07fd\u0337", "A\u10f46\u0337", "A\u1abf\u0337",  # ccc-220 band
+        # decomposition/composition version difference: U+11938 (Divès
+        # Akuru) is atomic in U9 (no decomposition, no (11935,11930) pair);
+        # U14 composes the pair to 11938 and decomposes 11938 back.
+        "\U00011935\U00011930", "\U00011935\U00011930x", "\U00011938",
     ]
     for t in nfc_cases:
-        nfc_t = unicodedata.normalize("NFC", t)
-        # Engine consistency: the pinned engine applies its NFC inside
-        # encode, so engine(t) must equal engine(NFC(t)) for every vector;
+        # ORACLE: the pinned engine's U9 normalizer stage (EXACT).
+        nfc_t = tok.normalizer.normalize_str(t)
+        # Engine self-consistency: the engine applies its normalizer inside
+        # encode, so encode(t) must equal encode(NFC(t)) for every vector;
         # a divergence is a real oracle mismatch — fail loud (do not skip).
         assert list(tok.encode(t).ids) == list(tok.encode(nfc_t).ids), \
-            "engine NFC diverges from python NFC for %r" % t
+            "engine normalizer not idempotent in encode for %r" % t
+        # Secondary diagnostic (NOT the oracle): Python unicodedata carries
+        # U14 data in this environment and legitimately differs from the
+        # pinned U9 normalizer exactly on the 98 U14-only-ccc cps and the
+        # Divès Akuru pair (BLOCKER-D1).  That difference is expected and is
+        # pinned by the (11) regression lines; it is NOT an error.
+        if unicodedata.normalize("NFC", t) != nfc_t:
+            pass  # expected U9/U14 data divergence (diagnostic only)
         lines.append("N %s %s" % (hexify(t), hexify(nfc_t)))
 
-    # Pre-tokenization vectors (independent-engine reference; the native
-    # code applies the same pattern after NFC on added-token-free chunks).
+    # Pre-tokenization vectors.  ORACLE: the pinned engine's pre-tokenizer
+    # stage (pre_tokenizer.pre_tokenize_str) applied to NFC'd input.  A
+    # Python re mirror of the pinned pattern (U16 L/N/M + UAX #44
+    # White_Space) remains as a secondary cross-check (must agree with the
+    # engine on every case — fail loud otherwise).
     pat = build_pretok_pattern()
     pretok_cases = [
         "hello", "a b", "a   b", "a\tb", "a\nb", "a\r\nb",
@@ -334,12 +388,60 @@ def main():
         "a\u00a0b", "x\U0001f389y", "\u4e2d \u6587", "a\u4e2db",
         "café", "e\u0301", "A\u0308", "a1b2", "UP", "MiXeD",
     ]
+    # White_Space boundary battery: EVERY White_Space cp (25) at word /
+    # symbol / run boundaries.  U+00A0 was missing from the native WS class
+    # (BLOCKER-D2); these lines pin all 25.
+    _ws_cps = [0x0009, 0x000A, 0x000B, 0x000C, 0x000D, 0x0020, 0x0085,
+               0x00A0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004,
+               0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200A, 0x2028,
+               0x2029, 0x202F, 0x205F, 0x3000]
+    for w in _ws_cps:
+        wc = chr(w)
+        pretok_cases += [
+            wc,                    # lone ws
+            "a" + wc, "a" + wc + "b", "a" + wc + wc + "b",
+            wc + "b", wc + "b" + "c",
+            wc + wc + "x", wc + wc + " x",
+            "a" + wc + "-b", wc + "-b",      # ws next to a symbol
+            "ab" + wc + "cd",                # ws inside a word run
+        ]
+    # Regex-class version battery (BLOCKER-D1 subsystem B): cps whose
+    # \pL/\pN/\pM membership exists only in U15/U16 (the pinned regex
+    # data).  The OLD U14 L/N/M ranges chunk these differently (a word
+    # letter splits into "a"|"Xb"; a digit RUN merges into one B4 chunk).
+    pretok_cases += [
+        "a\U00011f02b", "a\U000105c0b",      # U16 letters (Kawi, Vithkuqi)
+        "a\u0897b", "a\u11241b",             # U15/U16 marks
+        "\U00011f50\U00011f51",              # U16 digit RUN (Kawi)
+        "\u1123f\u11240",                    # U16 letter pair (Tangsa)
+    ]
+    # The engine pre_tokenizer is Sequence[Split, ByteLevel]: its
+    # pre_tokenize_str output is the Split chunks in ByteLevel encoding.
+    # The native pretokenize stage is the Split stage on RAW NFC text
+    # (ByteLevel is applied later, per chunk, inside encode).  So the
+    # oracle comparison reverse-maps each engine chunk to raw bytes
+    # (the inverse of the GPT-2/tokenizers byte bijection — the same map
+    # the X lines verify against the engine below).
+    _identity = set(range(33, 127)) | set(range(161, 173)) | set(range(174, 256))
+    _b2c, _nn = {}, 0
+    for _b in range(256):
+        _b2c[_b] = chr(_b) if _b in _identity else chr(0x100 + _nn)
+        if _b not in _identity:
+            _nn += 1
+    _c2b = {c: b for b, c in _b2c.items()}
+
     for t in pretok_cases:
-        nfc_t = unicodedata.normalize("NFC", t)
-        pres = [m.group(0) for m in pat.finditer(nfc_t)]
-        assert "".join(pres) == nfc_t, "regex does not tile the input"
+        nfc_t = tok.normalizer.normalize_str(t)   # ORACLE stage order
+        raw = [bytes(_c2b[ch] for ch in s).decode("utf-8")
+               for s, _ in tok.pre_tokenizer.pre_tokenize_str(nfc_t)]
+        # Secondary cross-check (must agree with the pinned engine).
+        mirror = [m.group(0) for m in pat.finditer(nfc_t)]
+        assert "".join(mirror) == nfc_t, "mirror does not tile: %r" % t
+        assert mirror == raw, \
+            "python mirror diverges from pinned pre-tokenizer for %r:\n" \
+            "  engine: %r\n  mirror: %r" % (t, raw, mirror)
         lines.append("P %s %s" % (hexify(nfc_t),
-                                  SEP.join(hexify(q) for q in pres)))
+                                  SEP.join(hexify(q) for q in raw)))
 
     # --- arbitrary token-ID decode oracle (X lines) ----------------------------
     # The D/D1 lines above are text->encode->decode round trips, so their
