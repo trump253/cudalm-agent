@@ -410,3 +410,47 @@ if(CUDALM_PYTHON3)
 else()
   message(STATUS "python3 not found: cross-language weight tests disabled")
 endif()
+
+# --- v0.4 Phase B: native tokenizer (CUDLMTK1) cross-language gate ----------
+# tools/convert_qwen35_tokenizer.py (tokenizers lib, offline) transcribes the
+# pinned Qwen3.5 tokenizer (tokenizer.json + tokenizer_config.json union) into
+# the CUDLMTK1 artifact; tools/gen_tokenizer_refs.py emits the multilingual
+# oracle corpus (E/D/D1/N/P lines). test_qwen35_tokenizer loads the artifact
+# with the PyTorch-free C++ loader and gates: loader failure contract
+# (corruption classes), NFC/pre-tokenization stage vectors, the decode
+# contract (padding ids -> "", out-of-range fail loud, is_special exact), and
+# EXACT cross-language equality on the whole corpus. Needs the `tokenizers`
+# python lib (NOT torch) + the pinned local assets; self-skips (77) when the
+# assets are absent.
+if(CUDALM_TOOL_PYTHON3)
+  execute_process(
+    COMMAND ${CUDALM_TOOL_PYTHON3} -c "import tokenizers"
+    RESULT_VARIABLE CUDALM_TOOL_PY_TOK_OK
+    OUTPUT_QUIET ERROR_QUIET)
+endif()
+if(CUDALM_TOOL_PYTHON3 AND CUDALM_TOOL_PY_TOK_OK EQUAL 0)
+  set(CUDALM_TK_ARTIFACT ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk)
+  set(CUDALM_TK_CORPUS ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer_refs.txt)
+
+  # Python-side converter selftest (determinism, round-trip, corruption
+  # classes; self-skips 77 when the pinned assets are absent).
+  add_test(NAME test_qwen35_tokenizer_python_selftest
+           COMMAND ${CUDALM_TOOL_PYTHON3}
+                   ${CMAKE_SOURCE_DIR}/tools/convert_qwen35_tokenizer.py
+                   --selftest)
+  set_tests_properties(test_qwen35_tokenizer_python_selftest PROPERTIES
+    SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+  add_executable(test_qwen35_tokenizer cpu/test_qwen35_tokenizer.cpp)
+  target_link_libraries(test_qwen35_tokenizer PRIVATE cudalm)
+  add_test(NAME test_qwen35_tokenizer
+           COMMAND test_qwen35_tokenizer ${CUDALM_TK_ARTIFACT}
+                   /root/models/Qwen3.5-0.8B-Base
+                   ${CUDALM_TOOL_PYTHON3}
+                   ${CMAKE_SOURCE_DIR}
+                   ${CUDALM_TK_CORPUS})
+  set_tests_properties(test_qwen35_tokenizer PROPERTIES
+    SKIP_RETURN_CODE 77 TIMEOUT 600)
+else()
+  message(STATUS "tokenizers lib not available: tokenizer tests disabled")
+endif()
