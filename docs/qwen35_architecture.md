@@ -1123,8 +1123,12 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
                                     预分词 → ByteLevel BPE）
    -> Qwen35Generator::generate    （§19 冻结生成核；EOS = 真实 tokenizer
                                     EOS 248044，**非** Phase A 哨兵 248319）
-   -> Qwen35Tokenizer::decode      （base 字节串 / added 字面量 / padding→""）
-   -> raw UTF-8 生成文本
+   -> Qwen35Tokenizer::decode      （ids → 完整字节流：base 原始字节 /
+                                    added 字面量 / padding 丢弃；再对**整个**
+                                    字节流做一次有损 UTF-8 转换 —— 每个最大
+                                    非法子段 → 一个 U+FFFD；合法的跨 token
+                                    多字节字符仍按一个字符解出）
+   -> raw UTF-8 生成文本（恒为合法 UTF-8）
  ```
 
  `Qwen35TextGenerator`（`include/cudalm/qwen35_text_generator.h`）是**纯
@@ -1148,10 +1152,23 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    | `merges.txt` | `a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d` |
 
  - **oracle 版本**：主 oracle = 本地 venv（py3.11.16）`tokenizers 0.22.2`
-   （Rust 引擎，pinned 语义）；交叉核对 = 系统 `tokenizers 0.15.1`。语料
-   **刻意避开** U14/U15 Unicode 数据差异区（corpus 不碰 exotic changed
-   codepoints），两版本结果一致。NFC 向量另用 `unicodedata.normalize`
-   （U14 数据）交叉验证。
+   （Rust 引擎，pinned 语义）；交叉核对 = 系统 `tokenizers 0.15.1`。
+   **pinned `tokenizer.json` 含 `"normalizer": {"type": "NFC"}`** ——
+   引擎在预分词前对输入做 NFC，encode 的可观测行为包含 NFC。
+ - **Unicode 版本口径（不回避，直接差分）**：converter 的 Unicode 表
+   （ccc/分解/合成/\s\pL\pN\pM 区间）来自 Python `unicodedata`
+   （U14 数据）—— 这是**数据源**，**不是**独立 oracle（同源不能自证）。
+   独立 oracle = pinned 引擎的**可观测行为**（encode/decode）。U14 vs
+   引擎 Unicode 数据版本的差异用 differential validation 直接验证
+   （全 codepoint 扫描 + 邻接扫描 + NFD 幂等 + 随机 fuzz，见 §20.5），
+   **不**靠“避开差异区”证明 correctness；若在真实可观测行为上发现
+   mismatch 则 STOP 报 BLOCKER。**本轮结论**：引擎 Unicode 数据 =
+   **U9**（crate 常量 + 行为实证），U14 表与之存在真实可观测差异
+   （98 个 ccc 差异 cp + Divès Akuru 合成/分解对），已按纪律上报为
+   **BLOCKER-D1**（§20.5）；另发现 pre-existing 的 **\s 表缺 U+00A0**
+   （**BLOCKER-D2**）。本轮两个批准 blocker（NFC 算法、ByteLevel
+   decode）的修复**不依赖**上述数据差异，其算法正确性由全量差分
+   （§20.5 中 0-mismatch 的各 pass）证明。
  - 词汇结构（钉死）：base BPE 词汇 **248044**（id 0..248043，GPT-2 byte
    map：33..126/161..172/174..255 自映射，其余 68 字节 → U+0100..U+0143）；
    added token **33** 个（id 248044..248076 = `tokenizer.json` added_tokens
@@ -1162,11 +1179,27 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
 
  ### 20.2 管线契约（逐段 oracle 验证，C++ 只做离线转录的查表）
 
- 1. **NFC**（UAX #15，**oracle 验证过的精确算法**，非教科书 NFC）：
+ 1. **NFC**（**pinned 引擎算法的精确移植**，非教科书简化版）：
+    引擎的 NFC = Rust `unicode-normalization`（tokenizers crate 依赖
+    `unicode-normalization-alignments` 0.1.12）的 Decompositions +
+    Recompositions 双迭代器算法，C++ 逐语句移植（`nfc_impl`）：
     (a) 完全规范分解（含单部件分解，如 U+1FBE→U+03B9、Hangul 音节→jamo）；
-    (b) **不做**规范重排（both oracles 均不重排，jamo ccc 按 0 处理）；
-    (c) 贪心左→右合成：门控 `b_ccc==0 || (a_ccc<b_ccc && a_ccc<c_ccc &&
-       b_ccc<=c_ccc)`（a = 栈底前一项或 0）+ **精确合成表查表**。
+    (b) **流式规范重排**：分解流分批发射 —— 读入一个 `ccc == 0` 的
+    codepoint（或输入结束）时，对**尚未发射的尾部**按 ccc **升序、稳定**
+    排序后放行（`ccc == 0` = starter / 序列边界；jamo 在表中 ccc 0，
+    序列永不重排 —— oracle 验证 `V+L`(U+1161,U+1100) 原样不动，而
+    `L+V`→U+AC00）；
+    (c) **合成与重排同趟进行**（关键差异）：composee 只能与**入流**
+    非 starter 合成，且仅当**所有已缓冲（延迟）mark 的 ccc 都严格小于**
+    该 mark；否则该 mark 被缓冲、延后发射。纯合成表查表（表 = 恰好
+    `NFC(x y) == 单 codepoint` 的 (x,y) 集合，exclusions 已含）。
+    与“先整体排序再合成”（Python `unicodedata.normalize("NFC")` 的
+    做法）**可观测不同**：`U+0391 U+0301 U+093C`（ccc 0,230,7）→
+    引擎 **`U+0386 U+093C`**（230 mark 越过被延迟的 7 mark 与 0391
+    合成），Python 给 `U+0391 U+093C U+0301`。**pinned 引擎是 oracle，
+    不是 Python**（此类差异在差分中逐一验证）。
+    关键回归（descending CCC，旧“不重排”实现全部 FAIL、修复后 PASS）：
+    `U+0041 U+0315 U+0300`（ccc 232,230）→ **`U+00C0 U+0315`**。
     Hangul：27 个可合成 T-jamo = **U+11A8..U+11C2**（U+11C3+ 为保留区，
     **永不**合成 —— oracle 验证 `AC00+U+11F2/U+11F6` 原样不动）；
     (L,V)→S(L,V,0)，(S(L,V,0),T_t)→S(L,V,t)，音节 = 0xAC00+(L×21+V)×28+T，
@@ -1187,11 +1220,16 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
     | B7 | `\s+` |
 
     `\s`/`\pL`/`\pN`/`\pM` 用 artifact 的**精确区间表**（Unicode
-    White_Space = 09-0D/20/85/1680/2000-200A/2028/2029/202F/205F/3000 等）。
+    White_Space = 09-0D/20/85/**A0**/1680/2000-200A/2028/2029/202F/205F/
+    3000）。**已知 BLOCKER（本轮未修，见 §20.5 差分结果）**：artifact 的
+    \s 表（converter `WHITE_SPACE`）**漏了 U+00A0**，而引擎的 `\s`
+    （Unicode White_Space）**包含** U+00A0 —— 含 NBSP 文本的预分词
+    chunk 划分与引擎不一致（差分 39/100000 mismatch 全部含 NBSP）。
     语义要点（oracle 对齐）：B1 优先于 B2（`'mX`→`'m`+`X`）；B2 的可选前导
-    字符可吃空格/非字母（`a   b`→`a`,`  `,` b`；nbsp 黏后词）；B6 的
-    零宽 lookahead **不消费**字符（`\s+(?!\S)` 只决定空格 run 的切分点）；
-    BPE **只在预分词内部**合并。
+    字符可吃空格/非字母（`a   b`→`a`,`  `,` b`）；B6 的 `\s+` 是**贪心
+    带回退**：一个 k 个 \s 的 run 后跟 \S 时匹配前 k−1 个（lookahead 在
+    run 内回溯成功），末尾或单 \s 除外 —— 零宽 lookahead 本身**不消费**
+    字符；BPE **只在预分词内部**合并。
  4. **ByteLevel BPE**：`byte_fallback=false`（256 单字节 token + 全部 merge
     产物均在词汇表内，artifact 构建时逐条校验）；每预分词独立；贪心取
     全位置**最低 rank** merge（tie → 最左）；输出 = 拼接字节查词汇表。
@@ -1225,15 +1263,59 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    自测（确定性双跑 bit-exact、round-trip、损坏类；pinned 资产缺失 → 77）。
  - **`test_qwen35_tokenizer`**（pinned 资产，self-skip 77）：
    (a) loader 失败契约（空/过小/坏 magic/坏 version/坏 reserved/crc 翻转/
-   body 截断/header 截断）；(b) NFC 阶段向量（含 no-reorder、jamo T27、
-   U+11F6 不合成等 oracle 验证期望）；(c) 预分词阶段向量（leftmost-first、
-   nbsp 黏词、trailing space、CRLF、CJK）；(d) decode 契约（padding→""、
+   body 截断/header 截断）；(b) NFC 阶段向量（**descending-CCC 规范重排
+   回归**（`A+U+0315+U+0300`→`U+00C0+U+0315` 等 7 条，旧“不重排”实现
+   全部 FAIL）、等 ccc 稳定不重排、jamo T27、U+11F6 不合成、递归分解、
+   Greek 1FEE→0385 等 oracle 验证期望）；(c) 预分词阶段向量（leftmost-first、
+   nbsp 黏词、trailing space、CRLF、CJK、**孤立 combining mark**
+   （B2 的 `?` 需回退，kOpt 回退回归））；(d) decode 契约（padding→""、
    越界 fail loud、is_special 21/33、EOS==248044、非法 UTF-8 fail loud）；
    (e) **跨语言精确语料**：`tools/gen_tokenizer_refs.py` 生成
    E（encode，290 文本）/ D（decode skip_special=false，290）/ D1（
-   skip_special=true，290）/ N（NFC，31）/ P（预分词，36）共 877 行，
-   覆盖 EN/CJK/Cyrillic/Greek/emoji/mixed/whitespace/特殊 token hex ——
-   C++ 逐行与 pinned HF oracle **EXACT** 相等。
+   skip_special=true，290）/ N（NFC，55 向量，10 类，每条带 pinned 引擎
+   一致性 assert）/ P（预分词，36）/ **X（任意 id 序列 decode，586 行 =
+   293 序列 × 2 skip 模式：单非法字节、2/3/4 字节不完整、非法 lead+cont
+   组合、连续非法、合法字符跨 token 拆分、base+padding、base+added、
+   special；byte→id 映射从 pinned vocab 动态推导，期望 = pinned 引擎
+   decode，hex 编码）** 共 1547 行 —— C++ 逐行与 pinned oracle
+   **EXACT** 相等。
+ - **differential validation（dev 工具，非 ctest）**：pinned 引擎 vs
+   native C++ 的**可观测行为**差分（本轮真实结果）：
+   (A) 全部 1,112,064 个单 codepoint encode → **0 mismatch**；
+   (A2) `"a"+chr(cp)` 邻接扫描（1,112,064，Unicode 类/边界交互）→ **0**；
+   (B) 全部 13,233 个可分解 cp（含 11,172 Hangul 音节）的 NFD 形式 →
+   **1 mismatch**（U+11938 Divès Akuru，见 BLOCKER-D1）；
+   (C) 100,000 随机组合密集文本 encode fuzz → **39 mismatch**（**全部**含
+   U+00A0，见 BLOCKER-D2）；(C′) 同法 100,000 条**不含 NBSP** 文本 →
+   **0**；(D) 200,000 随机 id 序列 decode fuzz（双 skip 模式）→ **0**；
+   (N) NFC **codepoint 级** 200,000 条组合密集 fuzz（直接对比引擎
+   normalizer 输出）→ 全部 mismatch 均含 ccc 数据差异 cp（如 U+1715，
+   见 BLOCKER-D1）；全 13,233 个可分解 cp 的 NFD→NFC 逐一 codepoint 级
+   对比 → **1**（同 B）；全 12,119 个合成对 (x,y)→z 逐一过引擎 →
+   **1**（同 B，(U+11935,U+11930)→U+11938）。
+ - **本轮差分发现的未决 BLOCKER（本轮未修 —— 不属于两个批准
+   blocker，按“发现即报告、不擅自扩范围”纪律上报）**：
+   - **BLOCKER-D1（Unicode 数据版本：引擎 U9 vs 表 U14）**：pinned 引擎
+     的 Unicode 数据 = **9.0**（`unicode-normalization-alignments` 0.1.12
+     crate 常量 `UNICODE_VERSION=(9,0,0)`，表行为实证一致），而 converter
+     表来自 Python `unicodedata`（**U14**）。差异已**穷举**：
+     (1) **ccc**：98 个 cp U14 ccc>0 而引擎 ccc=0（如 U+1715 MYANMAR
+     SIGN ASAT 9→0、U+007FD NKO DANTAYALAN 220→0、Sogdian/藏文/
+     Hmong/Wancho 等成组 cp）—— 含这些 mark 的序列 NFC 重排结果不同
+     （probe 实证 51 个可观测发散，如 `A+U+1715+U+0300`）；
+     (2) **合成**：恰 1 对 (U+11935,U+11930)→U+11938（Divès Akuru，
+     U13 新增，U9 数据中三者为原子 cp）；(3) **分解**：恰 1 个
+     U+11938→11935 11930（同源）。修复路径：converter 表从 U9 数据
+     重生成（或明确接受 U14 并接受上述可观测差异）—— 需立项决定。
+   - **BLOCKER-D2（预分词 \s 表缺 U+00A0，pre-existing Phase B 缺陷）**：
+     引擎的 `\s`（Unicode White_Space）**包含** U+00A0，而 converter
+     `WHITE_SPACE` 硬编码表**漏了** U+00A0（reviewed HEAD 即缺，非本轮
+     引入）。实证：`" \xa0\xdf"` 引擎切 `" "`|`"NBSPß"`，C++ 合并
+     `" NBSP"`→8965；差分 39/100000 mismatch **全部**含 NBSP，去 NBSP
+     后 100k 0 mismatch。修复 = `tools/convert_qwen35_tokenizer.py`
+     `WHITE_SPACE` 与 `tools/gen_tokenizer_refs.py` `WS_RANGES` 各加
+     `(0x00A0, 0x00A0)` + 重生成 artifact/corpus（一行数据修复，本轮
+     未做）。
  - **`test_qwen35_text_generation`**（real checkpoint + tokenizer，self-skip
    77）：E2E 文本级门。4 个 **confident prompt**（2 EN + 2 CJK；
    `tools/diag_gen_gaps.py --text` 在 pinned-quantized oracle 上选得，
