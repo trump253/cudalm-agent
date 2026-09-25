@@ -441,6 +441,21 @@ struct Matcher {
         if (match_seq(nd, idx + 1, cps, ends[i], end)) return true;
       return false;
     }
+    if (c.kind == RNode::kOpt) {
+      // Greedy optional WITH backtracking (PCRE semantics): try the
+      // consumed form first, then the empty form.  Without the fallback
+      // the B2 branch `[...]?[\p{L}\p{M}]+` fails on a combining mark
+      // that is the first character of a chunk and is followed by a
+      // non-L/M character (or end of input): the optional prefix eats the
+      // mark and nothing is left for the +.  The pinned engine backtracks
+      // (leftmost-first: the optional is skipped and the mark is matched
+      // by the +) — oracle-verified on a lone U+0300, "U+0301 space", ...
+      std::size_t p2;
+      if (match_single(c.child, cps, pos, &p2)) {
+        if (match_seq(nd, idx + 1, cps, p2, end)) return true;
+      }
+      return match_seq(nd, idx + 1, cps, pos, end);
+    }
     std::size_t p2;
     if (!match_single(cur, cps, pos, &p2)) return false;
     return match_seq(nd, idx + 1, cps, p2, end);
