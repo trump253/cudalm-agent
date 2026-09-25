@@ -1151,8 +1151,17 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    | `vocab.json` | `ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003` |
    | `merges.txt` | `a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d` |
 
- - **oracle 版本**：主 oracle = 本地 venv（py3.11.16）`tokenizers 0.22.2`
-   （Rust 引擎，pinned 语义）；交叉核对 = 系统 `tokenizers 0.15.1`。
+ - **oracle 版本（pinned + 版本门）**：主 oracle = 本地 venv
+   （py3.11.16）`tokenizers 0.22.2`（Rust 引擎，pinned 语义）。版本在
+   `tools/common/qwen35_tokenizer_ref.py` 中钉死：
+   `EXPECTED_TOKENIZERS_VERSION = "0.22.2"` + `check_oracle_version()`；
+   `build_tokenizer()` 在任何引擎调用**之前**跑该门，因此**所有
+   authoritative oracle 路径**（converter、语料生成、differential
+   validator、text golden）都经过同一个检查。实际版本 ≠ 0.22.2 =
+   **provenance violation，fail loud，不可 skip**（资产缺失仍按既有
+   规则 self-skip 77 —— 二者不同）；converter `--selftest` 含版本门
+   回归（0.22.2 接受；0.15.1 / 0.22.3 / None 拒绝）。系统
+   `tokenizers 0.15.1` **不是**可接受 oracle（无 silent fallback）。
    **pinned `tokenizer.json` 含 `"normalizer": {"type": "NFC"}`** ——
    引擎在预分词前对输入做 NFC，encode 的可观测行为包含 NFC。
  - **Unicode 数据口径（BLOCKER-D1/D2 —— 已解决）**：converter 的
@@ -1333,16 +1342,24 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
      --artifact build/data/qwen35_tokenizer.cudaltk \
      --tokenizer-dir /root/models/Qwen3.5-0.8B-Base/tokenizer
    ```
-   本轮 extended（穷举）真实结果（head=63b884f，修复后构建）：
-   regressions 26/0；ws_battery 400/0；nfc_single **1,112,064/0（全 cp
-   穷举）**；enc_single **1,112,064/0**（`"a"+cp` 全 cp）；class_probe
-   **3,336,192/0**（3 探针 × 全 cp：L∪M/N/WS 类成员）；decomp_cp(+enc)
-   **13,232/0（全可分解 cp 穷举）**；comp_pair nfc(+enc) **12,118/0（全
-   合成对穷举）**；nfc_fuzz 200,000/0（seed 777）；adjacency 50,000/0
-   （seed 20260925）；enc_fuzz 100,000/0（seed 42）；pretok_fuzz
-   100,000/0（seed 999）；dec_fuzz 40,000/0（seed 20250417，双 skip
-   模式）。quick 模式 = 同 seed 缩减规模（stride 16 单 cp、20k/10k
-   fuzz），供常规 CI。
+   **Phase B final evidence executed on:**
+   `PHASE_B_EVIDENCE_SHA = 0dc3b576d8171bedebe96d487cf83a59d5f98bef`
+   （工作树干净、HEAD == 该 SHA；artifact 由该 SHA 的 converter 重新
+   生成，未复用旧件）。**失效规则**：此后任何对 `src/`、`include/`、
+   `tools/`、`tests/` 或 functional CMake 配置的修改都使该 evidence
+   **失效**，必须整套重跑；仅 docs 修改不使其失效（此时注明最终 HEAD
+   与 evidence SHA 不同）。
+   extended（穷举）真实结果（于上述 SHA）：regressions 26/0；
+   ws_battery 400/0；nfc_single **1,112,064/0（全 cp 穷举）**；
+   enc_single **1,112,064/0**（`"a"+cp` 全 cp）；class_probe
+   **3,336,190/0**（**实际比较数**：3 探针 × 全 cp，第三探针跳过
+   CR/LF → 3×1,112,064−2）；decomp_cp(+enc) **13,232/0（全可分解 cp
+   穷举）**；comp_pair nfc(+enc) **12,118/0（全合成对穷举）**；
+   nfc_fuzz 200,000/0（seed 777）；adjacency 50,000/0（seed
+   20260925）；enc_fuzz 100,000/0（seed 42）；pretok_fuzz 100,000/0
+   （seed 999）；dec_fuzz 40,000/0（seed 20250417，双 skip 模式）。
+   quick 模式 = 同 seed 缩减规模（stride 16 单 cp、20k/10k fuzz），
+   供常规 CI。
  - **BLOCKER-D1/D2 —— 本轮已解决**（上一轮按纪律上报，本轮批准修复）：
    - **D1（Unicode 数据版本）**：修复 = converter 表改从 pinned U9 UCD
      （sha-gated）+ 引擎构建期合成对验证 + L/N/M 改 pinned U16 UCD（见

@@ -448,29 +448,18 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
   | `vocab.json` | `ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003` |
   | `merges.txt` | `a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d` |
 
- - **oracle**：主 = 本地 venv（py3.11.16，tokenizers 0.22.2，Rust
-   引擎，sha-gated pinned tokenizer 资产）；交叉核对 = 系统
-   `tokenizers 0.15.1`。Python `unicodedata`（本机 U14 数据）**仅作
-   诊断**，不作等价 oracle（其数据版本与引擎不同）。**无**
-   transformers 参与 encode/decode。
- - **Unicode 数据口径（BLOCKER-D1/D2 —— 已解决）**：converter 表全部
-   来自 sha256 钉死的离线 UCD 副本 + pinned 引擎构建期验证：
-   ccc/分解 = **Unicode 9.0.0**（`tools/ucd/UnicodeData-9.0.0.txt`，
-   sha256 `68dfc414d28257b9b5d6ddbb8b466c768c00ebdf6cbf7784364a9b6cad55ee8f`；
-   引擎数据版本，crate 常量 `UNICODE_VERSION=(9,0,0)`）；合成对由 U9
-   完全分解流推导且**每对构建时过 pinned 引擎** `normalize_str`
-   验证；L/N/M = **Unicode 16.0.0**（`tools/ucd/UnicodeData-16.0.0.txt`，
-   sha256 `ff58e5823bd095166564a006e47d111130813dcf8bf234ef79fa51a870edb48f`；
-   pinned regex 引擎数据版本，全 1,112,064 非代理 cp 逐 cp 实证：
-   L∪M==U16 恰 143,529、N==U16 恰 1,911）；\s = UAX #44 White_Space
-   恰 25 cp（**含 U+00A0**，BLOCKER-D2 修复）。上一轮上报的
-   BLOCKER-D1（U14 表 vs 引擎 U9：98 个 ccc 差异 cp + Divès Akuru
-   对）与 BLOCKER-D2（\s 漏 U+00A0）均已按批准修复并重生成
-   artifact/语料；引擎 vs Python（U14）的全部差异 = 上述数据版本差，
-   **算法层面无差异**（200k seed-20260925 差分 0 未解释发散；上一轮
-   “Python 给 `U+0391 U+093C U+0301`”的示例系测量错误，已删除）。
-   pinned `tokenizer.json` 含 `"normalizer": {"type": "NFC"}`
-   （引擎 encode 前对输入做 NFC）。
+ - **oracle（pinned + 版本门）**：主 = 本地 venv（py3.11.16，
+   tokenizers 0.22.2，Rust 引擎，sha-gated pinned tokenizer 资产）。
+   oracle 版本钉死 `tokenizers == 0.22.2`：`qwen35_tokenizer_ref.
+   check_oracle_version()` 在 `build_tokenizer()` 内强制执行 —— 所有
+   authoritative 路径（converter / 语料生成 / differential validator /
+   text golden）都经过同一门；实际版本 ≠ 0.22.2 = provenance
+   violation，**fail loud，不可 skip**（资产缺失仍按既有规则 self-skip
+   77 —— 二者不同）；converter self-test 含版本门回归（0.22.2 接受；
+   0.15.1 / 0.22.3 / None 拒绝）。系统 `tokenizers 0.15.1` **不是**
+   可接受 oracle（无 silent fallback）。Python `unicodedata`（本机 U14
+   数据）**仅作诊断**，不作等价 oracle（其数据版本与引擎不同）。
+   **无** transformers 参与 encode/decode。
 - 转录是**纯离线查表**：C++ 运行时**不**链接/调用任何 tokenizer 库、不
   读 JSON、不做正则库调用 —— 全部结构（词汇字节、merge rank、added token、
   NFC 分解/合成/ccc 表、`\s/\pL/\pN/\pM` 精确区间）由 converter 预先算进
@@ -549,14 +538,18 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
  - **differential validation 固化为仓库工具**：`tools/
    dump_qwen35_tokenizer.cpp`（CMake `tool_qwen35_tokenizer_dump`）+
    `tools/validate_qwen35_tokenizer.py`（sha-gated pinned oracle，固定
-   seed，打印 samples/mismatches/seed/HEAD）。extended（穷举）本轮
-   结果：nfc_single 1,112,064/0、enc_single 1,112,064/0、class_probe
-   3,336,192/0、decomp_cp 13,232/0、comp_pair 12,118/0（各含 encode
-   对照）、nfc_fuzz 200k/0（seed 777）、adjacency 50k/0（seed
-   20260925）、enc_fuzz 100k/0（seed 42）、pretok_fuzz 100k/0（seed
-   999）、dec_fuzz 40k/0（seed 20250417）、regressions 26/0、
-   ws_battery 400/0 —— **全 pass 0 mismatch（停止条件达成）**。
-   命令见架构文档 §20.5。
+   seed，打印 samples/mismatches/seed/HEAD）。**Phase B final evidence
+   executed on**: `PHASE_B_EVIDENCE_SHA = 
+   0dc3b576d8171bedebe96d487cf83a59d5f98bef`（此后任何 src/include/
+   tools/tests/functional CMake 配置修改 → evidence 失效必须重跑；仅
+   docs 修改不失效，此时注明最终 HEAD ≠ evidence SHA）。于该 SHA 的
+   extended（穷举）结果：nfc_single 1,112,064/0、enc_single 1,112,064/0、
+   class_probe **3,336,190/0**（实际比较数，第三探针跳过 CR/LF）、
+   decomp_cp 13,232/0、comp_pair 12,118/0（各含 encode 对照）、
+   nfc_fuzz 200k/0（seed 777）、adjacency 50k/0（seed 20260925）、
+   enc_fuzz 100k/0（seed 42）、pretok_fuzz 100k/0（seed 999）、
+   dec_fuzz 40k/0（seed 20250417）、regressions 26/0、ws_battery 400/0
+   —— **全 pass 0 mismatch（停止条件达成）**。命令见架构文档 §20.5。
 - `test_qwen35_text_generation`（real checkpoint + tokenizer，self-skip 77，
   TIMEOUT 1800）：4 个 confident 文本 prompt（2 EN + 2 CJK，min top1-top2
   gap 0.625 / 2.875 / 1.4375 / 0.75，`tools/diag_gen_gaps.py --text` 选定）：
