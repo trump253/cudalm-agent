@@ -825,37 +825,168 @@ Status Qwen35Tokenizer::nfc_impl(const std::uint32_t* cps, std::size_t n,
       }
     }
   }
-  // 2. NO reordering (verified oracle behavior: neither the tokenizers Rust
-  //    engine nor Python's unicodedata reorders combining sequences).
-  // 3. Greedy left-to-right composition with the standard ccc gate.
-  std::vector<std::uint32_t> st;
-  st.reserve(stream.size());
-  for (std::uint32_t c : stream) {
-    if (!st.empty()) {
-      const std::uint32_t b = st.back();
-      const std::uint8_t bccc = ccc_[b];
-      const std::uint8_t accc =
-          st.size() >= 2 ? ccc_[st[st.size() - 2]] : 0;
-      const std::uint8_t cccc = ccc_[c];
-      const bool allowed =
-          bccc == 0 || (accc < bccc && accc < cccc && bccc <= cccc);
-      if (allowed) {
-        const std::uint64_t key =
-            (static_cast<std::uint64_t>(b) << 21) | c;
-        auto it = std::lower_bound(
-            comp_.begin(), comp_.end(), key,
-            [](const std::pair<std::uint64_t, std::uint32_t>& kv,
-               std::uint64_t k) { return kv.first < k; });
-        if (it != comp_.end() && it->first == key) {
-          st.pop_back();
-          st.push_back(it->second);
-          continue;
-        }
+  // 2+3. Canonical ordering + composition, EXACT port of the pinned engine's
+  // algorithm (Rust `unicode-normalization` Decompositions + Recompositions,
+  // as used by the tokenizers crate's NFC normalizer).  This is NOT
+  // "sort everything, then compose": the decomposition stream is emitted in
+  // batches — a ccc == 0 code point (or end of input) triggers a STABLE sort
+  // of the not-yet-emitted tail by ascending ccc — and the composition runs
+  // in the same pass: a non-starter may compose with the current composee
+  // over a buffered (delayed) mark only when every buffered mark has a
+  // STRICTLY SMALLER ccc; otherwise it is blocked and buffered itself.
+  // Observable difference from a pre-sort: "U+0391 U+0301 U+093C" (ccc 0,
+  // 230, 7) -> U+0386 U+093C (the 230 mark composes over the delayed 7 mark)
+  // — oracle-verified.  Jamo are ccc 0 in the tables (starters; the pinned
+  // oracles never reorder jamo sequences).
+  struct PCp {
+    std::uint8_t ccc;
+    std::uint32_t cp;
+  };
+  const auto ccc_of = [this](std::uint32_t c) -> std::uint8_t { return ccc_[c]; };
+  std::vector<PCp> buffer;  // (ccc, cp) pairs in text order
+  buffer.reserve(stream.size());
+  std::size_t rs = 0, re = 0;  // ready range [rs, re)
+  std::size_t ip = 0;          // input position in `stream`
+  auto stable_sort_pending = [&]() {
+    if (re < buffer.size()) {
+      std::stable_sort(buffer.begin() + static_cast<std::ptrdiff_t>(re),
+                       buffer.end(),
+                       [](const PCp& a, const PCp& b) { return a.ccc < b.ccc; });
+    }
+    re = buffer.size();
+  };
+  auto decomp_next = [&](PCp* item) -> bool {
+    while (re == 0) {
+      if (ip < stream.size()) {
+        const std::uint32_t c = stream[ip++];
+        if (ccc_of(c) == 0) stable_sort_pending();
+        buffer.push_back(PCp{ccc_of(c), c});
+      } else {
+        if (buffer.empty()) return false;
+        stable_sort_pending();
+        break;
       }
     }
-    st.push_back(c);
+    *item = buffer[rs];
+    ++rs;
+    if (rs == re) {
+      const std::size_t pending = buffer.size() - re;
+      for (std::size_t i = 0; i < pending; ++i) buffer[i] = buffer[re + i];
+      buffer.resize(pending);
+      rs = re = 0;
+    }
+    return true;
+  };
+  const auto composeable = [&](std::uint32_t a, std::uint32_t b,
+                               std::uint32_t* out_cp) -> bool {
+    const std::uint64_t key =
+        (static_cast<std::uint64_t>(a) << 21) | static_cast<std::uint64_t>(b);
+    auto it = std::lower_bound(
+        comp_.begin(), comp_.end(), key,
+        [](const std::pair<std::uint64_t, std::uint32_t>& kv,
+           std::uint64_t k) { return kv.first < k; });
+    if (it != comp_.end() && it->first == key) {
+      *out_cp = it->second;
+      return true;
+    }
+    return false;
+  };
+  // Recompositions state machine (mirrors the engine iterator).
+  std::vector<std::uint32_t> cbuf;  // blocked (delayed) marks
+  std::size_t drain_i = 0;
+  bool has_composee = false;
+  std::uint32_t composee = 0;
+  int last_ccc = -1;  // -1 = none
+  enum State { kComposing, kPurging, kFinished };
+  State state = kComposing;
+  while (true) {
+    if (state == kComposing) {
+      bool early = false;
+      std::uint32_t ch = 0;
+      PCp item;
+      while (!early) {
+        if (!decomp_next(&item)) break;
+        ch = item.cp;
+        const std::uint8_t ch_class = ccc_of(ch);
+        if (!has_composee) {
+          if (ch_class != 0) {
+            out->push_back(ch);
+            early = true;
+            break;
+          }
+          composee = ch;
+          has_composee = true;
+          continue;
+        }
+        if (last_ccc < 0) {
+          std::uint32_t r = 0;
+          if (composeable(composee, ch, &r)) {
+            composee = r;
+            continue;
+          }
+          if (ch_class == 0) {
+            out->push_back(composee);
+            composee = ch;
+            early = true;
+            break;
+          }
+          cbuf.push_back(ch);
+          last_ccc = ch_class;
+        } else if (static_cast<std::uint8_t>(last_ccc) >= ch_class) {
+          // ch is blocked from the composee.
+          if (ch_class == 0) {
+            out->push_back(composee);
+            composee = ch;
+            last_ccc = -1;
+            state = kPurging;
+            drain_i = 0;
+            early = true;
+            break;
+          }
+          cbuf.push_back(ch);
+          last_ccc = ch_class;
+        } else {
+          std::uint32_t r = 0;
+          if (composeable(composee, ch, &r)) {
+            composee = r;
+            continue;
+          }
+          cbuf.push_back(ch);
+          last_ccc = ch_class;
+        }
+      }
+      if (early) continue;
+      state = kFinished;
+      drain_i = 0;
+      if (has_composee) {
+        out->push_back(composee);
+        has_composee = false;
+        continue;
+      }
+      // fall through to Finished handling
+    }
+    if (state == kPurging) {
+      if (drain_i < cbuf.size()) {
+        out->push_back(cbuf[drain_i++]);
+        continue;
+      }
+      cbuf.clear();
+      state = kComposing;
+      continue;
+    }
+    // kFinished
+    if (drain_i < cbuf.size()) {
+      out->push_back(cbuf[drain_i++]);
+      continue;
+    }
+    cbuf.clear();
+    if (has_composee) {
+      out->push_back(composee);
+      has_composee = false;
+      continue;
+    }
+    break;
   }
-  *out = std::move(st);
   return Status::ok_status();
 }
 

@@ -16,12 +16,26 @@
 // merges, added tokens, NFC tables, \s/\pL/\pN/\pM range tables) which this
 // class loads with full bounds-checking and fails loud on any violation.
 //
-// NFC oracle note: both the pinned tokenizers (Rust) engine and Python's
-// unicodedata.normalize implement NFC as  (1) full canonical decomposition,
-// (2) NO canonical reordering, (3) greedy left-to-right composition with the
-// standard ccc gate and an exact composition table.  That exact algorithm —
-// and nothing else — is implemented here (fuzz-verified against both
-// oracles; see tools/gen_tokenizer_refs.py).
+// NFC oracle note: the pinned engine's NFC is an EXACT port of the
+// Rust `unicode-normalization` streaming algorithm used by the tokenizers
+// crate (Decompositions + Recompositions iterators):  (1) full canonical
+// decomposition (recursive);  (2) canonical ordering in batches — a ccc == 0
+// code point (or end of input) triggers a STABLE sort of the not-yet-emitted
+// tail by ascending ccc (ccc == 0 is a starter / sequence boundary; jamo are
+// ccc 0 in the tables, so jamo sequences are never reordered);  (3)
+// composition integrated in the same pass — the composee composes with an
+// incoming non-starter only while every buffered (delayed) mark has a
+// STRICTLY SMALLER ccc, otherwise the mark is buffered and emitted later
+// (exact composition table, exclusions included).  Observable consequence:
+// "U+0391 U+0301 U+093C" (ccc 0, 230, 7) -> "U+0386 U+093C" (the 230 mark
+// composes over the delayed 7 mark) — a case where pre-sorting the whole
+// string first (as Python's unicodedata does) gives a DIFFERENT result; the
+// pinned engine is the oracle, not Python.  Known data caveat: the tables are
+// derived from Python U14 Unicode data while the engine's are Unicode 9.0
+// (crate constant UNICODE_VERSION=(9,0,0)); differential validation found 98
+// cps with U14 ccc > 0 but engine ccc 0 (e.g. U+1715) and one U13-added
+// composition/decomposition pair (U+11935+U+11930 <-> U+11938, Dives Akuru)
+// — reported as open blocker BLOCKER-D1 (docs/qwen35_architecture.md §20).
 //
 // No special/control token string literals appear in this file or its
 // implementation: added tokens are carried by the artifact only.
