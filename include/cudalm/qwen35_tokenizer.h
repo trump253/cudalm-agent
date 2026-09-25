@@ -20,26 +20,38 @@
 // merges, added tokens, NFC tables, \s/\pL/\pN/\pM range tables) which this
 // class loads with full bounds-checking and fails loud on any violation.
 //
-// NFC oracle note: the pinned engine's NFC is an EXACT port of the
-// Rust `unicode-normalization` streaming algorithm used by the tokenizers
-// crate (Decompositions + Recompositions iterators):  (1) full canonical
-// decomposition (recursive);  (2) canonical ordering in batches — a ccc == 0
-// code point (or end of input) triggers a STABLE sort of the not-yet-emitted
-// tail by ascending ccc (ccc == 0 is a starter / sequence boundary; jamo are
-// ccc 0 in the tables, so jamo sequences are never reordered);  (3)
-// composition integrated in the same pass — the composee composes with an
-// incoming non-starter only while every buffered (delayed) mark has a
-// STRICTLY SMALLER ccc, otherwise the mark is buffered and emitted later
-// (exact composition table, exclusions included).  Observable consequence:
-// "U+0391 U+0301 U+093C" (ccc 0, 230, 7) -> "U+0386 U+093C" (the 230 mark
-// composes over the delayed 7 mark) — a case where pre-sorting the whole
-// string first (as Python's unicodedata does) gives a DIFFERENT result; the
-// pinned engine is the oracle, not Python.  Known data caveat: the tables are
-// derived from Python U14 Unicode data while the engine's are Unicode 9.0
-// (crate constant UNICODE_VERSION=(9,0,0)); differential validation found 98
-// cps with U14 ccc > 0 but engine ccc 0 (e.g. U+1715) and one U13-added
-// composition/decomposition pair (U+11935+U+11930 <-> U+11938, Dives Akuru)
-// — reported as open blocker BLOCKER-D1 (docs/qwen35_architecture.md §20).
+ // NFC (normalizer stage): the pinned engine's NFC is the Rust
+ // `unicode-normalization-alignments` streaming algorithm (Decompositions +
+ // Recompositions iterators):  (1) full canonical decomposition (recursive);
+ // (2) canonical ordering in batches — a ccc == 0 code point (or end of
+ // input) triggers a STABLE sort of the not-yet-emitted tail by ascending ccc
+ // (ccc == 0 is a starter / sequence boundary; jamo are ccc 0 in the tables,
+ // so jamo sequences are never reordered);  (3) composition integrated in the
+ // same pass — the composee composes with an incoming non-starter only while
+ // every buffered (delayed) mark has a STRICTLY SMALLER ccc, otherwise the
+ // mark is buffered and emitted later (exact composition table, exclusions
+ // included).  This is standard UAX #15 NFC.  Differential validation (a
+ // 200k-sample seed-20260925 sweep plus a targeted ccc/composition battery)
+ // found the engine and Python's unicodedata to AGREE on the algorithm in
+ // every case: every engine-vs-Python difference is a DATA-version gap, not
+ // an algorithmic one.
+ //
+ // Data provenance (BLOCKER-D1/D2 — resolved): the artifact tables are NOT
+ // derived from this build's Python unicodedata (U14 here).  The ccc/decomp
+ // tables come from a sha256-gated pinned copy of the Unicode 9.0.0 UCD
+ // (tools/ucd/UnicodeData-9.0.0.txt) — the data version of the pinned engine
+ // (crate constant UNICODE_VERSION=(9,0,0)); the composition pairs are
+ // derived from the U9 full-decomposition streams and every pair is verified
+ // against the pinned engine's normalizer at build time; the L/N/M range
+ // tables come from the pinned Unicode 16.0.0 UCD (tools/ucd/UnicodeData-
+ // 16.0.0.txt) — the data version of the pinned regex engine, proven by a
+ // per-cp chunking sweep over all 1,112,064 non-surrogate cps; \s is the
+ // UAX #44 White_Space set (25 cps, including U+00A0).  The residual
+ // engine-vs-Python differences are exactly this U9-vs-U14 data gap (98 cps
+ // with a U14-only ccc, e.g. U+1715, plus the U13 Divès Akuru pair
+ // U+11935+U+11930 <-> U+11938); they are pinned by dedicated regression
+ // corpus lines and the native behavior equals the PINNED ENGINE exactly.
+ // Full validation: docs/qwen35_architecture.md §20.5.
 //
 // No special/control token string literals appear in this file or its
 // implementation: added tokens are carried by the artifact only.
