@@ -5,7 +5,12 @@
 //   * capacity+1 acquires -> OOM, no state change;
 //   * free -> the id is reusable (LIFO: most recently freed first);
 //   * double-free / out-of-range -> Status error, no state change;
-//   * random fixed-seed stress with an independent live-set model;
+//   * FIXED-SEED MIXED allocate/free stress (uniform op coin flip,
+//     live-biased releases so the pool drains and climbs across the
+//     whole occupancy range) vs an independent host live-set model:
+//     unique live ids, full live-set equality, exact accounting every
+//     step, OOM no state change, valid release exact, invalid/double
+//     rejected, released ids actually reused, occupancy sweep covered;
 //   * accounting exact at every step (capacity == used + free).
 
 #include "../../tests/common/check.h"
@@ -132,49 +137,103 @@ int test_zero_capacity() {
   return 0;
 }
 
-// Fixed-seed stress: an independent live-set model must mirror the pool at
-// every step (uniqueness + exact accounting invariants).
+// Fixed-seed MIXED allocate/free stress: the op choice is a uniform
+// coin flip (NO bias toward acquire), so the pool wanders across all
+// occupancy levels and releases happen at low/mid/high occupancy alike.
+// An independent host live-set model must mirror the pool at every step:
+//   * live ids unique (model.insert must succeed);
+//   * pool live set == model live set (full equality checked periodically
+//     and at the end, not just the size);
+//   * used/free/capacity exact at EVERY step;
+//   * acquire at full pool -> OOM, no state change;
+//   * valid release exact (ok + model updated);
+//   * invalid / out-of-range / double release rejected, no state change;
+//   * released ids ARE reused (reuse counter must be > 0 at the end).
 int test_random_stress() {
   const int CAP = 64;
   const int OPS = 200000;
   const std::uint32_t SEED = 20260925u;
   FixedIdPool p(CAP);
   std::mt19937 rng(SEED);
-  std::uniform_int_distribution<int> op_dist(0, 1);   // 0 = acquire, 1 = release
-  std::uniform_int_distribution<int> id_dist(0, CAP + 5);  // includes invalid ids
-  std::set<int> model;  // the independent live-set model
+  std::uniform_int_distribution<int> op_dist(0, 1);    // 0 = acquire, 1 = release
+  std::uniform_int_distribution<int> cand_dist(0, 9);  // release-id choice
+  std::uniform_int_distribution<int> id_dist(0, CAP + 5);  // includes invalid
+  std::set<int> model;       // the independent live-set model
+  std::set<int> ever_issued; // every id ever handed out (reuse tracking)
+  long n_acquire_ok = 0, n_oom = 0, n_release_ok = 0,
+       n_release_rejected = 0, n_reuse = 0;
+  int min_occ = CAP, max_occ = 0;
   for (int i = 0; i < OPS; ++i) {
-    if (op_dist(rng) == 0 || model.size() < CAP) {
+    if (op_dist(rng) == 0) {
+      // ACQUIRE (no occupancy bias).
       int got = -1;
       Status s = p.acquire(&got);
       if (model.size() < CAP) {
         CHECK(s.ok);
         CHECK(got >= 0 && got < CAP);
         CHECK(model.insert(got).second);  // unique
+        if (!ever_issued.insert(got).second) ++n_reuse;  // reissued id
+        ++n_acquire_ok;
       } else {
-        CHECK(!s.ok);
+        CHECK(!s.ok);  // OOM: no state change (model untouched by design)
+        ++n_oom;
       }
     } else {
-      const int vid = id_dist(rng);
+      // RELEASE: usually a LIVE id (deterministic pick from the model, so
+      // the pool actually drains across the occupancy range); sometimes a
+      // raw random candidate (released / out-of-range -> must be rejected).
+      int vid = -1;
+      if (cand_dist(rng) < 9 && !model.empty()) {
+        auto it = model.begin();
+        std::advance(it, static_cast<long>(rng()) % model.size());
+        vid = *it;
+      } else {
+        vid = id_dist(rng);
+      }
       Status s = p.release(vid);
       if (vid >= 0 && vid < CAP && model.count(vid)) {
         CHECK(s.ok);
         model.erase(vid);
+        ++n_release_ok;
       } else {
-        CHECK(!s.ok);  // invalid or double-free
+        CHECK(!s.ok);  // invalid, out-of-range, or double release
+        ++n_release_rejected;
       }
     }
-    if (i % 10000 == 0) {
-      CHECK(p.used() == static_cast<int>(model.size()));
-      CHECK(p.capacity() == p.used() + p.free_count());
+    // Exact accounting at EVERY step + occupancy-range tracking.
+    const int occ = p.used();
+    if (occ < min_occ) min_occ = occ;
+    if (occ > max_occ) max_occ = occ;
+    CHECK(occ == static_cast<int>(model.size()));
+    CHECK(p.free_count() == CAP - occ);
+    CHECK(p.capacity() == occ + p.free_count());
+    // Full live-set equality (not just size) at checkpoints.
+    if (i % 5000 == 0 || i == OPS - 1) {
+      const std::vector<int> live = p.live_ids();
+      CHECK(live.size() == model.size());
+      std::set<int> live_set(live.begin(), live.end());
+      CHECK(live_set == model);
     }
   }
-  CHECK(p.used() == static_cast<int>(model.size()));
-  CHECK(p.capacity() == p.used() + p.free_count());
-  std::printf("  [ok] fixed-seed stress (%d ops, cap %d: %d live at end)\n",
-              OPS, CAP, static_cast<int>(model.size()));
+  // The mixed workload must have exercised EVERY branch (coverage proof):
+  // normal acquires, OOM-at-full, valid releases, rejected releases,
+  // actual reuse of previously issued (released) ids, and a real
+  // occupancy sweep (down below half and up to full, not just full-only).
+  CHECK(n_acquire_ok > 0);
+  CHECK(n_oom > 0);
+  CHECK(n_release_ok > 0);
+  CHECK(n_release_rejected > 0);
+  CHECK(n_reuse > 0);
+  CHECK(min_occ * 2 < CAP);  // low occupancy was actually visited
+  CHECK(max_occ == CAP);     // ... and so was full
+  std::printf("  [ok] fixed-seed mixed stress (%d ops, cap %d: %d live at "
+              "end, occupancy range [%d, %d]; %ld acquire-ok, %ld OOM, "
+              "%ld release-ok, %ld rejected, %ld reuses)\n",
+              OPS, CAP, static_cast<int>(model.size()), min_occ, max_occ,
+              n_acquire_ok, n_oom, n_release_ok, n_release_rejected, n_reuse);
   return 0;
 }
+
 
 }  // namespace
 

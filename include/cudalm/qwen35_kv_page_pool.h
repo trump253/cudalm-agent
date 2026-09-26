@@ -89,6 +89,9 @@ class Qwen35KvPagePool : public KvPageSource {
   int used_pages() const { return ids_.used(); }
   int free_pages() const { return ids_.free_count(); }
   int page_tokens() const { return page_tokens_; }
+  // Live page ids in ascending order (tests / diagnostics; the stress
+  // gate compares this against its independent host live-set model).
+  std::vector<int> live_pages() const { return ids_.live_ids(); }
   // Bytes of ONE page across all full-attention layers (K + V), from the
   // config schedule (qwen35_kv_page_bytes) — no magic constants.
   std::size_t bytes_per_page() const {

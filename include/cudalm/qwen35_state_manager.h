@@ -122,8 +122,9 @@ class Qwen35StateManager {
   int num_live_sequences() const {
     return static_cast<int>(sequences_.size());
   }
-  // The highest SequenceId ever issued (0 when nothing was ever created);
-  // the next id will be one greater (monotone, non-reusing).
+  // The NEXT SequenceId to be issued (1 when nothing has ever been
+  // created). Ids are monotone increasing and never reused, so this is
+  // always one greater than the highest id issued so far.
   SequenceId next_sequence_id() const { return next_id_; }
 
   const Qwen35KvPagePool& kv_pool() const { return kv_; }

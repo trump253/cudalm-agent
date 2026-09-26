@@ -218,43 +218,101 @@ int test_kv_pool_allocator() {
   return 0;
 }
 
+// Fixed-seed MIXED allocate/free stress on the real device pool (op choice
+// is a uniform coin flip — no acquire bias — so releases happen at
+// low/mid/high occupancy and every pool branch is exercised). An
+// independent host live-set model mirrors the pool at every step: unique
+// live pages, full live-set equality at checkpoints, used/free/capacity
+// exact, OOM-at-full with no state change, valid release exact,
+// invalid/double release rejected, and released page ids actually reused.
 int test_kv_pool_stress() {
   const Qwen35Config cfg = small_config();
   const int PT = 4, CAP = 32;
+  const int OPS = 100000;
   cudaStream_t s;
   CUDA_CHECK(cudaStreamCreate(&s));
   {
     Qwen35KvPagePool pool(cfg, PT, CAP, s);
     std::mt19937 rng(20260925u);
     std::uniform_int_distribution<int> op_dist(0, 1);
-    std::uniform_int_distribution<int> id_dist(0, CAP + 3);
-    std::set<int> model;
-    for (int i = 0; i < 100000; ++i) {
-      if (op_dist(rng) == 0 || model.size() < CAP) {
+    std::uniform_int_distribution<int> cand_dist(0, 9);
+    std::uniform_int_distribution<int> id_dist(0, CAP + 3);  // invalid too
+    std::set<int> model;        // the independent live-set model
+    std::set<int> ever_issued;  // reuse tracking
+    long n_alloc_ok = 0, n_oom = 0, n_free_ok = 0,
+         n_free_rejected = 0, n_reuse = 0;
+    int min_occ = CAP, max_occ = 0;
+    for (int i = 0; i < OPS; ++i) {
+      if (op_dist(rng) == 0) {
+        // ALLOCATE (no occupancy bias).
         int id = -1;
         Status st = pool.allocate_page(&id);
         if (model.size() < CAP) {
           CHECK(st.ok);
-          CHECK(model.insert(id).second);
+          CHECK(id >= 0 && id < CAP);
+          CHECK(model.insert(id).second);  // unique
+          if (!ever_issued.insert(id).second) ++n_reuse;  // reissued page
+          ++n_alloc_ok;
         } else {
-          CHECK(!st.ok);
+          CHECK(!st.ok);  // OOM: no state change
+          ++n_oom;
         }
       } else {
-        const int vid = id_dist(rng);
-        const bool expect_ok =
-            vid >= 0 && vid < CAP && model.count(vid) > 0;
+        // FREE: usually a LIVE page (deterministic pick from the model, so
+        // the pool actually drains across the occupancy range); sometimes
+        // a raw random candidate (freed / out-of-range -> rejected).
+        int vid = -1;
+        if (cand_dist(rng) < 9 && !model.empty()) {
+          auto it = model.begin();
+          std::advance(it, static_cast<long>(rng()) % model.size());
+          vid = *it;
+        } else {
+          vid = id_dist(rng);
+        }
+        const bool expect_ok = vid >= 0 && vid < CAP && model.count(vid) > 0;
         CHECK(pool.free_page(vid).ok == expect_ok);
-        if (expect_ok) model.erase(vid);
+        if (expect_ok) {
+          model.erase(vid);
+          ++n_free_ok;
+        } else {
+          ++n_free_rejected;
+        }
       }
-      CHECK_EQ(pool.used_pages(), static_cast<int>(model.size()));
-      CHECK_EQ(pool.free_pages(), CAP - static_cast<int>(model.size()));
+      // Exact accounting at EVERY step (device zeroing stays on the pool
+      // stream; metadata checks here are host-side) + occupancy tracking.
+      const int occ = pool.used_pages();
+      if (occ < min_occ) min_occ = occ;
+      if (occ > max_occ) max_occ = occ;
+      CHECK_EQ(occ, static_cast<int>(model.size()));
+      CHECK_EQ(pool.free_pages(), CAP - occ);
+      // Full live-set equality (not just size) at checkpoints.
+      if (i % 5000 == 0 || i == OPS - 1) {
+        const std::vector<int> live = pool.live_pages();
+        CHECK(live.size() == model.size());
+        std::set<int> live_set(live.begin(), live.end());
+        CHECK(live_set == model);
+      }
     }
+    // Every branch must have been exercised (coverage proof): OOM at
+    // full, valid frees, rejected frees, actual reuse, and a real
+    // occupancy sweep (below half AND full — not full-only releases).
+    CHECK(n_alloc_ok > 0);
+    CHECK(n_oom > 0);
+    CHECK(n_free_ok > 0);
+    CHECK(n_free_rejected > 0);
+    CHECK(n_reuse > 0);
+    CHECK(min_occ * 2 < CAP);
+    CHECK(max_occ == CAP);
     pool.reset();
     CHECK_EQ(pool.used_pages(), 0);
     CHECK_EQ(pool.free_pages(), CAP);
+    std::printf("  [ok] KV pool: fixed-seed mixed stress (%d ops, cap %d: "
+                "%d live at end, occupancy range [%d, %d]; %ld alloc-ok, "
+                "%ld OOM, %ld free-ok, %ld rejected, %ld reuses)\n",
+                OPS, CAP, static_cast<int>(model.size()), min_occ, max_occ,
+                n_alloc_ok, n_oom, n_free_ok, n_free_rejected, n_reuse);
   }
   CUDA_CHECK(cudaStreamDestroy(s));
-  std::printf("  [ok] KV pool: fixed-seed stress (100k ops, cap 32)\n");
   return 0;
 }
 
@@ -496,6 +554,10 @@ int test_sequence_lifecycle() {
       CHECK(b_dirty);
     }
     CHECK_EQ(ra->id, a);  // same id, still live
+    // Cache A's physical slot BEFORE retire: retire_sequence erases the
+    // record from the map, so `ra` (and any other record pointer) dangles
+    // after it and must not be dereferenced again.
+    const int a_slot = ra->delta_slot;
 
     // Retire A: resources reclaimed; the id is dead.
     CHECK(mgr.retire_sequence(a).ok);
@@ -511,11 +573,13 @@ int test_sequence_lifecycle() {
 
     // C create: physical resources ARE reusable (the freed slot comes
     // back LIFO) but the SequenceId is NOT A's (monotone, non-reusing).
+    // (Compared against the pre-retire cached a_slot — `ra` dangles after
+    // retire_sequence and is never dereferenced again.)
     SequenceId c = 0;
     CHECK(mgr.create_sequence(&c).ok);
+    CHECK(c != a);  // id never reused
     CHECK_EQ(c, static_cast<SequenceId>(3));
-    CHECK(mgr.lookup(c)->delta_slot == ra->delta_slot);  // slot reused
-    CHECK(c != a);
+    CHECK_EQ(mgr.lookup(c)->delta_slot, a_slot);  // physical slot reused
     CHECK_EQ(mgr.delta_pool().used_slots(), 2);
 
     // Length metadata: set/advance contract + bounds.
