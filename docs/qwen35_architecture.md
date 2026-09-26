@@ -1405,7 +1405,7 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
  ```cpp
  struct SamplingConfig {
    float temperature = 0.0f;   // <=0 -> 冻结 greedy 路径; >0 -> sampling
-   int   top_k = 0;            // <=0 -> 不启用; >vocab_size -> clamp 到 vocab
+   int   top_k = 0;            // 0 -> 不启用; <0 非法; >vocab_size -> clamp 到 vocab
    float top_p = 1.0f;         // (0,1]; 1.0 -> 不启用
    std::uint64_t seed = 0;     // 每请求 RNG 种子（greedy 不消耗 RNG）
  };
@@ -1418,15 +1418,22 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
  - **固定流水线顺序**（与调用顺序无关，sampling 模式）：
    `temperature → top-k → top-p → normalize → sample`。
    1. **temperature**：`f[i] = logits[i] / temperature`（T > 0；非法值
-      fail loud，见下）。
-   2. **top-k**：只留概率最高的 k 个（`top_k <= 0` 不启用；
+      fail loud，见下）。**scaled logits / max / exp 全程用 double**：
+      有限 BF16 logit 除以最小合法正 float temperature（denorm_min）
+      约 2.4e83 —— 远超 float 范围但在 double 之内，因此**对每个合法
+      有限正 float temperature**，有限 logits 都产生合法分布（全部
+      p finite、至少一个严格为正、sum ≈ 1）；`sample_token()` 对
+      vocab ≥ 1 恒返回 `[0, vocab)`（generator 另有防御性 range
+      检查，`-1` 永不进 `forward_token`）。
+   2. **top-k**：只留概率最高的 k 个（`top_k == 0` 不启用；`top_k < 0` 非法 fail loud；
       **`top_k > vocab_size` clamp 到 vocab_size**（已测试并文档化）；
       值相同（tie）时**最小 token id** 占名额）。
    3. **top-p**：在 **top-k 幸存者**上按概率从高到低（tie → 最小 id），
       保留 cumulative probability 达到 top_p 的**最小前缀**（`top_p == 1`
       不裁剪；**至少保留 1 个** token）。
-   4. **normalize**：`p[i] = exp(f[i] - max_f) / sum_survivors` ——
-      **先减 max 再 exp**（数值稳定，无 overflow）；被排除 token p == 0。
+   4. **normalize**：`p[i] = exp(f[i] - max_f) / sum_survivors`（double）
+      —— **先减 max 再 exp**（数值稳定，无 overflow）；被排除 token
+      p == 0。
    5. **sample**：单次 RNG 抽取 u ∈ [0,1)，按 token id 升序走 cumulative，
       首个 `u < cum` 者胜；u 落在尾部舍入缝隙时取**最后一个**幸存者。
  - **fail loud（单一校验门 `validate_sampling_config`）**：temperature
@@ -1486,8 +1493,17 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    `--top-p` → sampling（未显式给 `--temperature` 时默认 1.0；
    `--temperature 0` → 冻结 greedy 路径）；`--seed` 单独出现**不**
    启用 sampling（greedy 不消耗 RNG，seed 被忽略）。
+ - **`--temperature` 数值 range**：文本必须能舍入到可表示的 float。
+   overflow 到 inf（如 `1e40`、`inf`、`nan`）或 underflow 到 0
+   （如 `1e-50`、`7e-46`）→ **usage error（exit 2）**——不允许静默
+   变 inf 或静默变 0/greedy。denormal 到 denorm_min、最大到
+   FLT_MAX 都是合法值（有测试钉死）；显式 `0`/`-0` 仍是文档化的
+   greedy 写法。
  - 输出：成功时 stdout **只有生成的文本**（正常模式不打印 logits /
-   debug tensor）；错误走 stderr。
+   debug tensor）；错误走 stderr。stdout 写入是 **binary-safe /
+   length-aware**（`write_generated_text`：按精确字节数 fwrite +
+   约定的结尾换行，短写 → exit 1）——原生 decode 合法产生的
+   **embedded NUL 字节不会被截断**。
  - **exit code**：0 成功；1 运行时失败（model load failure /
    tokenizer load failure / 生成契约违规，如 empty prompt、prompt 超
    max_seq_len）；2 用法错误（缺参 / 坏参数 / 非法 sampling config，
@@ -1505,7 +1521,10 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    不同 seed 不同 stream + 均匀性；非法 config（单一门 fail loud）；
    极值 logits（1000/1000 量级，max 相减无 overflow）/ 全负 logits；
    精确 tie（greedy 最小 id、sampling 均匀、k=1 钉死）；单一幸存者
-   （top_k=1 任意 seed 都 = argmax）。
+   （top_k=1 任意 seed 都 = argmax）；**极值 temperature（FLT_MIN /
+   denorm_min / FLT_MAX × 正/负极值与平手 logits：所有 p finite、
+   sum ≈ 1、16 个 seed 下 sampled id ∈ [0, vocab)）——该组 regression
+   在旧的 float 流水线下必然击穿（NaN + sample == -1）**。
  - `test_qwen35_sampling`（real checkpoint，self-skip 77）：greedy
    EXACT（旧 API == greedy-config 新 API == temperature-0 带字段 config，
    ids/stop/forward 全同）；seed 确定性（A(42) == A(42)）；
@@ -1514,8 +1533,12 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    sampler RNG reset 都无跨请求污染）；sampling 健全性（id ∈ vocab、
    forward-count 不变式）；非法 config fail loud 且不 forward。
  - `test_generate_cli_args`（CPU）：--help / 缺必填 / 缺值 / 未知参数 /
-   坏数值（含溢出、部分消费）/ 模式解析 / `--greedy` 互斥 /
-   解析后 config 过单一校验门。
+   坏数值（含溢出、部分消费）/ **`--temperature` float range
+   （`1e40`/`1e308`/`inf`/`nan`/`1e-50`/`7e-46` → usage error；
+   `0`/`-0`/`1.4e-45`/`1e-45`/`1.17549435e-38`/`3.4e38` → 合法并
+   钉死精确 float 值）**/ 模式解析 / `--greedy` 互斥 / 解析后 config
+   过单一校验门 / **binary-safe stdout（`write_generated_text`
+   roundtrip：`ab\0cd`、单个 NUL、空串 → 逐字节全保留 + 结尾换行）**。
  - `test_cudalm_generate_cli`（真二进制 fork/exec，无 shell，CJK 原样
    传递）：--help；用法错误 exit 2 + 信息；坏 model/tokenizer 路径
    exit 1 + 信息；非法 sampling config exit 2；greedy 路径 exit 0 +
@@ -1525,13 +1548,24 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
  ### 21.6 v0.4 最终 evidence（Phase C 完成）
 
  **Phase C / v0.4 functional evidence executed on:**
- `V04_EVIDENCE_SHA = a008b4373a94427695ebe0dafb7086468afd9c90`（工作树干净、HEAD == 该 SHA）。
+ `V04_EVIDENCE_SHA = cb3cb668f1c99b253c65f676b8737896b503ce48`（工作树
+ 干净、HEAD == 该 SHA）。
+
+ **历史**：第一版 functional evidence 曾绑定
+ `a008b4373a94427695ebe0dafb7086468afd9c90`；review 之后做了两处
+ correctness 修复（极小正 temperature 的数值溢出 → double 流水线 +
+ sampler/generator 防御检查；CLI stdout 改 binary-safe）+ CLI
+ --temperature 数值 range 检查 + top_k 措辞统一 —— 属于 functional
+ 修改，按规则**该旧 SHA 的 evidence 已失效并整套重跑**（下文即新
+ SHA 的结果）。中间提交 `b7fb4b1`（README/docs + `benchmarks/
+ sanitizer_cudalm_generate.txt`）的性质是 **docs/evidence-only**
+ （含 benchmark 证据记录，不是严格 docs-only）。
 
  **失效规则**：此后任何对 `src/`、`include/`、`tools/`、`tests/` 或
  functional CMake 配置的修改都使该 evidence **失效**，必须整套重跑；
- 仅 docs 修改不使其失效（此时注明最终 HEAD 与 evidence SHA 不同）。
- 若 Phase C 之后任何人修改了**冻结的 tokenizer 语义**（§18/§20），
- 必须停止并报告，而不是继续。
+ 仅 docs/evidence 修改（文档 + benchmark 证据记录）不使其失效（此时
+ 注明最终 HEAD 与 evidence SHA 不同）。若 Phase C 之后任何人修改了
+ **冻结的 tokenizer 语义**（§18/§20），必须停止并报告，而不是继续。
 
  证据内容（于该 SHA，全部真实执行）：
  - **完整 ctest：45/45 PASS，0 failed，0 skipped**（含 Phase A/B 全部
@@ -1549,7 +1583,7 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    comp_pair 各 3,030、nfc_fuzz 20,000/seed 777、adjacency 5,000/
    seed 20260925、enc_fuzz 10,000/seed 42、pretok_fuzz 10,000/seed
    999、dec_fuzz 4,000/seed 20250417；脚本自报
-   `head=a008b437…`）。Phase C 未修改 tokenizer 实现/工具，extended
+   `head=cb3cb668…`）。Phase C 未修改 tokenizer 实现/工具，extended
    百万级穷举不需要重做，Phase B extended evidence 仍绑定
    `0dc3b576`。
  - **新 CUDA runtime path = 0**（sampler 纯 CPU，无新 kernel/

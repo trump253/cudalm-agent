@@ -619,10 +619,36 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
    extended evidence 仍绑定 `0dc3b576`）。
  - **`scripts/check_no_torch.sh`**：CLEAN（新代码全部 PyTorch/
    pybind-free）。
- - **evidence 绑定**：`V04_EVIDENCE_SHA = a008b4373a94427695ebe0dafb7086468afd9c90`（clean tree、HEAD ==
-   SHA；完整 ctest + check_no_torch + quick tokenizer validation 于该
-   SHA）。失效规则同 Phase B：此后任何 `src/` / `include/` / `tools/` /
-   `tests/` / functional CMake 修改 → evidence 失效必须重跑；仅 docs
-   修改不失效（此时最终 HEAD ≠ evidence SHA）。
+ - **Review 修复轮（functional，commit `cb3cb66`）**：两处
+   correctness blocker + 两处 cleanup，不扩 scope ——
+   (1) 极小正 temperature 数值溢出：原 float 流水线
+   `logit / denorm_min -> inf`，随后 `inf - max -> NaN`，
+   `sample_token()` 返回 -1（已复现）；修复为 scaled/max/exp 全程
+   **double**（有限 bf16 logit / 最小合法正 float ≈ 2.4e83，在
+   double 范围内）→ 对**每个**合法有限正 float temperature，有限
+   logits 都产生合法分布（p 全 finite、sum ≈ 1）；`sample_token()`
+   契约文档化为 vocab ≥ 1 时恒返回 `[0, vocab)`，generator 另加
+   防御性 range 检查（-1 永不进 `forward_token`）。回归：
+   `test_sampling` 第 12 组（FLT_MIN / denorm_min / FLT_MAX ×
+   正/负极值与平手 logits，16 seeds 下 sampled id ∈ [0, vocab)）——
+   旧实现必然击穿。(2) CLI stdout 由 `fputs(c_str())` 改为
+   **binary-safe length-aware** `write_generated_text()`（精确字节数
+   fwrite + 结尾换行，短写 exit 1）：原生 decode 合法产生的 embedded
+   NUL 不再被截断。回归：`test_generate_cli_args` 用真实 FILE
+   roundtrip `ab\0cd` / 单 NUL / 空串逐字节比对。另外：CLI
+   `--temperature` 文本 parse 增加 float range 检查（overflow 到 inf /
+   underflow 到 0 → usage error，不静默变 inf 或 0/greedy；denormal
+   到 denorm_min 合法）；`top_k` 措辞统一为 `== 0` 禁用 / `< 0` 非法 /
+   `> vocab` clamp（代码 + 文档）。
+ - **evidence 绑定**：`V04_EVIDENCE_SHA = cb3cb668f1c99b253c65f676b8737896b503ce48`（clean
+   tree、HEAD == SHA；完整 ctest 45/45 PASS 0 skipped +
+   check_no_torch CLEAN + quick tokenizer validation 0 mismatch +
+   CLI compute-sanitizer 0 错误，均于该 SHA）。旧 evidence SHA
+   `a008b437` 因上述 functional 修复按规则**失效**（未删除历史，
+   仅声明失效）。失效规则：此后任何 `src/` / `include/` / `tools/` /
+   `tests/` / functional CMake 修改 → evidence 失效必须重跑；仅
+   **docs/evidence** 修改（文档 + benchmark 证据记录；例如
+   `b7fb4b1` 的性质就是 docs/evidence-only，不是严格 docs-only）不
+   失效（此时最终 HEAD ≠ evidence SHA）。
  - **停止**：未 merge main；未宣布 v0.4 DONE/FROZEN —— 等待 external
    reviewer 对 v0.4 最终 sign-off。

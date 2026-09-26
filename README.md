@@ -260,9 +260,10 @@ cmake -S . -B build && cmake --build build -j
   --seed 42
 ```
 
-- 成功：stdout **只有生成的文本**；错误：stderr + 非零退出
-  （1 = 运行时失败：model/tokenizer 加载、生成契约；
-  2 = 用法错误：缺参 / 坏参数 / 非法 sampling config）。
+- 成功：stdout **只有生成的文本**（binary-safe / length-aware 写入：
+  原生 decode 合法产生的 embedded NUL 字节不会被截断）；错误：
+  stderr + 非零退出（1 = 运行时失败：model/tokenizer 加载、生成
+  契约；2 = 用法错误：缺参 / 坏参数 / 非法 sampling config）。
 - 模式：默认 **greedy**（冻结 Phase A 路径，bit-for-bit）；
   `--temperature` / `--top-k` / `--top-p` 任一出现 → sampling
   （未显式给 `--temperature` 时默认 1.0）；`--greedy` 显式关闭
@@ -272,11 +273,14 @@ cmake -S . -B build && cmake --build build -j
 
 ### Sampling 语义（摘要）
 
-固定流水线 `temperature → top-k → top-p → normalize → sample`：
-`logits/T`；top-k 留最高的 k 个（`>vocab` 时 clamp 到 vocab，tie →
-最小 id）；top-p 在 k 幸存者上保留 cumulative 概率达到 p 的最小前缀
-（≥1 个）；softmax 先减 max（数值稳定）。详见
-`docs/qwen35_architecture.md` §21。
+固定流水线 `temperature → top-k → top-p → normalize → sample`
+（scaled/max/exp 用 double，对任何合法有限正 temperature 都保持
+数值合法）：`logits/T`；top-k 留最高的 k 个（`top_k == 0` 禁用、
+`top_k < 0` 非法、`>vocab` 时 clamp 到 vocab，tie → 最小 id）；
+top-p 在 k 幸存者上保留 cumulative 概率达到 p 的最小前缀（≥1 个）；
+softmax 先减 max（数值稳定）。CLI 的 `--temperature` 文本若 overflow
+到 inf 或 underflow 到 0 → usage error（不静默变 inf / 0/greedy）。
+详见 `docs/qwen35_architecture.md` §21。
 
 ### 当前限制（v0.4 边界）
 
@@ -290,9 +294,10 @@ server / OpenAI API、无 NCU / CUDA Graph / kernel fusion / 性能调优。
 
 ### v0.4 最终 evidence
 
-`V04_EVIDENCE_SHA = a008b4373a94427695ebe0dafb7086468afd9c90` —— 完整 ctest + `scripts/check_no_torch.sh`
+`V04_EVIDENCE_SHA = cb3cb668f1c99b253c65f676b8737896b503ce48` —— 完整 ctest + `scripts/check_no_torch.sh`
 + tokenizer quick differential validation 于该 SHA（clean tree、
 HEAD == SHA）执行；失效规则：此后任何 `src/`/`include/`/`tools/`/
-`tests/`/functional CMake 修改 → evidence 失效必须重跑（仅 docs 不
-失效）。细节见 `docs/qwen35_architecture.md` §21.6 与
+`tests/`/functional CMake 修改 → evidence 失效必须重跑（仅
+ docs/evidence 修改——文档 + benchmark 证据记录——不失效）。细节见
+ `docs/qwen35_architecture.md` §21.6 与
 `docs/provenance.md`（v0.4 Phase C）。
