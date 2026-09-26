@@ -114,6 +114,28 @@ void Qwen35DeltaNetLayer::seed_state(const __nv_bfloat16* conv,
 
 void Qwen35DeltaNetLayer::forward(int position, const __nv_bfloat16* x_in,
                                   cudaStream_t stream) {
+  // Legacy owned-state path: the exact v0.2 pipeline over the layer's own
+  // persistent state (behavior unchanged).
+  forward_impl(position, x_in, conv_state_.data<__nv_bfloat16>(),
+               rec_state_.data<float>(), stream);
+}
+
+void Qwen35DeltaNetLayer::forward_with_state(int position,
+                                             const __nv_bfloat16* x_in,
+                                             __nv_bfloat16* ext_conv,
+                                             float* ext_rec,
+                                             cudaStream_t stream) {
+  // v0.5 Phase B external-state path: the SAME pipeline, state addressed
+  // directly in the caller's buffers (e.g. a Qwen35DeltaStatePool slot) —
+  // read + updated in place, no host roundtrip, layer-owned state untouched.
+  forward_impl(position, x_in, ext_conv, ext_rec, stream);
+}
+
+void Qwen35DeltaNetLayer::forward_impl(int position,
+                                       const __nv_bfloat16* x_in,
+                                       __nv_bfloat16* conv_state,
+                                       float* rec_state,
+                                       cudaStream_t stream) {
   CUDALM_PRECONDITION(
       position >= 0 && position < cfg_.max_seq_len,
       "Qwen35DeltaNetLayer::forward: position out of bounds [0, max_seq_len)");
@@ -157,7 +179,7 @@ void Qwen35DeltaNetLayer::forward(int position, const __nv_bfloat16* x_in,
 
   // 3) depthwise causal conv1d decode update (in-place conv_state) + SiLU
   kernels::qwen35_deltanet_conv_decode_bf16(
-      conv_state_.data<__nv_bfloat16>(), mixed_.data<__nv_bfloat16>(),
+      conv_state, mixed_.data<__nv_bfloat16>(),
       w_->conv1d_weight.data<__nv_bfloat16>(), conv_out_.data<__nv_bfloat16>(),
       conv_silu_.data<__nv_bfloat16>(), static_cast<int>(conv_dim), stream);
 
@@ -184,7 +206,7 @@ void Qwen35DeltaNetLayer::forward(int position, const __nv_bfloat16* x_in,
   kernels::qwen35_deltanet_delta_rule_fp32(
       q_.data<__nv_bfloat16>(), k_.data<__nv_bfloat16>(),
       v_.data<__nv_bfloat16>(), g_.data<float>(),
-      beta_.data<__nv_bfloat16>(), rec_state_.data<float>(),
+      beta_.data<__nv_bfloat16>(), rec_state,
       core_.data<__nv_bfloat16>(), static_cast<int>(n_heads),
       static_cast<int>(hd), eps, stream);
 

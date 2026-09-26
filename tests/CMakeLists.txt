@@ -79,6 +79,36 @@ cudalm_add_test(test_attention test_attention cuda/test_attention.cpp)
 # and OOM transactional behavior (table/accounting unchanged on failure).
 cudalm_add_test(test_qwen35_state_manager test_qwen35_state_manager
                 cuda/test_qwen35_state_manager.cpp)
+# v0.5 Phase B: paged-KV kernel standalone hard gate (synthetic data, NO
+# checkpoint): paged KV write (physical rows bit-exact, unwritten rows
+# untouched) + paged causal decode attention BIT-IDENTICAL to the frozen
+# contiguous attention under two NON-trivial physical mappings (not the
+# identity) across the position boundary matrix (0, pt-1, pt, pt+1,
+# multi-page crossings), with OUT-OF-RANGE sentinels in the block-table
+# stale region proving stale entries are never read.
+cudalm_add_test(test_paged_kv test_paged_kv cuda/test_paged_kv.cpp)
+# v0.5 Phase B: single-sequence external-state parity hard gate (real
+# checkpoint). A = frozen legacy owned-state forward_token (p0..p5, page
+# boundaries at positions 2+4 with page_tokens=2) vs B = Qwen35StateManager
+# sequence + forward_token_with_state (DeltaNet forward_with_state over the
+# pool slot + paged attention over the pool + device block table). Gates:
+# every step's embedding/24 layer finals/final-norm/FULL logits BIT-IDENTICAL,
+# final hybrid state (18x delta conv+rec, 6x KV logical rows via block table)
+# BIT-IDENTICAL, OOM-BEFORE-MUTATION (exhausted 3-page pool: 7th forward
+# fails with length/block-table/pool/Delta/KV all unchanged), reset parity
+# (reset_sequence + same tokens == first external run), fail-loud unknown id
+# + invalid token. Self-skips (77) when the checkpoint is absent; the
+# Phase B evidence environment MUST actually run it.
+add_executable(test_qwen35_state_parity cuda/test_qwen35_state_parity.cpp)
+target_link_libraries(test_qwen35_state_parity PRIVATE cudalm)
+add_test(NAME test_qwen35_state_parity
+         COMMAND test_qwen35_state_parity
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_state_parity PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 # --- Cross-language weight-file tests (Python tools -> C++ loader) ------------
 # tools/convert_weights.py (torch, offline) emits data/block_v01.cudalm into

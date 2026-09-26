@@ -20,6 +20,7 @@
 
 #include "cudalm/cuda_check.h"
 #include "cudalm/kernels/int4_gemv_bf16.h"
+#include "cudalm/kernels/paged_kv.h"
 #include "cudalm/kernels/qwen35_kernels.h"
 
 namespace cudalm {
@@ -138,10 +139,27 @@ void Qwen35FullAttentionLayer::forwardTimed(int position,
   *whole_block_us = wms * 1000.0f;
 }
 
+void Qwen35FullAttentionLayer::forward_with_paged_state(
+    int position, const __nv_bfloat16* x_in, const PagedStateRef& ps,
+    cudaStream_t stream) {
+  CUDALM_PRECONDITION(
+      ps.k_pages != nullptr && ps.v_pages != nullptr &&
+          ps.block_table != nullptr && ps.page_tokens >= 1 &&
+          ps.page_stride >=
+              static_cast<std::size_t>(cfg_.n_kv_heads) *
+                  static_cast<std::size_t>(ps.page_tokens) *
+                  static_cast<std::size_t>(cfg_.head_dim),
+      "Qwen35FullAttentionLayer::forward_with_paged_state: incomplete "
+      "PagedStateRef (null pointers, page_tokens < 1, or page_stride too "
+      "small)");
+  forwardImpl(position, x_in, stream, nullptr, &ps);
+}
+
 void Qwen35FullAttentionLayer::forwardImpl(int position,
                                            const __nv_bfloat16* x_in,
                                            cudaStream_t stream,
-                                           cudaEvent_t* events) {
+                                           cudaEvent_t* events,
+                                           const PagedStateRef* paged) {
   CUDALM_PRECONDITION(
       position >= 0 && position < cfg_.max_seq_len,
       "Qwen35FullAttentionLayer::forward: position out of bounds "
@@ -233,18 +251,36 @@ void Qwen35FullAttentionLayer::forwardImpl(int position,
       rd, cos_t, sin_t, stream);
   rec(events, 19, stream);
 
-  // 6) KV write at `position` (K cache <- rope_k, V cache <- v)
+  // 6) KV write at `position` (K cache <- rope_k, V cache <- v). Paged:
+  //    scatter into the external page array via the device block table
+  //    (no host gather); legacy: the layer's own contiguous cache.
   rec(events, 20, stream);
-  kv_->write(position, rope_k_.data<__nv_bfloat16>(), v_.data<__nv_bfloat16>(),
-             stream);
+  if (paged) {
+    kernels::qwen35_paged_kv_write_bf16(
+        rope_k_.data<__nv_bfloat16>(), v_.data<__nv_bfloat16>(),
+        paged->k_pages, paged->v_pages, paged->block_table, position,
+        paged->page_tokens, n_kv, hd, paged->page_stride, stream);
+  } else {
+    kv_->write(position, rope_k_.data<__nv_bfloat16>(),
+               v_.data<__nv_bfloat16>(), stream);
+  }
   rec(events, 21, stream);
 
-  // 7) causal attention over [0..position]
+  // 7) causal attention over [0..position] (paged: rows resolved through
+  //    the device block table; legacy: contiguous cache).
   rec(events, 22, stream);
-  kernels::qwen35_attention_decode_bf16(
-      rope_q_.data<__nv_bfloat16>(), kv_->k(), kv_->v(), position,
-      attn_raw_.data<__nv_bfloat16>(), n_heads, n_kv, hd, cfg_.max_seq_len,
-      attn_scratch_.data<__nv_bfloat16>(), stream);
+  if (paged) {
+    kernels::qwen35_paged_attention_decode_bf16(
+        rope_q_.data<__nv_bfloat16>(), paged->k_pages, paged->v_pages,
+        paged->block_table, position, paged->page_tokens,
+        attn_raw_.data<__nv_bfloat16>(), n_heads, n_kv, hd,
+        paged->page_stride, attn_scratch_.data<__nv_bfloat16>(), stream);
+  } else {
+    kernels::qwen35_attention_decode_bf16(
+        rope_q_.data<__nv_bfloat16>(), kv_->k(), kv_->v(), position,
+        attn_raw_.data<__nv_bfloat16>(), n_heads, n_kv, hd, cfg_.max_seq_len,
+        attn_scratch_.data<__nv_bfloat16>(), stream);
+  }
   rec(events, 23, stream);
 
   // 8) attention gate: attn_raw * sigmoid(att_gate)

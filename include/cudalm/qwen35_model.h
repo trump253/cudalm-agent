@@ -39,6 +39,7 @@
 #include "cudalm/qwen35_config.h"
 #include "cudalm/qwen35_deltanet.h"
 #include "cudalm/qwen35_full_attention.h"
+#include "cudalm/qwen35_state_manager.h"
 #include "cudalm/tensor.h"
 #include "cudalm/weight_loader_v2.h"
 
@@ -103,6 +104,35 @@ class Qwen35Model {
   // 0 <= position < max_seq_len.
   void forward_token(int token_id, int position, cudaStream_t stream);
 
+  // ---- v0.5 Phase B: external-state single-token forward ----------------
+  // Run the COMPLETE model on ONE token of the LIVE sequence `seq_id`
+  // (Qwen35StateManager), with the layer state addressed IN the manager's
+  // pools instead of the layers' own caches:
+  //   * 18 Gated DeltaNet layers -> forward_with_state over the sequence's
+  //     DeltaStatePool slot (conv + recurrent updated in place);
+  //   * 6 full-attention layers  -> forward_with_paged_state over the
+  //     Qwen35KvPagePool pages + the sequence's DEVICE block table.
+  //
+  // `position` is DERIVED from SequenceState.length (the single source of
+  // truth — the caller does not maintain a second position). One SUCCESSFUL
+  // call means exactly:
+  //   position = sequence.length
+  //   ensure the KV page for `position` (TRANSACTIONAL, OOM-checked FIRST)
+  //   copy the current block-table page IDs to a device scratch (per-token
+  //   H2D metadata; stream-ordered with the kernels)
+  //   embedding -> 24 layers (external state) -> final RMSNorm -> LM head
+  //   sequence.length += 1
+  //
+  // FAIL LOUD (Status, no partial effect): unknown/retired sequence id;
+  // invalid token_id; length >= max_seq_len; KV page OOM. The KV OOM check
+  // (ensure_kv_capacity) runs BEFORE any model-state mutation — on OOM no
+  // DeltaNet state, no KV page, and the sequence length are changed, and
+  // no layer forward ran. (The frozen legacy forward_token's
+  // precondition-abort contract is unchanged and separate.)
+  Status forward_token_with_state(int token_id, SequenceId seq_id,
+                                  Qwen35StateManager& mgr,
+                                  cudaStream_t stream);
+
   // ---- Forward outputs (device; valid from forward_token until the next) --
   // Embedding output [hidden_size] bf16 (= embed_tokens.weight[token_id]).
   const __nv_bfloat16* embedding_output() const {
@@ -144,6 +174,11 @@ class Qwen35Model {
   DeviceBuffer embed_out_{};
   DeviceBuffer norm_out_{};
   DeviceBuffer logits_buf_{};
+  // v0.5 Phase B: device scratch for the per-sequence block-table page-ID
+  // H2D (sized grow-only to the manager's max_blocks() on first use; the
+  // paged kernels read only entries [0, position/page_tokens], so stale
+  // content beyond the copied prefix is never read).
+  DeviceBuffer block_table_scratch_{};
   bool tie_ = false;
   bool loaded_ = false;
 };

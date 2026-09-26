@@ -111,6 +111,15 @@ class Qwen35KvPagePool : public KvPageSource {
   int full_layer_ordinal(int layer_idx) const;   // -1 if not full-attention
   int layer_of_full_ordinal(int ordinal) const;  // -1 if ordinal out of range
 
+  // Element stride between two consecutive pages of the SAME layer ordinal,
+  // in bf16 elements: page_elems(). The physical layout is row-major
+  // [n_full][num_pages][n_kv][page_tokens][head_dim] (page_ptr computes
+  // (ordinal * capacity_pages + page_id) * page_elems), so the pages of one
+  // ordinal are ADJACENT; ordinals are capacity_pages() * page_elems() apart
+  // (pass k_page(ord, 0) as the page-array base to select an ordinal). This
+  // is the paged kernels' `page_stride`.
+  std::size_t page_stride_elems() const { return page_elems(); }
+
   // ---- device access (Phase B kernels + tests) ------------------------------
   // K (or V) page slice: bf16 [n_kv_heads][page_tokens][head_dim], the
   // contiguous page-`page_id` slice of full-attention layer ordinal

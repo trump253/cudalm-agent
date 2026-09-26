@@ -76,6 +76,14 @@ class KvBlockTable {
     return logical_block * page_tokens_;
   }
 
+  // Host-side view of the current prefix (logical block -> physical page),
+  // one entry per allocated block. This is the array a caller copies to a
+  // device scratch buffer for the paged kernels (v0.5 Phase B: per-token
+  // H2D of the current page IDs; the kernels read only entries
+  // [0, position/page_tokens], so stale device content beyond the copied
+  // prefix is never touched).
+  const int* page_ids() const { return pages_.data(); }
+
   // Query: physical page id of an ALLOCATED logical block, else -1.
   int lookup(int logical_block) const {
     return logical_block >= 0 && logical_block < num_blocks()

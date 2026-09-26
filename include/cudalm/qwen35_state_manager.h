@@ -129,6 +129,13 @@ class Qwen35StateManager {
 
   const Qwen35KvPagePool& kv_pool() const { return kv_; }
   const Qwen35DeltaStatePool& delta_pool() const { return delta_; }
+  // Non-const pool views (Phase B: the model's external-state forward
+  // WRITES into the pool's pages / delta slots; the pool API itself is
+  // unchanged).
+  Qwen35KvPagePool& kv_pool_mut() { return kv_; }
+  Qwen35DeltaStatePool& delta_pool_mut() { return delta_; }
+  // The pool's KV page size (the paged kernels' `page_tokens`).
+  int page_tokens() const { return kv_.page_tokens(); }
   const Qwen35Config& config() const { return cfg_; }
 
   // Exact manager-level byte accounting (sum of the exact pool
