@@ -1798,31 +1798,41 @@ sampling / tokenizer / CLI）**零语义修改**；legacy contiguous KV cache
 - **`Qwen35Model::forward_token_with_state(token_id, seq_id, mgr,
   stream)`**（执行顺序，全部 stream-ordered）：
   1. model 未加载 → Status；`token_id ∉ [0, vocab)` → Status；
-  2. `mgr.lookup(seq_id)` → nullptr（未知 / 已 retire）→ Status；
-  3. **`position = rec->length`**（位置永远从 SequenceState.length 推导，
+  2. **compatibility gate（任何 state mutation 前的最先一致性检查）**：
+     `mgr.config() == config()` —— config 不一致的 manager 会以错误布局
+     寻址池，直接 Status 返回；且 enforce Phase A 单 stream 契约（v0.5
+     correctness-first，**不引入** cross-stream event machinery）：
+     `stream == mgr.kv_pool().stream() && stream ==
+     mgr.delta_pool().stream()`，否则 Status —— 两者失败均**零
+     mutation**（无 KV allocation、无 Delta 变化、length 不变、不进入
+     任何 layer forward，硬门钉死）；
+  3. `mgr.lookup(seq_id)` → nullptr（未知 / 已 retire）→ Status；
+  4. **`position = rec->length`**（位置永远从 SequenceState.length 推导，
      不接受外部 position 参数）；`position >= max_seq_len` → Status；
-  4. **`mgr.ensure_kv_capacity(seq_id, position)` 最先**（在任何模型
-     state 变更前）→ OOM 时 Status 返回，**零 mutation**（无 delta
-     变化、无 KV 变化、length 不变、无部分 forward —— 硬门钉死）；
-  5. block table 上设备：grow-only `block_table_scratch_`
+  5. **`mgr.ensure_kv_capacity(seq_id, position)` 最先的 state 触点**
+     （在任何模型 state 变更前）→ OOM 时 Status 返回，**零 mutation**
+     （无 delta 变化、无 KV 变化、length 不变、无部分 forward —— 硬门
+     钉死）；
+  6. block table 上设备：grow-only `block_table_scratch_`
      （`max_blocks()` 个 int 的单一设备 buffer，永不重分配）+ 把当前
      前缀 `num_blocks` 个 page id 做**每 token 一次的小 H2D
      `cudaMemcpyAsync`**（唯一跨 H/D 的每 token 元数据拷贝；page id
      精确 —— kernel 只读 `block_table[t / page_tokens]`，`t ≤
      position`，全部在当前前缀内，无 stale 读；旧 buffer 尾部残留的
      大 id 永不被触及）；
-  6. embedding 行 D2D 拷贝 → 24 层循环：linear 层走
+  7. embedding 行 D2D 拷贝 → 24 层循环：linear 层走
      `delta(i)->forward_with_state(position, x,
      dpool.conv_mut(ord, slot), dpool.recurrent_mut(ord, slot),
      stream)`（每层一个 base + slot 偏移，Phase A 布局天然支持）；
      full 层组 `PagedStateRef{ kpool.k_page_mut(ord, 0),
      kpool.v_page_mut(ord, 0), d_block_table, page_tokens,
      kpool.page_stride_elems() }` 走 `forward_with_paged_state`；
-  7. final RMSNorm → LM head `bf16_gemv` → 全量 logits；
-  8. **`mgr.advance(seq_id, 1)` 最后**（一次成功 = position=len、
+  8. final RMSNorm → LM head `bf16_gemv` → 全量 logits；
+  9. **`mgr.advance(seq_id, 1)` 最后**（一次成功 = position=len、
      KV page 已 ensure、24 层 external forward 完成、len += 1）。
 
-  fail-loud：未知/retire 序列、`len >= max_seq_len`、KV OOM、
+  fail-loud：config/stream mismatch（compatibility gate）、
+  未知/retire 序列、`len >= max_seq_len`、KV OOM、
   非法 token —— 全部 Status 返回（不 abort），且失败时 state 零
   变化（硬门钉死）。
 
@@ -1882,11 +1892,14 @@ parity 是 **runtime-vs-runtime**（legacy 冻结路径 vs 新 external
   - attention 门：16 组 (position × mapping)（T ∈ {1,2,4,5,6,8,9,13}，
     pt=4，4 head/2 kv/8 hd）对冻结 `qwen35_attention_decode_bf16`
     **BIT-IDENTICAL**；
-  - 真实形状门：0.8B 全注意力真实维度（**n_heads 16、n_kv 8、
-    head_dim 64** —— H1024/16；page_tokens 2 = parity 门同款小页），
-    池布局（相邻 page + 两个交错 ordinal），映射 `{2,0,1}`，
+  - 真实形状门：**真实 Qwen3.5-0.8B attention 维度**（直接从冻结
+    `Qwen35Config::qwen35_08b()` 读取并 CHECK 钉死：**n_heads 8、
+    n_kv_heads 2、head_dim 256** —— H1024/8，无手写常量）+ **2-ordinal
+    miniature 池布局 fixture**（page_tokens 2 = parity 门同款小页；相邻
+    page + ordinal 间距 = capacity*page_elems），映射 `{2,0,1}`，
     T ∈ {2,3,4,5,6}（从 position 2 起逐 token 跨页边界）
-    **BIT-IDENTICAL**。
+    **BIT-IDENTICAL**（真正 6 个 full-attention layer 的 real-checkpoint
+    path 由 `test_qwen35_state_parity` 覆盖）。
 - **`test_qwen35_state_parity`**（真实 Qwen3.5-0.8B checkpoint，CLI
   参数 `<full_model.cudalm> <checkpoint_dir> <python> <src_dir>`，
   SKIP 77 / TIMEOUT 1800；**evidence 环境必须真实跑，77 skip 不是
@@ -1906,6 +1919,12 @@ parity 是 **runtime-vs-runtime**（legacy 冻结路径 vs 新 external
   - **OOM-before-mutation**：第 7 个 token（position 6 → block 3 >
     容量 3）必须 `!s.ok`，且前后 **48 项 state 全部 bit-identical**
     + length / num_blocks / used_state_bytes / live_pages 不变；
+  - **compatibility gate**：config 不一致的 manager（n_kv_heads 4 vs
+    2）→ `!s.ok` 且**零 mutation**（无 KV page allocation、无 Delta
+    变化、length 不变、不进任何 layer forward）；config 一致但 stream
+    不一致（单 stream 契约）→ `!s.ok` 且 **48 项 state 全部
+    bit-identical** + length / num_blocks / used_state_bytes /
+    live_pages 不变；
   - **fail-loud**：未知 SequenceId 999 → `!s.ok`；非法 token
     （vocab+7）→ `!s.ok` 且 length 不变；
   - **reset parity**：`reset_sequence` 后重放同一 6 token →
