@@ -1126,7 +1126,12 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
      采样 RNG 隔离（A(seed42) 交错 == A 单独；B(seed123) 交错 == B
      单独；同 prompt+同 seed ⇒ 同流，与 interleave/admission 顺序无
      关）、fatal Status（Failed + retire 恰一次；snapshot 其余 id 继
-     续推进）；
+     续推进；**失败的 forward 不提交 progress**：`forward_count` /
+     `prefill_pos` 均排除之 —— `{50,99}` 门钉死 50 ok/99 failing →
+     `forward_count = 1`、`prefill_pos = 1`（**不是 2**）；**`run()`
+     failure isolation** 硬门：A 在 `run()` 中 fatal、B 正常 →
+     `!s.ok`、A Failed、B Finished、num_live == 0、manager 0，且 A 的
+     progress 钉死 + sequence 只 retire 一次）；
    - `test_qwen35_scheduler_integration`（**real-checkpoint
      integration gate**；真实 Qwen3.5-0.8B-Base；无 checkpoint 自
      skip 77，evidence 环境**必须真实运行**，非签核）：A（3-tok
@@ -1152,18 +1157,44 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
    `test_qwen35_scheduler_integration`（真实 checkpoint 全流程，55 次
    真实 forward + 全部 state capture）：**PASS + ERROR SUMMARY: 0
    errors**（原始日志：`benchmarks/sanitizer_qwen35_scheduler.txt`）。
+ - **reviewer fix round（未 amend）**：reviewer 在原 functional SHA
+   `459ff12f1a4d1365112d65f8863a4e5010710c11` 上发现两个 scheduler
+   state-machine blocker，均已在后续 commit 修复（不 amend、不
+   rebase）：
+   - **failed-prefill progress commit**：`advance_one()` 原先在
+     `forward_token()` **之前**就 `prefill_pos++`，违反
+     `prefill_pos = 已成功 forward 的 prompt token 数` 的 contract。
+     改为：选 `prompt[prefill_pos]` → `forward_token()` → **成功才**
+     `prefill_pos++`。失败的 forward 既不提交 `prefill_pos` 也不计入
+     `forward_count`（钉死：prompt `{50,99}`、50 ok / 99 failing →
+     status Failed、forward_count = 1、**prefill_pos = 1 非 2**）。
+     正常 prefill / last-prompt 采样 / decode 的 off-by-one 语义不
+     变（real-checkpoint integration gate 全量 EXACT 重跑确认）。
+   - **`run()` failure isolation**：`run()` 的公开 contract 是
+     「run until every request is terminal」，原先一个 request 的
+     fatal Status 会让 `run()` 立即返回、其他 live request 永久停
+     住。改为：失败 request → Failed + retire（不再被 advance），其
+     余 request 在后续 iteration 继续推进，全部 terminal 后返回遇到
+     的**首个错误**；`step()` 行为不变（同一 snapshot 剩余 id 继续、
+     返回首个错误）。新增 hard gate：A 在 `run()` 中 fatal、B 正常
+     → `!s.ok`、A Failed、B Finished、num_live == 0、manager 0（+
+     A 的 progress 钉死、sequence 只 retire 一次）。
  - **evidence 绑定**：`V06A_EVIDENCE_SHA =
-   459ff12f1a4d1365112d65f8863a4e5010710c11`（clean tree、HEAD ==
+   928d0a772f698bcc22e55a6d2ff1a19f48e0f037`（clean tree、HEAD ==
    SHA；完整 ctest 54/54 PASS 0 skipped + check_no_torch CLEAN +
    scheduler integration 门 compute-sanitizer memcheck 0 错误，均于
-   该 SHA）。**失效声明（未删除历史）**：Phase A 修改了
-   `src/`、`include/`、`tests/` 与测试 CMake，按失效规则：**
-   `V05C_EVIDENCE_SHA = 1054b69c4f72f3f0238361d5b5e5f5ab8463489c`**
-   （及其更早的 V05B `a29b59610b39a0ad24fc6d79ce2c61088897330e` /
-   V05A `2319a261543e1af75f544a6a57592b0193074312` / V04 绑定）对
-   本 tree **失效** —— 其全部门面回归已在本 SHA 的 54/54 内重跑全绿
-   （v0.5 的 merge 状态与历史 SHA 不变，仅 evidence 绑定按规则推进）。
-   失效规则延续：此后任何 `src/` / `include/` / `tools/` / `tests/` /
+   该 SHA）。**失效声明（未删除历史）**：本 reviewer fix commit 修改
+   了 `src/` 与 `tests/`，按失效规则：**原
+   `V06A_EVIDENCE_SHA = 459ff12f1a4d1365112d65f8863a4e5010710c11`
+   失效**（历史 commit 与 docs 不变，仅 evidence 绑定推进到
+   `928d0a7…`）。更早地，Phase A 首版修改了 `src/`、`include/`、
+   `tests/` 与测试 CMake，按失效规则：**`V05C_EVIDENCE_SHA =
+   1054b69c4f72f3f0238361d5b5e5f5ab8463489c`**（及其更早的 V05B
+   `a29b59610b39a0ad24fc6d79ce2c61088897330e` / V05A
+   `2319a261543e1af75f544a6a57592b0193074312` / V04 绑定）对本 tree
+   **失效** —— 其全部门面回归已在本 SHA 的 54/54 内重跑全绿（v0.5
+   的 merge 状态与历史 SHA 不变，仅 evidence 绑定按规则推进）。失效
+   规则延续：此后任何 `src/` / `include/` / `tools/` / `tests/` /
    functional CMake 修改 → 本 evidence 失效必须重跑；仅 docs/evidence
    修改不失效。
  - **v0.6 Phase A 终态（明说）**：**Phase A = scheduler semantics

@@ -9,7 +9,7 @@
 #            /root/models/Qwen3.5-0.8B-Base \
 #            /root/py311/venv/bin/python3 \
 #            /root/code/cudalm-agent
-# git: 459ff12f1a4d1365112d65f8863a4e5010710c11  # V06A_EVIDENCE_SHA (clean
+# git: 928d0a772f698bcc22e55a6d2ff1a19f48e0f037  # V06A_EVIDENCE_SHA (clean
 #        worktree, HEAD == SHA; build/ rebuilt from that SHA)
 #
 # Scope: the FULL real-checkpoint scheduler integration flow
@@ -25,6 +25,10 @@
 #     full per-forward logits D2H capture + per-request sampling);
 #   * the real-logits SAMPLING ISOLATION runs (X alone / Y alone /
 #     X+Y interleaved, same prompt + same seed).
+#
+# (Re-run at the reviewer-fix SHA: failed-prefill progress commit +
+# run() failure isolation — this gate re-confirms the normal-path
+# off-by-one semantics stayed EXACT.)
 #
 # Result (full run below): test_qwen35_scheduler_integration PASS +
 # ERROR SUMMARY: 0 errors.

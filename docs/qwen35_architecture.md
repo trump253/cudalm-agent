@@ -2086,6 +2086,18 @@ src/runtime/scheduler.cpp   // Scheduler 实现
   **未知 id → fail-loud Status error**。
 - **fatal Status**：forward 失败 → 该 request Failed + retire（恰一次）；
   同一 snapshot 的其余 id **继续**推进；`step()` 返回首个错误。
+  **失败的 forward 不提交 progress**（reviewer fix，钉死）：
+  `prefill_pos`（prefill 时）与 `forward_count` 都不计入失败的 forward
+  —— prompt `{50, 99}`，50 成功 / 99 失败 → `forward_count = 1`、
+  `prefill_pos = 1`（**不是 2**）：`prefill_pos` 的 contract 是「已
+  成功 forward 的 prompt token 数」。
+- **`run()` failure isolation**（reviewer fix，钉死）：`run()` 的公开
+  contract 是「run until every request is terminal」，因此**一个
+  request 的 fatal Status 不能让其他 live request 永久停住**：失败
+  request → Failed + retire（永不再被 advance），其余 request 在后续
+  iteration 继续推进；全部 terminal 后 `run()` 返回遇到的**首个错误**
+  （无错误则 ok）。`step()` 行为不变（同一 snapshot 中剩余 request
+  继续执行、返回首个错误）。
 - **采样隔离（v0.4 contract）**：每个 request 自己的 SamplingConfig +
   Sampler；interleave / admission 顺序**绝不**改变任何 request 的 token
   流（A(seed42) 交错 == A(seed42) 单独；同 prompt + 同 seed ⇒ 同流）。
@@ -2102,7 +2114,12 @@ src/runtime/scheduler.cpp   // Scheduler 实现
   轮**）、prefill/decode 共存、EOS + max_new_tokens（精确 token 流 +
   forward count）、cancel + retire（幂等 re-cancel / 未知 id fail-loud /
   stale 永不 advance）、per-request 采样 RNG 隔离、fatal Status（Failed
-  + retire 恰一次；snapshot 其余 id 继续推进）。
+  + retire 恰一次；snapshot 其余 id 继续推进；**失败 forward 不提交
+  progress**：`forward_count`/`prefill_pos` 均排除之，`{50,99}` 门钉死
+  `prefill_pos = 1` 非 2；**`run()` failure isolation** 硬门：A 在
+  `run()` 中 fatal、B 正常 → `!s.ok`、A Failed、B Finished、
+  num_live == 0、manager 0，且 A 的 progress 钉死 + sequence 只
+  retire 一次）。
 - **real-checkpoint integration gate**（`tests/cuda/test_qwen35_scheduler_
   integration.cpp`；真实 Qwen3.5-0.8B-Base；无 checkpoint 时自 skip 77，
   evidence 环境**必须真实运行**）：A（3-tok prompt，max_new 3，seed 42）+
@@ -2117,7 +2134,13 @@ src/runtime/scheduler.cpp   // Scheduler 实现
   real-logits 采样隔离（同 prompt + 同 seed ⇒ X 单独 == Y 单独 ==
   X+Y 交错 相同流）。
 
-### 25.5 Evidence（于 `V06A_EVIDENCE_SHA`，clean tree）
+### 25.5 Evidence（于 `V06A_EVIDENCE_SHA =
+928d0a772f698bcc22e55a6d2ff1a19f48e0f037`，clean tree）
+
+（reviewer fix round：failed-prefill progress commit + `run()` failure
+isolation；旧绑定 `459ff12f1a4d1365112d65f8863a4e5010710c11` 按失效
+规则声明失效、历史保留。正常路径的 off-by-one 语义不变 —— integration
+gate 全量 EXACT 重跑确认。）
 
 完整 ctest **54/54 PASS、0 failed、0 skipped**（integration gate 在
 evidence 环境真实运行，非 77 skip）；`scripts/check_no_torch.sh`
