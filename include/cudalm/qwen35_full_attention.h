@@ -124,6 +124,38 @@ class Qwen35FullAttentionLayer {
   void forward_with_paged_state(int position, const __nv_bfloat16* x_in,
                                 const PagedStateRef& ps, cudaStream_t stream);
 
+  // v0.6 Phase B: TRUE BATCHED decode over EXTERNAL paged state — B rows
+  // in ONE traversal (no host loop over rows).
+  //   positions_host : host int [B] — row b attends over
+  //                    [0..positions_host[b]] (HETEROGENEOUS positions);
+  //                    its KV write goes at positions_host[b];
+  //   x_in           : bf16 [B][H];
+  //   ps             : the batched paged state reference below.
+  // Row b may only touch its own block-table row and logical KV prefix
+  // [0..position[b]] (no cross-sequence contamination). Per row the math is
+  // BIT-IDENTICAL to forward_with_paged_state() on that row (row-parity
+  // contract). Batch scratch is grow-only (sized to the largest B x T_max
+  // seen). The layer's OWN contiguous cache is untouched.
+  struct PagedStateRefBatch {
+    __nv_bfloat16* k_pages = nullptr;  // the ordinal's page base (k_page(ord, 0))
+    __nv_bfloat16* v_pages = nullptr;
+    const int* block_table = nullptr;  // DEVICE int [B][row_stride]; row b =
+                                       // block_table + b*row_stride
+    int row_stride = 0;                // = the manager's block_table.max_blocks()
+    const int* d_positions = nullptr;  // DEVICE int [B] (positions_host on device)
+    int page_tokens = 0;
+    std::size_t page_stride = 0;       // = pool.page_stride_elems()
+  };
+  void forward_batch_with_paged_state(int B, const int* positions_host,
+                                      const __nv_bfloat16* x_in,
+                                      const PagedStateRefBatch& ps,
+                                      cudaStream_t stream);
+
+  // Row layout [B][H] of the final output of the LAST batch forward.
+  const __nv_bfloat16* stage_final_output_batch() const {
+    return b_final_.data<__nv_bfloat16>();
+  }
+
   // Names of the 21 timed stages, in order (shared with the benchmark).
   static const char* const* stage_names();
 
@@ -197,6 +229,36 @@ class Qwen35FullAttentionLayer {
 
   DeviceBuffer attn_scratch_;  // bf16 [2 * n_heads * max_seq_len]
   DeviceBuffer rope_tables_;   // fp32 [2 * (rotary_dim/2)] (cos_t | sin_t)
+
+  // ---- v0.6 Phase B: batch scratch (grow-only; largest B / T_max seen) ----
+  int batch_cap_ = 0;
+  int batch_t_max_ = 0;
+  DeviceBuffer b_input_;      // [B][H]
+  DeviceBuffer b_rms1_;       // [B][H]
+  DeviceBuffer b_q_gate_;     // [B][n_heads*head_dim*2]
+  DeviceBuffer b_q_;          // [B][n_heads*head_dim]
+  DeviceBuffer b_att_gate_;   // [B][n_heads*head_dim]
+  DeviceBuffer b_k_;          // [B][n_kv*head_dim]
+  DeviceBuffer b_v_;          // [B][n_kv*head_dim]
+  DeviceBuffer b_q_norm_;     // [B][n_heads*head_dim]
+  DeviceBuffer b_k_norm_;     // [B][n_kv*head_dim]
+  DeviceBuffer b_rope_q_;     // [B][n_heads*head_dim]
+  DeviceBuffer b_rope_k_;     // [B][n_kv*head_dim]
+  DeviceBuffer b_attn_raw_;   // [B][n_heads*head_dim]
+  DeviceBuffer b_attn_gated_; // [B][n_heads*head_dim]
+  DeviceBuffer b_o_proj_;     // [B][H]
+  DeviceBuffer b_res1_;       // [B][H]
+  DeviceBuffer b_rms2_;       // [B][H]
+  DeviceBuffer b_mlp_gate_;   // [B][inter]
+  DeviceBuffer b_mlp_up_;     // [B][inter]
+  DeviceBuffer b_silu_mul_;   // [B][inter]
+  DeviceBuffer b_mlp_down_;   // [B][H]
+  DeviceBuffer b_final_;      // [B][H]
+  DeviceBuffer b_attn_scratch_;  // bf16 [2 * B * n_heads * T_max]
+  DeviceBuffer b_rope_tables_;   // fp32 [B * rotary_dim] (cos [B][rd/2] | sin)
+  DeviceBuffer b_positions_;     // int [B] (positions_host on device)
+
+  void grow_batch(int B, int t_max, cudaStream_t stream);
 };
 
 }  // namespace cudalm

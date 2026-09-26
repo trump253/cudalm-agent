@@ -91,6 +91,12 @@ cudalm_add_test(test_int4_gemv_bf16 test_int4_gemv_bf16 cuda/test_int4_gemv_bf16
 # hard gate: vec4 (K%8==0, aligned) + scalar (K%8!=0 / misaligned) + zero-row,
 # vs a CPU FP32-accumulate -> BF16 RNE reference. No checkpoint needed.
 cudalm_add_test(test_bf16_gemv test_bf16_gemv cuda/test_bf16_gemv.cpp)
+# v0.6 Phase B: TRUE BATCHED decode kernel family — ROW-WISE parity of every
+# new batched kernel (W4A16 GEMV, BF16 LM-head GEMV, paged KV write, paged
+# attention, Delta stateful conv/gbeta/delta) against the frozen v0.5 single
+# kernel. Deterministic synthetic inputs, no checkpoint (pure kernel parity).
+cudalm_add_test(test_qwen35_batch_kernels test_qwen35_batch_kernels
+                cuda/test_qwen35_batch_kernels.cpp)
 cudalm_add_test(test_qwen35_kernels test_qwen35_kernels cuda/test_qwen35_kernels.cpp)
 cudalm_add_test(test_rope test_rope cuda/test_rope.cpp)
 cudalm_add_test(test_kv_cache test_kv_cache cuda/test_kv_cache.cpp)
@@ -207,6 +213,42 @@ add_test(NAME test_qwen35_scheduler_integration
                  ${CUDALM_TOOL_PYTHON3}
                  ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_qwen35_scheduler_integration PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# v0.6 Phase B: TRUE BATCHED decode — FULL-MODEL real-checkpoint hard gate.
+# B=3 heterogeneous positions (3/5/2-token prompts, page_tokens=2) + B=1, two
+# decode steps: per-row embedding / 24 layer-finals / final-norm / FULL
+# logits[248320] / final hybrid state (18 Delta conv/rec + 6 FA logical K/V) /
+# length all BIT-IDENTICAL to the frozen single path
+# (forward_token_with_state) run from an equivalent state. No throughput claim
+# (correctness-first; prefill stays serial, single stream).
+add_executable(test_qwen35_batched_decode cuda/test_qwen35_batched_decode.cpp)
+target_link_libraries(test_qwen35_batched_decode PRIVATE cudalm)
+add_test(NAME test_qwen35_batched_decode
+         COMMAND test_qwen35_batched_decode
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_batched_decode PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# v0.6 Phase B: scheduler TRUE-BATCHED decode real-checkpoint gate.
+# Three requests with DIFFERENT prompt lengths (3/5/2) and chosen max_new so
+# the decode cohort forms at B=3 then SHRINKS to B=2 (A finishes mid-run):
+# proves batch_forward_calls>0, max_batch_size==3, forwarder cohort sizes
+# exactly {3,2} (one batch forward per B>=2 cohort, never B single forwards),
+# and per request the generated IDs / per-step FULL logits / forward count /
+# finish reason / FINAL hybrid state are EXACT vs independent references.
+add_executable(test_qwen35_scheduler_batch cuda/test_qwen35_scheduler_batch.cpp)
+target_link_libraries(test_qwen35_scheduler_batch PRIVATE cudalm)
+add_test(NAME test_qwen35_scheduler_batch
+         COMMAND test_qwen35_scheduler_batch
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_scheduler_batch PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 if(CUDALM_PYTHON3)

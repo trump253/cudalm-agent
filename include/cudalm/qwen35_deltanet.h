@@ -98,6 +98,30 @@ class Qwen35DeltaNetLayer {
                           __nv_bfloat16* ext_conv, float* ext_rec,
                           cudaStream_t stream);
 
+   // v0.6 Phase B: TRUE BATCHED decode — the SAME pipeline as
+   // forward_with_state() for B rows at ONCE (one set of kernel launches,
+   // NO host loop over rows). `x_in` is bf16 [B][hidden_size]; row b's
+   // persistent state lives at `conv_base + d_slots[b] * conv_dim * 3`
+   // (bf16) and `rec_base + d_slots[b] * n_heads * head_dim * head_dim`
+   // (fp32) — i.e. conv_base/rec_base are the pool's per-ordinal bases
+   // (conv(ordinal, 0) / recurrent(ordinal, 0)) and d_slots[b] is row b's
+   // DeltaStatePool slot (device int [B]; HETEROGENEOUS slots). Every row
+   // touches ONLY its own slot (no cross-row access); per row the math is
+   // BIT-IDENTICAL to forward_with_state() on that row alone (the
+   // row-parity contract; pinned by the kernel-level + full-model gates).
+   // The layer's OWN conv_state_/rec_state_ are untouched. Batch scratch is
+   // grow-only (sized to the largest B seen). Precondition: B >= 1.
+   void forward_batch_with_state(int B, const int* d_slots,
+                                 const __nv_bfloat16* x_in,
+                                 __nv_bfloat16* conv_base, float* rec_base,
+                                 cudaStream_t stream);
+
+   // Row layout [B][H] of the final output of the LAST batch forward
+   // (valid until the next forward / destruction).
+   const __nv_bfloat16* stage_final_output_batch() const {
+     return b_final_.data<__nv_bfloat16>();
+   }
+
   // ---- persistent state (Phase C hard gate) --------------------------------
   // Zero both conv_state and recurrent_state (first-token / reset).
   void reset_state(cudaStream_t stream);
@@ -174,6 +198,34 @@ class Qwen35DeltaNetLayer {
   DeviceBuffer silu_mul_;     // [inter]
   DeviceBuffer mlp_down_;     // [H]
   DeviceBuffer final_;        // [H]
+
+  // ---- v0.6 Phase B: batch scratch (grow-only; sized to the largest B) ----
+  int batch_cap_ = 0;
+  DeviceBuffer b_input_;      // [B][H]
+  DeviceBuffer b_rms1_;       // [B][H]
+  DeviceBuffer b_mixed_;      // [B][conv_dim]
+  DeviceBuffer b_z_;          // [B][value_dim]
+  DeviceBuffer b_b_;          // [B][n_heads]
+  DeviceBuffer b_a_;          // [B][n_heads]
+  DeviceBuffer b_conv_out_;   // [B][conv_dim]
+  DeviceBuffer b_conv_silu_;  // [B][conv_dim]
+  DeviceBuffer b_q_;          // [B][key_dim]
+  DeviceBuffer b_k_;          // [B][key_dim]
+  DeviceBuffer b_v_;          // [B][value_dim]
+  DeviceBuffer b_beta_;       // [B][n_heads] bf16
+  DeviceBuffer b_g_;          // [B][n_heads] fp32
+  DeviceBuffer b_core_;       // [B][value_dim]
+  DeviceBuffer b_gated_;      // [B][value_dim]
+  DeviceBuffer b_out_proj_;   // [B][H]
+  DeviceBuffer b_res1_;       // [B][H]
+  DeviceBuffer b_rms2_;       // [B][H]
+  DeviceBuffer b_mlp_gate_;   // [B][inter]
+  DeviceBuffer b_mlp_up_;     // [B][inter]
+  DeviceBuffer b_silu_mul_;   // [B][inter]
+  DeviceBuffer b_mlp_down_;   // [B][H]
+  DeviceBuffer b_final_;      // [B][H]
+
+  void grow_batch(int B, cudaStream_t stream);
 };
 
 }  // namespace cudalm

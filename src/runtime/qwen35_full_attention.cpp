@@ -15,15 +15,19 @@
 
 #include "cudalm/qwen35_full_attention.h"
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
 #include "cudalm/cuda_check.h"
 #include "cudalm/kernels/int4_gemv_bf16.h"
+#include "cudalm/kernels/batch_decode.h"
 #include "cudalm/kernels/paged_kv.h"
 #include "cudalm/kernels/qwen35_kernels.h"
 
 namespace cudalm {
+
+using kernels::batch_int4_gemv_bf16;  // v0.6 Phase B batch GEMV (kernels namespace)
 
 namespace {
 std::size_t bf_bytes(std::size_t n) { return n * sizeof(__nv_bfloat16); }
@@ -348,6 +352,222 @@ void Qwen35FullAttentionLayer::forwardImpl(int position,
 
   // Whole-layer timing end (matches the start event above).
   rec(events, 2 * kNumStages + 1, stream);
+}
+
+
+// ---------------------------------------------------------------------------
+// v0.6 Phase B: TRUE BATCHED decode over external paged state (B rows, one
+// launch per stage; per row BIT-IDENTICAL to forward_with_paged_state() —
+// see include/cudalm/kernels/batch_decode.h and docs §26).
+// ---------------------------------------------------------------------------
+void Qwen35FullAttentionLayer::grow_batch(int B, int t_max,
+                                          cudaStream_t stream) {
+  const bool bigger = (B > batch_cap_) || (t_max > batch_t_max_);
+  if (!bigger) return;
+  batch_cap_ = std::max(batch_cap_, B);
+  batch_t_max_ = std::max(batch_t_max_, t_max);
+  const std::size_t b = static_cast<std::size_t>(batch_cap_);
+  const std::size_t t = static_cast<std::size_t>(batch_t_max_);
+  const std::size_t H = static_cast<std::size_t>(cfg_.hidden_size);
+  const std::size_t qo = static_cast<std::size_t>(cfg_.n_heads) * cfg_.head_dim;
+  const std::size_t kvo = static_cast<std::size_t>(cfg_.n_kv_heads) * cfg_.head_dim;
+  const std::size_t inter = static_cast<std::size_t>(cfg_.intermediate_size);
+  const std::size_t rd = static_cast<std::size_t>(cfg_.rotary_dim());
+  b_input_.allocate(bf_bytes(b * H), stream);
+  b_rms1_.allocate(bf_bytes(b * H), stream);
+  b_q_gate_.allocate(bf_bytes(b * 2 * qo), stream);
+  b_q_.allocate(bf_bytes(b * qo), stream);
+  b_att_gate_.allocate(bf_bytes(b * qo), stream);
+  b_k_.allocate(bf_bytes(b * kvo), stream);
+  b_v_.allocate(bf_bytes(b * kvo), stream);
+  b_q_norm_.allocate(bf_bytes(b * qo), stream);
+  b_k_norm_.allocate(bf_bytes(b * kvo), stream);
+  b_rope_q_.allocate(bf_bytes(b * qo), stream);
+  b_rope_k_.allocate(bf_bytes(b * kvo), stream);
+  b_attn_raw_.allocate(bf_bytes(b * qo), stream);
+  b_attn_gated_.allocate(bf_bytes(b * qo), stream);
+  b_o_proj_.allocate(bf_bytes(b * H), stream);
+  b_res1_.allocate(bf_bytes(b * H), stream);
+  b_rms2_.allocate(bf_bytes(b * H), stream);
+  b_mlp_gate_.allocate(bf_bytes(b * inter), stream);
+  b_mlp_up_.allocate(bf_bytes(b * inter), stream);
+  b_silu_mul_.allocate(bf_bytes(b * inter), stream);
+  b_mlp_down_.allocate(bf_bytes(b * H), stream);
+  b_final_.allocate(bf_bytes(b * H), stream);
+  b_attn_scratch_.allocate(2 * b * static_cast<std::size_t>(cfg_.n_heads) * t *
+                                  sizeof(__nv_bfloat16),
+                           stream);
+  b_rope_tables_.allocate(b * rd * sizeof(float), stream);
+  b_positions_.allocate(b * sizeof(int), stream);
+}
+
+void Qwen35FullAttentionLayer::forward_batch_with_paged_state(
+    int B, const int* positions_host, const __nv_bfloat16* x_in,
+    const PagedStateRefBatch& ps, cudaStream_t stream) {
+  CUDALM_PRECONDITION(
+      B >= 1 && positions_host != nullptr && x_in != nullptr &&
+          ps.k_pages != nullptr && ps.v_pages != nullptr &&
+          ps.block_table != nullptr && ps.d_positions != nullptr &&
+          ps.page_tokens >= 1 && ps.row_stride >= 1 &&
+          ps.page_stride >=
+              static_cast<std::size_t>(cfg_.n_kv_heads) *
+                  static_cast<std::size_t>(ps.page_tokens) *
+                  static_cast<std::size_t>(cfg_.head_dim),
+      "forward_batch_with_paged_state: incomplete PagedStateRefBatch");
+
+  const int H = cfg_.hidden_size;
+  const int hd = cfg_.head_dim;
+  const int n_heads = cfg_.n_heads;
+  const int n_kv = cfg_.n_kv_heads;
+  const int inter = cfg_.intermediate_size;
+  const int rd = cfg_.rotary_dim();
+
+  int t_max = 1;
+  for (int b = 0; b < B; ++b) {
+    const int p = positions_host[b];
+    CUDALM_PRECONDITION(
+        p >= 0 && p < cfg_.max_seq_len,
+        "forward_batch_with_paged_state: position out of bounds");
+    t_max = std::max(t_max, p + 1);
+  }
+  grow_batch(B, t_max, stream);
+
+  // H2D the per-row positions (per-batch metadata, stream-ordered before
+  // the paged kernels that read them).
+  CUDA_CHECK(cudaMemcpyAsync(b_positions_.data(), positions_host,
+                             static_cast<std::size_t>(B) * sizeof(int),
+                             cudaMemcpyHostToDevice, stream));
+  const int* d_positions = static_cast<int*>(b_positions_.data());
+
+  // 0) stage.input: plain D2D copy of [B][H].
+  CUDA_CHECK(cudaMemcpyAsync(b_input_.data(), x_in,
+                             bf_bytes(static_cast<std::size_t>(B) * H),
+                             cudaMemcpyDeviceToDevice, stream));
+
+  // Partial-RoPE cos/sin tables, ONE per row's position (fp32, host libm —
+  // the same construction as the frozen single path's rope_table_host).
+  {
+    std::vector<float> host(static_cast<std::size_t>(B) * rd);
+    for (int b = 0; b < B; ++b) {
+      rope_table_host(positions_host[b], rd, cfg_.rope_theta,
+                      host.data() + static_cast<std::size_t>(b) * (rd / 2),
+                      host.data() + static_cast<std::size_t>(B) * (rd / 2) +
+                          static_cast<std::size_t>(b) * (rd / 2));
+    }
+    b_rope_tables_.copy_from_host(host.data(), host.size() * sizeof(float),
+                                  stream);
+  }
+  const float* cos_t = b_rope_tables_.data<float>();
+  const float* sin_t = cos_t + static_cast<std::size_t>(B) * (rd / 2);
+
+  // 1) zero-centered RMSNorm 1 (frozen kernel, M = B rows).
+  kernels::qwen35_rmsnorm_zc_bf16(
+      b_input_.data<__nv_bfloat16>(),
+      w_->input_layernorm.data<__nv_bfloat16>(),
+      b_rms1_.data<__nv_bfloat16>(), B, H, cfg_.eps, stream);
+
+  // 2) fused q_proj [q; gate] (W4A16, batched) + split (frozen kernel;
+  //    the [B][n_heads][2*hd] layout splits per (b,h) head row).
+  batch_int4_gemv_bf16(w_->q_proj.weight.data<std::uint8_t>(),
+                       w_->q_proj.scale.data<__half>(),
+                       b_rms1_.data<__nv_bfloat16>(),
+                       b_q_gate_.data<__nv_bfloat16>(), w_->q_proj.N,
+                       w_->q_proj.K, B, stream);
+  kernels::qwen35_split_q_gate_bf16(
+      b_q_gate_.data<__nv_bfloat16>(), b_q_.data<__nv_bfloat16>(),
+      b_att_gate_.data<__nv_bfloat16>(), B * n_heads, hd, stream);
+
+  // 3) k / v projections (W4A16, batched).
+  batch_int4_gemv_bf16(w_->k_proj.weight.data<std::uint8_t>(),
+                       w_->k_proj.scale.data<__half>(),
+                       b_rms1_.data<__nv_bfloat16>(),
+                       b_k_.data<__nv_bfloat16>(), w_->k_proj.N, w_->k_proj.K,
+                       B, stream);
+  batch_int4_gemv_bf16(w_->v_proj.weight.data<std::uint8_t>(),
+                       w_->v_proj.scale.data<__half>(),
+                       b_rms1_.data<__nv_bfloat16>(),
+                       b_v_.data<__nv_bfloat16>(), w_->v_proj.N, w_->v_proj.K,
+                       B, stream);
+
+  // 4) per-head zero-centered q/k norms (frozen kernel, M = B*n_heads rows).
+  kernels::qwen35_rmsnorm_zc_bf16(
+      b_q_.data<__nv_bfloat16>(), w_->q_norm.data<__nv_bfloat16>(),
+      b_q_norm_.data<__nv_bfloat16>(), B * n_heads, hd, cfg_.eps, stream);
+  kernels::qwen35_rmsnorm_zc_bf16(
+      b_k_.data<__nv_bfloat16>(), w_->k_norm.data<__nv_bfloat16>(),
+      b_k_norm_.data<__nv_bfloat16>(), B * n_kv, hd, cfg_.eps, stream);
+
+  // 5) partial rotate-half RoPE with HETEROGENEOUS per-row positions.
+  kernels::batch_partial_rope_bf16(
+      b_q_norm_.data<__nv_bfloat16>(), b_rope_q_.data<__nv_bfloat16>(), B,
+      n_heads, hd, rd, cos_t, sin_t, stream);
+  kernels::batch_partial_rope_bf16(
+      b_k_norm_.data<__nv_bfloat16>(), b_rope_k_.data<__nv_bfloat16>(), B,
+      n_kv, hd, rd, cos_t, sin_t, stream);
+
+  // 6) paged KV write at each row's position (row b through its OWN block
+  //    table row; K cache <- rope_k, V cache <- v).
+  kernels::batch_paged_kv_write_bf16(
+      b_rope_k_.data<__nv_bfloat16>(), b_v_.data<__nv_bfloat16>(),
+      ps.k_pages, ps.v_pages, ps.block_table, d_positions, ps.row_stride,
+      ps.page_tokens, n_kv, hd, ps.page_stride, B, stream);
+
+  // 7) causal attention over each row's OWN [0..position[b]] (paged, batched).
+  kernels::batch_paged_attention_decode_bf16(
+      b_rope_q_.data<__nv_bfloat16>(), ps.k_pages, ps.v_pages,
+      ps.block_table, d_positions, ps.row_stride, ps.page_tokens,
+      b_attn_raw_.data<__nv_bfloat16>(), n_heads, n_kv, hd, ps.page_stride,
+      t_max, B, b_attn_scratch_.data<__nv_bfloat16>(), stream);
+
+  // 8) attention gate: attn_raw * sigmoid(att_gate) (frozen kernel, flat).
+  kernels::qwen35_gate_mul_bf16(
+      b_attn_raw_.data<__nv_bfloat16>(), b_att_gate_.data<__nv_bfloat16>(),
+      b_attn_gated_.data<__nv_bfloat16>(),
+      static_cast<std::size_t>(B) * n_heads * hd, stream);
+
+  // 9) O projection (W4A16, batched) + residual 1 (frozen add, flat).
+  batch_int4_gemv_bf16(w_->o_proj.weight.data<std::uint8_t>(),
+                       w_->o_proj.scale.data<__half>(),
+                       b_attn_gated_.data<__nv_bfloat16>(),
+                       b_o_proj_.data<__nv_bfloat16>(), w_->o_proj.N,
+                       w_->o_proj.K, B, stream);
+  kernels::qwen35_add_bf16(
+      b_input_.data<__nv_bfloat16>(), b_o_proj_.data<__nv_bfloat16>(),
+      b_res1_.data<__nv_bfloat16>(), static_cast<std::size_t>(B) * H,
+      stream);
+
+  // 10) zero-centered RMSNorm 2 (M = B rows).
+  kernels::qwen35_rmsnorm_zc_bf16(
+      b_res1_.data<__nv_bfloat16>(),
+      w_->post_attention_ln.data<__nv_bfloat16>(),
+      b_rms2_.data<__nv_bfloat16>(), B, H, cfg_.eps, stream);
+
+  // 11) gate / up (W4A16, batched) + silu_mul (frozen, flat).
+  batch_int4_gemv_bf16(w_->gate_proj.weight.data<std::uint8_t>(),
+                       w_->gate_proj.scale.data<__half>(),
+                       b_rms2_.data<__nv_bfloat16>(),
+                       b_mlp_gate_.data<__nv_bfloat16>(), w_->gate_proj.N,
+                       w_->gate_proj.K, B, stream);
+  batch_int4_gemv_bf16(w_->up_proj.weight.data<std::uint8_t>(),
+                       w_->up_proj.scale.data<__half>(),
+                       b_rms2_.data<__nv_bfloat16>(),
+                       b_mlp_up_.data<__nv_bfloat16>(), w_->up_proj.N,
+                       w_->up_proj.K, B, stream);
+  kernels::qwen35_silu_mul_bf16(
+      b_mlp_gate_.data<__nv_bfloat16>(), b_mlp_up_.data<__nv_bfloat16>(),
+      b_silu_mul_.data<__nv_bfloat16>(),
+      static_cast<std::size_t>(B) * inter, stream);
+
+  // 12) down (W4A16, batched) + residual 2.
+  batch_int4_gemv_bf16(w_->down_proj.weight.data<std::uint8_t>(),
+                       w_->down_proj.scale.data<__half>(),
+                       b_silu_mul_.data<__nv_bfloat16>(),
+                       b_mlp_down_.data<__nv_bfloat16>(), w_->down_proj.N,
+                       w_->down_proj.K, B, stream);
+  kernels::qwen35_add_bf16(
+      b_res1_.data<__nv_bfloat16>(), b_mlp_down_.data<__nv_bfloat16>(),
+      b_final_.data<__nv_bfloat16>(), static_cast<std::size_t>(B) * H,
+      stream);
 }
 
 }  // namespace cudalm

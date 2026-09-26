@@ -1,4 +1,4 @@
-// CUDALM — v0.6 Phase A: request scheduler / control plane.
+// CUDALM — v0.6 Phase A/B: request scheduler / control plane.
 //
 // Sits ON TOP of the frozen v0.5 runtime — the scheduler does NOT own the
 // model, the state manager, or the stream (non-owning references; all
@@ -9,15 +9,28 @@
 //     -> Qwen35StateManager   (sequence state ownership)
 //
 // PHASE A EXECUTION MODEL (pinned): one scheduler "iteration" (step())
-// advances each eligible request by AT MOST ONE token, and every advance
-// is ONE single-sequence forward_token_with_state() call on the SINGLE
-// stream. The v0.5 runtime is reused AS-IS: NO batched CUDA compute, NO
-// batched Qwen35Model forward, NO true continuous-batch GPU execution —
-// that is Phase B. Phase A's goal is to prove
+// advances each eligible request by AT MOST ONE token. In Phase A every
+// advance is ONE single-sequence forward_token_with_state() call on the
+// SINGLE stream, proving
 //     scheduler/control-plane semantics == independent execution
 //     semantics
 // for request lifecycle, admission, iteration order, prefill/decode
 // progression, completion, retirement, and per-request sampling.
+//
+// PHASE B EXECUTION MODEL (pinned, additive): the SAME per-request
+// semantics — each request still advances by AT MOST ONE token per
+// iteration, FIFO snapshot order is preserved, prefill stays SERIAL (the
+// last prompt token goes through the single path and produces g0) — but
+// CONSECUTIVE decode-ready requests in the snapshot (a "decode cohort")
+// are advanced by ONE TRUE BATCHED model traversal
+// (Qwen35Model::forward_batch_with_state: a single layer chain with
+// batched GEMVs / DeltaNet / paged attention over the whole cohort,
+// heterogeneous positions and block tables) instead of N single forwards.
+// A batch size of 1 keeps the single path; a batch PREFLIGHT failure
+// (zero-mutation — e.g. insufficient aggregate KV capacity) falls back to
+// the frozen serial path for that cohort (Phase A semantics). Per-row
+// output is BIT-IDENTICAL to the frozen single path (row-parity
+// contract).
 //
 // POLICY (deterministic FIFO / round-robin, pinned; NO priority or
 // fairness heuristics):
@@ -96,6 +109,38 @@ class SequenceForwarder {
                                 cudaStream_t stream) const = 0;
 
   virtual int vocab_size() const = 0;
+
+  // ---- v0.6 Phase B: TRUE BATCHED decode capability ---------------------
+  // Capable forwarders (ModelForwarder) can run a whole DECODE cohort of
+  // B sequences in ONE model traversal (forward_batch_with_state —
+  // zero-mutation preflight; on failure NOTHING changed, so the scheduler
+  // falls back to the frozen serial path). CPU fakes return false and the
+  // scheduler keeps the Phase A single-forward semantics.
+  virtual bool supports_batch() const { return false; }
+  // One batched decode forward for B LIVE sequences (row b =
+  // (token_ids[b], sids[b]); the caller guarantees all rows are
+  // decode-ready — each forwards its last generated token at its current
+  // sequence length).
+  virtual Status forward_batch(const int* token_ids, const SequenceId* sids,
+                               int B, Qwen35StateManager& mgr,
+                               cudaStream_t stream) {
+    (void)token_ids;
+    (void)sids;
+    (void)B;
+    (void)mgr;
+    (void)stream;
+    return Status::error("batch forward not supported by this forwarder");
+  }
+  // The FULL logits [B][vocab] (bf16) of the LAST forward_batch — ONE
+  // device-to-host copy of the whole batch (the scheduler then samples
+  // each row with that request's own Sampler).
+  virtual Status logits_batch_to_host(std::vector<__nv_bfloat16>* out, int B,
+                                      cudaStream_t stream) const {
+    (void)out;
+    (void)B;
+    (void)stream;
+    return Status::error("batch logits not supported by this forwarder");
+  }
 };
 
 // The real SequenceForwarder: a non-owning wrapper over a loaded
@@ -109,6 +154,13 @@ class ModelForwarder : public SequenceForwarder {
   Status logits_to_host(std::vector<__nv_bfloat16>* out,
                         cudaStream_t stream) const override;
   int vocab_size() const override;
+
+  bool supports_batch() const override { return model_.loaded(); }
+  Status forward_batch(const int* token_ids, const SequenceId* sids, int B,
+                       Qwen35StateManager& mgr,
+                       cudaStream_t stream) override;
+  Status logits_batch_to_host(std::vector<__nv_bfloat16>* out, int B,
+                              cudaStream_t stream) const override;
 
  private:
   Qwen35Model& model_;
@@ -150,7 +202,33 @@ class Scheduler {
   // forward_token_with_state per advance). A forward failure marks that
   // request Failed + retires its sequence; the remaining snapshot ids
   // still advance; the first error is returned.
+  //
+  // v0.6 Phase B: CONSECUTIVE decode-ready requests in the snapshot (a
+  // "decode cohort") are advanced in ONE TRUE BATCHED forward when the
+  // forwarder supports it (batch size >= 2; a size-1 cohort keeps the
+  // frozen single path). The cohort is NOT reordered (snapshot order is
+  // preserved), prefill requests in between stay on the serial path (the
+  // LAST prompt token is always serial and produces g0; the next
+  // iteration's g0 forward is what joins a decode cohort), and a batch
+  // PREFLIGHT failure (e.g. insufficient aggregate KV capacity) falls
+  // back to the frozen serial path for that cohort — Phase A semantics.
+  // The observable per-request progression (tokens, logits, counts,
+  // finish reasons, sampling streams) is IDENTICAL to Phase A.
   Status step();
+
+  // ---- v0.6 Phase B instrumentation (pinned) ----------------------------
+  // Number of batched forwards issued so far (each one advances a whole
+  // decode cohort — a cohort of B costs EXACTLY ONE batch forward, not B
+  // single forwards).
+  int batch_forward_calls() const { return batch_forward_calls_; }
+  // Number of single forwards issued so far (Phase A path: prefill
+  // advances, size-1 cohorts, and every serial fallback).
+  int single_forward_calls() const { return single_forward_calls_; }
+  // Largest decode cohort (batch size) advanced so far (0 if none).
+  int max_batch_size() const { return max_batch_size_; }
+  // Number of batch attempts that FAILED preflight and fell back to the
+  // frozen serial path.
+  int batch_fallback_calls() const { return batch_fallback_calls_; }
 
   // Run step() until EVERY request is terminal (deterministic; bounded —
   // fails loud if the bound is exceeded, which cannot happen for a
@@ -177,6 +255,17 @@ class Scheduler {
   // Failed + retires and returns the error.
   Status advance_one(Request& r);
 
+  // v0.6 Phase B: advance the maximal decode cohort runnable[i..j) in ONE
+  // batched forward (zero-mutation preflight; fallback to the frozen
+  // serial path on a preflight failure). `first_error` accumulates the
+  // first failure. All cohort rows are decode-ready.
+  void advance_batch_run(const std::vector<RequestId>& runnable,
+                         std::size_t i, std::size_t j, Status* first_error);
+
+  // Decode-ready: prefill complete AND at least one generated token (the
+  // next forward is a DECODE of the last generated token).
+  static bool is_decode_ready(const Request& r);
+
   // Terminal transition: set status/reason and retire the sequence
   // EXACTLY ONCE (internal invariant: the sequence is live, so a retire
   // failure is a logic bug -> fail loud).
@@ -187,6 +276,11 @@ class Scheduler {
   cudaStream_t stream_;
   std::map<RequestId, Request> requests_;  // ascending order == FIFO
   RequestId next_id_ = 1;
+  // v0.6 Phase B instrumentation.
+  int batch_forward_calls_ = 0;
+  int single_forward_calls_ = 0;
+  int max_batch_size_ = 0;
+  int batch_fallback_calls_ = 0;
 };
 
 }  // namespace cudalm

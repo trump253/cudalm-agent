@@ -1,11 +1,16 @@
-// CUDALM — v0.6 Phase A: request scheduler / control plane (impl).
+// CUDALM — v0.6 Phase A/B: request scheduler / control plane (impl).
 //
 // Deterministic FIFO / round-robin over the frozen v0.5 runtime:
 // one iteration advances each non-terminal request by at most ONE token
-// via ONE single-sequence forward_token_with_state() on the single
-// stream (NO batched CUDA compute in Phase A — see scheduler.h for the
-// pinned execution model, admission/terminal/cancel contracts, and the
-// "no off-by-one" v0.4 token progression).
+// on the single stream. Phase A: every advance is ONE single-sequence
+// forward_token_with_state(). Phase B (additive): consecutive
+// decode-ready requests in the snapshot (a "decode cohort") are advanced
+// in ONE TRUE BATCHED forward (forward_batch_with_state — one model
+// traversal for the whole cohort) when the forwarder supports it; a
+// size-1 cohort or a zero-mutation preflight failure keeps/falls back to
+// the frozen serial path. See scheduler.h for the pinned execution model,
+// admission/terminal/cancel contracts, the "no off-by-one" v0.4 token
+// progression, and the Phase B cohort/fallback rules.
 
 #include "cudalm/scheduler.h"
 
@@ -71,6 +76,35 @@ Status ModelForwarder::logits_to_host(std::vector<__nv_bfloat16>* out,
 
 int ModelForwarder::vocab_size() const {
   return model_.config().vocab_size;
+}
+
+Status ModelForwarder::forward_batch(const int* token_ids,
+                                     const SequenceId* sids, int B,
+                                     Qwen35StateManager& mgr,
+                                     cudaStream_t stream) {
+  // The v0.6 Phase B TRUE BATCHED external-state forward (zero-mutation
+  // preflight; on failure NOTHING changed — the scheduler then falls back
+  // to the frozen serial path for the cohort).
+  return model_.forward_batch_with_state(token_ids, sids, B, mgr, stream);
+}
+
+Status ModelForwarder::logits_batch_to_host(std::vector<__nv_bfloat16>* out,
+                                            int B,
+                                            cudaStream_t stream) const {
+  const int vocab = model_.config().vocab_size;
+  if (vocab <= 0) {
+    return Status::error("scheduler: model not loaded (vocab_size <= 0)");
+  }
+  out->resize(static_cast<std::size_t>(B) * static_cast<std::size_t>(vocab));
+  // ONE device-to-host copy of the whole [B][vocab] batch (stream-ordered;
+  // the scheduler samples each row host-side with its own Sampler).
+  CUDA_CHECK(cudaMemcpyAsync(
+      out->data(), model_.batch_logits(),
+      static_cast<std::size_t>(B) * static_cast<std::size_t>(vocab) *
+          sizeof(__nv_bfloat16),
+      cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  return Status::ok_status();
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +226,8 @@ Status Scheduler::advance_one(Request& r) {
     token = r.generated.back();
   }
 
+  // Phase B instrumentation: every call here is ONE single forward.
+  ++single_forward_calls_;
   Status s = fwd_.forward_token(token, r.sequence_id, mgr_, stream_);
   if (!s.ok) {
     // Fatal Status: terminal exactly once (Failed) + retire exactly once.
@@ -262,17 +298,157 @@ Status Scheduler::step() {
   }
   std::sort(runnable.begin(), runnable.end());
   Status first_error;
-  for (RequestId id : runnable) {
-    auto it = requests_.find(id);
+  std::size_t i = 0;
+  while (i < runnable.size()) {
+    auto it = requests_.find(runnable[i]);
     if (it == requests_.end() || is_terminal(it->second.status)) {
+      ++i;
       continue;
     }
-    Status s = advance_one(it->second);
-    if (!s.ok && first_error.ok) {
-      first_error = s;  // continue with the remaining snapshot ids
+    // Collect the MAXIMAL consecutive run of decode-ready requests
+    // starting at i (snapshot order; a prefill request or a terminal id
+    // ends the run). The run is advanced as one cohort: batched (size
+    // >= 2 + capable forwarder) or serial (size 1 / no batch support —
+    // the frozen Phase A path).
+    std::size_t j = i;
+    while (j < runnable.size()) {
+      auto jt = requests_.find(runnable[j]);
+      if (jt == requests_.end() || is_terminal(jt->second.status)) {
+        break;
+      }
+      if (!is_decode_ready(jt->second)) {
+        break;
+      }
+      ++j;
+    }
+    if (j - i < 2 || !fwd_.supports_batch()) {
+      // Single path (Phase A semantics unchanged) — including a size-1
+      // decode cohort (a batch of 1 keeps the single path).
+      Status s = advance_one(it->second);
+      if (!s.ok && first_error.ok) {
+        first_error = s;  // continue with the remaining snapshot ids
+      }
+      ++i;
+    } else {
+      advance_batch_run(runnable, i, j, &first_error);
+      i = j;
     }
   }
   return first_error;  // ok when no advance failed
+}
+
+bool Scheduler::is_decode_ready(const Request& r) {
+  // Prefill complete (all prompt tokens forwarded) AND at least one
+  // generated token exists (g0 came from the last-prompt forward): the
+  // next forward is a DECODE of the last generated token.
+  return r.prefill_pos == static_cast<int>(r.prompt.size()) &&
+         !r.generated.empty();
+}
+
+void Scheduler::advance_batch_run(const std::vector<RequestId>& runnable,
+                                  std::size_t i, std::size_t j,
+                                  Status* first_error) {
+  const std::size_t B = j - i;
+  std::vector<int> tokens(B);
+  std::vector<SequenceId> sids(B);
+  for (std::size_t k = 0; k < B; ++k) {
+    const Request& r = requests_.at(runnable[i + k]);
+    CUDALM_PRECONDITION(
+        !r.generated.empty(),
+        "advance_batch_run: cohort row is not decode-ready (logic bug)");
+    tokens[k] = r.generated.back();  // the decode token: last generated
+    sids[k] = r.sequence_id;
+  }
+
+  Status s =
+      fwd_.forward_batch(tokens.data(), sids.data(), static_cast<int>(B),
+                         mgr_, stream_);
+  if (!s.ok) {
+    // The batch preflight is ZERO-MUTATION (no Delta/KV change, no length
+    // change), so the fallback is exactly the frozen Phase A serial path:
+    // each cohort row advances in snapshot order, a per-row failure marks
+    // that row Failed + retires, the others continue, the first error is
+    // recorded.
+    ++batch_fallback_calls_;
+    for (std::size_t k = i; k < j; ++k) {
+      auto it = requests_.find(runnable[k]);
+      if (it == requests_.end() || is_terminal(it->second.status)) {
+        continue;
+      }
+      Status fs = advance_one(it->second);
+      if (!fs.ok && first_error->ok) {
+        *first_error = fs;
+      }
+    }
+    return;
+  }
+
+  // The batch committed: ONE batch forward for the whole cohort (never B
+  // single forwards).
+  ++batch_forward_calls_;
+  if (static_cast<int>(B) > max_batch_size_) {
+    max_batch_size_ = static_cast<int>(B);
+  }
+
+  // ONE D2H of the whole [B][vocab] logits, then per-row sampling with
+  // each request's OWN Sampler (v0.4 per-request RNG isolation — the
+  // sampling call order is the cohort order, as in Phase A).
+  std::vector<__nv_bfloat16> logits;
+  Status ls = fwd_.logits_batch_to_host(&logits, static_cast<int>(B), stream_);
+  if (!ls.ok) {
+    // A logits D2H failure is fatal for the whole cohort (Phase A
+    // semantics for a logits_to_host failure: mark Failed + retire).
+    for (std::size_t k = i; k < j; ++k) {
+      auto it = requests_.find(runnable[k]);
+      if (it == requests_.end() || is_terminal(it->second.status)) {
+        continue;
+      }
+      Request& r = it->second;
+      r.status = RequestStatus::Failed;
+      r.finish_reason = FinishReason::Failed;
+      finish(r, RequestStatus::Failed, FinishReason::Failed);
+    }
+    if (first_error->ok) {
+      *first_error = ls;
+    }
+    return;
+  }
+
+  const int V = fwd_.vocab_size();
+  for (std::size_t k = 0; k < B; ++k) {
+    auto it = requests_.find(runnable[i + k]);
+    if (it == requests_.end() || is_terminal(it->second.status)) {
+      continue;
+    }
+    Request& r = it->second;
+    r.forward_count++;
+    if (r.status == RequestStatus::Waiting) {
+      r.status = RequestStatus::Running;
+    }
+    const __nv_bfloat16* row =
+        logits.data() +
+        static_cast<std::size_t>(k) * static_cast<std::size_t>(V);
+    const int next = r.sampler.sample(row, V);
+    if (next < 0 || next >= V) {
+      // The sampler's contract is [0, vocab) for valid finite logits;
+      // anything else is an internal invariant violation.
+      r.status = RequestStatus::Failed;
+      r.finish_reason = FinishReason::Failed;
+      finish(r, RequestStatus::Failed, FinishReason::Failed);
+      if (first_error->ok) {
+        *first_error = Status::error("scheduler: sampler returned token id " +
+                                     std::to_string(next) +
+                                     " outside [0, vocab_size)");
+      }
+      continue;
+    }
+    r.generated.push_back(next);
+    if (next == r.eos_token_id) {
+      finish(r, RequestStatus::Finished, FinishReason::Eos);  // EOS IS kept
+    } else if (static_cast<int>(r.generated.size()) >= r.max_new_tokens) {
+      finish(r, RequestStatus::Finished, FinishReason::MaxNewTokens);
+    }
+  }
 }
 
 Status Scheduler::run() {
