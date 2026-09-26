@@ -1202,3 +1202,113 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
    true batched GPU execution 声明。** 本阶段**不** merge 进 main、
    **不**自启 Phase B（batched GPU execution / true continuous
    batching）—— 待 external reviewer 签核。
+
+## CUDALM v0.6 Phase B（True Batched GPU Decode 执行 — correctness-first）
+
+  - **承接**：v0.6 Phase A（Request Scheduler / Control Plane）已在分支
+    `v0.6-scheduler` 冻结（`V06A_EVIDENCE_SHA =
+    928d0a772f698bcc22e55a6d2ff1a19f48e0f037`，**不 amend**）。本阶段在
+    同一分支上把 GPU 执行从「每 sequence 一次单序列 forward」升级为
+    **真 batched GPU decode**：**一个 `forward_batch_with_state` 对整个
+    decode cohort 一次性遍历全部 24 层**（真 batched GEMV / DeltaNet /
+    paged attention）——**不是** host 循环 N 次单 `forward_token_with_state()`、
+    **不是** N 次全层 forward（`for layer in 24` 允许）。范围 = **serial
+    prefill + true batched decode only**（最后一个 prompt token 保持
+    serial 产生 g0，g0 的 forward 进入下一个 iteration 的 decode batch）。
+  - **correctness-first（钉死）**：目标是证明 **batched decode 的每行与
+    冻结单序列路径 `forward_token_with_state()` BIT-IDENTICAL**（runtime-
+    vs-runtime memcmp）；**无**数值优化 / 性能调优 / Tensor Core 重写 /
+    kernel fusion / NCU / 吞吐声明。单 model + 单 CUDA stream；保持每
+    scheduler iteration 每 request 一个 token、Phase A FIFO/snapshot 语义、
+    per-request sampler/RNG。明确不做：batched/chunked prefill、multi-
+    stream、CUDA Graph、FlashAttention、priority scheduler、speculative
+    decoding、HTTP/OpenAI。
+  - **冻结 runtime（零修改既有路径，batch 纯增量）**：`Qwen35Model` /
+    `Qwen35StateManager` / paged KV / Delta state pool / `forward_token_
+    with_state()` / tokenizer / sampling / Phase A scheduler 控制面全部
+    原样；v0.5/v0.6 已证明的 multi-SequenceId / interleaved / retire-reuse /
+    reset isolation 语义继续成立。frozen 上游 `trump253/CUDALab @
+    cb6a6a9` **无** batched kernel —— batch kernel 是单 kernel 数学的
+    **batch 维扩展**，逐行必须与冻结单 kernel bit-identical。
+  - **新增 API**：`Qwen35Model::forward_batch_with_state(token_ids[B],
+    sequence_ids[B], B, mgr, stream)`（对 cohort 一次遍历 24 层）+ 输出
+    accessor `batch_embedding_output()[B][H]` / `batch_layer_final_output(i)
+    [B][H]` / `batch_final_norm_output()[B][H]` / `batch_logits()[B][vocab]`。
+    **batch preflight ZERO-MUTATION**：任何失败 → 无突变、无部分分配 →
+    scheduler 回退冻结 serial 路径（Phase A 语义保留）。
+  - **新增真 batch kernels**（`src/kernels/batch_decode.cu` +
+    `include/cudalm/kernels/batch_decode.h`），每个逐行 bit-identical 到
+    冻结单 kernel：
+    - **W4A16 GEMV**（`batch_int4gemv_rowtile4_bf16_kernel`）：**GEMV
+      stride 律（本次钉死的 bug，已修）**——`nvec = K/32` 是 **int4 权重行**
+      步距（K int4 = K/32 × 16B uint4），bf16 **激活行** = K/8 uint4 =
+      **4·nvec**；行偏移必须 `x + b*(4*nvec)`（**不是** `b*nvec`）。用
+      `nvec` 是 row-1（b≥1）diverge 根因：row0 全 24 层正确、row1 在第 0
+      层（首个 W4A16 GEMV）diverge；修后两行全 bit-identical。
+    - **BF16 LM-head GEMV**（`batch_bf16_gemv`，激活行步距 K/8）；
+    - **paged KV write**（batch，行 b 只写 block_table[b] logical
+      [0..position[b]]）；**paged attention decode**（batch）；
+    - **DeltaNet stateful**（conv / gbeta / delta 三条，batch over per-row
+      delta slot）；
+    - **embedding gather / RoPE（heterogeneous positions）/ RMSNorm**
+      （stateless elementwise / RMSNorm 经 M-flatten 复用冻结 kernel）。
+    **heterogeneous state**：行 b 只触碰 `delta_slot[b]`、`block_table[b]`、
+    logical KV `[0..position[b]]`。
+  - **Scheduler 集成（不重排 cohort）**：保持 Phase A snapshot 升序；
+    **不重排**地形成 decode cohort（snapshot 中**连续** decode-ready 组成
+    run）；batch size 1 保持 single；**decode cohort B≥2 → 恰好一次 batch
+    forward**（绝不 B 次 single）；回退 `batch_fallback_calls_++` 逐行
+    `advance_one`。Instrumentation：`batch_forward_calls` /
+    `single_forward_calls` / `max_batch_size` / `batch_fallback_calls`。
+    采样：一次 D2H 拿 logits `[B,vocab]`，然后**逐行**
+    `request[b].sampler.sample(logits[b])`（per-request RNG 隔离）。
+  - **新增测试（3 个，全部 PASS）**：
+    - `test_qwen35_batch_kernels`（**kernel-level 逐行 parity**；CUDA、
+      **无** checkpoint、合成 LCG 输入）：batched W4A16 GEMV / BF16 GEMV /
+      paged KV write / paged attention / DeltaNet（conv·gbeta·delta）逐行
+      **BIT-IDENTICAL** 到冻结单 kernel；
+    - `test_qwen35_batched_decode`（**full-model 真检查点硬门**；真实
+      Qwen3.5-0.8B-Base；无 checkpoint 自 skip 77，evidence 环境**必须真实
+      运行**）：**B=3 heterogeneous**（3/5/2-token prompt、`page_tokens=2`
+      强制 page 边界、非连续 slot/page、不同 position）+ **B=1**，**两个
+      decode step**：每行 embedding / 24× layer-final / final-norm / FULL
+      logits[248320] / 最终 hybrid state（18× Delta conv·rec + 6× FA logical
+      K/V）/ length 全部 **BIT-IDENTICAL** 到冻结单序列路径（equivalent
+      state 起）；
+    - `test_qwen35_scheduler_batch`（**scheduler 真检查点 batch 门**）：三个
+      **不同 prompt 长度**（3/5/2）request，max_new 钉死 cohort 先 **B=3**
+      后 A finish 收缩 **B=2**：`batch_forward_calls=2`、`max_batch_size=3`、
+      `batch_fallback_calls=0`、forwarder 观测 cohort size 序列**恰好
+      {3,2}**（B≥2 cohort 恰好一次 batch forward）；每 request generated
+      IDs / 每生成步 FULL logits / forward count / finish reason / **最终
+      hybrid state** 与独立 fresh-manager reference **全部 EXACT**。
+  - **完整 regression（于本 evidence SHA，clean tree）**：完整 ctest
+    **57/57 PASS、0 failed、0 skipped**（含 v0.4/v0.5/v0.6-Phase-A 全部
+    门面回归 + 三个新 gate + Phase A `test_qwen35_scheduler_integration`
+    保持全绿；三个新 gate 真实运行，非 77 skip）；`scripts/check_no_torch.sh`
+    **CLEAN**。
+  - **Sanitizer（于本 evidence SHA）**：Phase B 引入**真 batched GPU
+    decode**（embedding gather / batched W4A16·BF16 GEMV / DeltaNet
+    stateful / paged KV·attention / heterogeneous RoPE，在真实 forward 之上
+    B=3×2-step + B=1 全流程）：`compute-sanitizer --tool memcheck`（RTX
+    2080 Ti / CUDA 11.8）对 `test_qwen35_batched_decode`（真实 checkpoint
+    全流程）：**PASS + ERROR SUMMARY: 0 errors**（原始日志：
+    `benchmarks/sanitizer_qwen35_batched_decode.txt`）。
+  - **evidence 绑定**：`V06B_EVIDENCE_SHA =
+    31b3ad2c3122465c3a43eee8c2b49f68f029a7a7`（clean tree、HEAD == SHA；
+    完整 ctest 57/57 PASS 0 skipped + check_no_torch CLEAN + full-model
+    batched decode 门 compute-sanitizer memcheck 0 错误，均于该 SHA）。
+    **失效声明（未删除历史）**：本 functional commit 修改了 `src/`、
+    `include/`、`tests/` 与测试 CMake，按失效规则：**`V06A_EVIDENCE_SHA =
+    928d0a772f698bcc22e55a6d2ff1a19f48e0f037`**（及其更早的 Phase A 首版
+    `459ff12f1a4d1365112d65f8863a4e5010710c11`）与 **`V05C_EVIDENCE_SHA =
+    1054b69c4f72f3f0238361d5b5e5f5ab8463489c`**（及其更早的 V05B / V05A /
+    V04 绑定）对本 tree **失效** —— 其全部门面回归已在本 SHA 的 57/57 内
+    重跑全绿（v0.5 的 merge 状态与历史 SHA 不变，仅 evidence 绑定按规则
+    推进）。失效规则延续：此后任何 `src/` / `include/` / `tools/` /
+    `tests/` / functional CMake 修改 → 本 evidence 失效必须重跑；仅
+    docs/evidence 修改不失效。
+  - **v0.6 Phase B 终态（明说）**：**Phase B = true batched GPU decode
+    （correctness-first）；prefill 仍 serial；单 stream；无吞吐声明。**
+    本阶段**不** merge 进 main、**不**自启 Phase C —— 待 external reviewer
+    签核。
