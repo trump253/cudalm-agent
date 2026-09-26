@@ -724,8 +724,12 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
  - **新增测试（4 个，全部 PASS；3 CPU + 1 CUDA，均无 checkpoint
    依赖）**：`test_fixed_id_pool`（全唯一 / capacity+1 OOM / LIFO
    复用 / double-free 与越界拒绝 / reset / 零容量 / **fixed-seed
-   200,000-op 随机 stress**，独立 live-set 模型每步对账，accounting
-   每步精确）；`test_kv_block_table`（位置分解边界矩阵 0 / pt-1 / pt
+   200,000-op 混合 allocate/free stress**（均匀 op 硬币 + live 偏置
+   release → 占用率全区间扫过 [0,64]；独立 host live-set 模型每步
+   对账：live 唯一、**完整 live-set 相等**（非仅 size）、accounting
+   每步精确、满池 OOM 零状态变化、合法 release 精确、非法/重复
+   release 拒绝、released id 实际复用；结束覆盖证明：五类分支计数
+   均 > 0 且 min_occ*2 < CAP 且 max_occ == CAP）；`test_kv_block_table`（位置分解边界矩阵 0 / pt-1 / pt
    / pt+1 / 最后有效 / max（含不整除 ceil）/ 最小前缀增长与幂等 /
    同 block 单 page / **中途 OOM 全回滚无泄漏** / 越界 fail loud /
    clear 精确归还 / LIFO 复用身份，counting fake source）；
@@ -733,14 +737,18 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
    每页字节（16 → 196,608 B）、每 slot 19,537,920 B、小型合成
    config 钉死）；`test_qwen35_state_manager`（CUDA，小型 valid()
    config：8 层 = 2 full + 6 linear，max_seq_len 64，page_tokens 4——
-   池分配器全矩阵 + **fixed-seed 100,000-op 设备侧 stress** + **真
+   池分配器全矩阵 + **fixed-seed 100,000-op 设备侧混合 stress**
+   （同 CPU 版 workload 语义，占用率扫过 [0,32]）+ **真
    设备复用污染门**：对 slot 写非零 pattern（conv + recurrent，全部
    6 层）/ 对 page 写非零 pattern（K + V，全部 2 层）→ 释放 → 同一
    物理资源被复用 → 新 owner D2H 读回**逐字节全零**（不只 metadata）
    + block table 真池边界/OOM 无泄漏/单表共享 + 生命周期
    （A/B 不别名、A reset 后 B 的 pattern 不受影响且 A 归零、A retire
-   回收资源且 id 永久失效、C 复用物理资源但 `SequenceId != A`、
-   已 retire id 一切操作 fail loud）+ OOM 事务性（跨页边界失败 ensure
+   回收资源且 id 永久失效、C 复用物理资源但 `SequenceId != A`——
+   retire 前缓存 A 的物理 slot（retire 后 map 节点已 erase，记录
+   指针悬垂，测试不再解引用；C 的 slot 与缓存值比对，不依赖
+   可能被 node-reuse 制造 false PASS 的悬垂指针）；已 retire id
+   一切操作 fail loud）+ OOM 事务性（跨页边界失败 ensure
    表与记账完全不变；create OOM 零登记、id 保持单调））。
  - **完整 regression（于本 evidence SHA）**：完整 ctest **49/49
    PASS、0 skipped**（v0.4 全部门面回归：generation / sampling /
@@ -752,14 +760,33 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
    （`--launch-timeout 1200`，RTX 2080 Ti / CUDA 11.8）：**ERROR
    SUMMARY: 0 errors**（记录：
    `benchmarks/sanitizer_qwen35_state_manager.txt`）。
- - **evidence 绑定**：`V05A_EVIDENCE_SHA = 866a2e46142f2a3a77deddf72809081eb58b47a1`
+ - **Review 修复轮（tests/header-doc only，commit `2319a26`）**：
+   (1) `test_sequence_lifecycle` host **use-after-free**：retire 后
+   `ra`（指向已被 `std::map::erase` 的 `SequenceState`）仍被解引用
+   （`ra->delta_slot`）——改为 retire 前缓存 `a_slot`，retire 后不
+   再解引用 `ra`；C create 后以缓存值验证「`C id != A` 且
+   `C delta_slot == a_slot`」（物理 slot 复用证明不再依赖悬垂
+   指针，杜绝 node-reuse false PASS）。(2) 两个 allocator stress
+   的 workload 由 acquire 偏置（未满必然 acquire → release 只发生
+   在满池）改为真正的 fixed-seed **混合 allocate/free** workload
+   （均匀 op 硬币 + live 偏置 release；占用率全区间扫过；完整
+   live-set 相等 + 每步精确 accounting + 五类分支覆盖证明，见
+   上）。(3) `Qwen35StateManager::next_sequence_id()` 注释修正
+   （返回**下一个将发放的** id，非「历史最大 id」；API 行为不
+   变）。(4) KV 池新增 `live_pages()` test/diag accessor。**runtime
+   语义零修改**（KV/Delta 池行为、manager 行为、所有冻结面均未
+   动）。
+ - **evidence 绑定**：`V05A_EVIDENCE_SHA = 2319a261543e1af75f544a6a57592b0193074312`
    （clean tree、HEAD == SHA；完整 ctest 49/49 PASS 0 skipped +
    check_no_torch CLEAN + state-manager compute-sanitizer 0 错误，
-   均于该 SHA）。Phase A 未修改 tokenizer 实现/工具 → tokenizer
-   quick differential 不需要重做（v0.4 evidence 的 tokenizer 门仍
-   绑定 `5aba21fe`）。失效规则同 v0.4：此后任何 `src/` / `include/` /
-   `tools/` / `tests/` / functional CMake 修改 → 本 evidence 失效必须
-   重跑；仅 docs/evidence 修改不失效。
+   均于该 SHA）。更早的 evidence SHA
+   `866a2e46142f2a3a77deddf72809081eb58b47a1` 因上述 tests/header
+   修改按规则**失效**（未删除历史，仅声明失效）。Phase A 未修改
+   tokenizer 实现/工具 → tokenizer quick differential 不需要重做
+   （v0.4 evidence 的 tokenizer 门仍绑定 `5aba21fe`）。失效规则同
+   v0.4：此后任何 `src/` / `include/` / `tools/` / `tests/` /
+   functional CMake 修改 → 本 evidence 失效必须重跑；仅
+   docs/evidence 修改不失效。
  - **边界（明说）**：Phase A **不** merge 进 main、**不**自启
    Phase B；无 paged-attention kernel / 无 external-state model
    forward / 无多序列执行 / 无 scheduler / 无 batching 类特性（见
