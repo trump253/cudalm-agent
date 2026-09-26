@@ -138,6 +138,11 @@ int main() {
     rc |= check_bad("--temperature", "nan", "--temperature");
     rc |= check_bad("--temperature", "1e-50", "--temperature");     // underflow -> 0 (no silent greedy)
     rc |= check_bad("--temperature", "7e-46", "--temperature");     // below half of the smallest denormal -> 0
+    // strtod-LEVEL underflow: the text is so small that strtod itself
+    // range-underflows to ±0.0 (errno ERANGE) — must not silently become
+    // 0/-0 (greedy).
+    rc |= check_bad("--temperature", "1e-5000", "--temperature");
+    rc |= check_bad("--temperature", "-1e-5000", "--temperature");
     rc |= check_bad("--top-k", "-1", "--top-k");
     rc |= check_bad("--top-k", "1.5", "--top-k");
     rc |= check_bad("--top-p", "zz", "--top-p");

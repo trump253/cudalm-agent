@@ -57,15 +57,25 @@ bool parse_float(const char* s, float* out) {
 // silent inf is a different (invalid) config. The explicit "0" / "-0" text
 // is the documented greedy spelling and stays legal; denormal floats (down
 // to denorm_min) are legal values.
+//
+// Underflow is detected at BOTH levels:
+//   * strtod level: the text is so small that strtod itself range-
+//     underflows to ±0.0 (e.g. "1e-5000"); errno == ERANGE with a zero
+//     result marks it. A NONZERO text must never silently become 0/-0.
+//   * float level: a nonzero finite double that rounds to 0.0f when cast
+//     (e.g. "1e-50", "7e-46").
 bool parse_temperature(const char* s, float* out) {
   if (s == nullptr || *s == '\0') return false;
+  errno = 0;  // reset before strtod (its ERANGE is read below)
   char* end = nullptr;
   const double v = std::strtod(s, &end);
   if (end == s || *end != '\0') return false;
+  if (errno == ERANGE && v == 0.0)
+    return false;  // strtod-level underflow: nonzero text -> ±0 (no silent greedy)
   if (!std::isfinite(v)) return false;
   const float f = static_cast<float>(v);
   if (!std::isfinite(f)) return false;        // overflow -> inf
-  if (f == 0.0f && v != 0.0) return false;    // underflow to zero (no silent greedy)
+  if (f == 0.0f && v != 0.0) return false;    // double -> float underflow to zero
   *out = f;
   return true;
 }
