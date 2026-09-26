@@ -640,15 +640,29 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
    underflow 到 0 → usage error，不静默变 inf 或 0/greedy；denormal
    到 denorm_min 合法）；`top_k` 措辞统一为 `== 0` 禁用 / `< 0` 非法 /
    `> vocab` clamp（代码 + 文档）。
- - **evidence 绑定**：`V04_EVIDENCE_SHA = cb3cb668f1c99b253c65f676b8737896b503ce48`（clean
+ - **第二轮 review 修复（functional，commit `5aba21fe`）**：
+   `--temperature` 的 **strtod 级 underflow**——上一轮只拦截了
+   「非零 double 转 float 变 0.0f」，但 `1e-5000` / `-1e-5000` 这类
+   文本会让 `strtod()` 本身就 range-underflow 到 ±0.0（errno
+   ERANGE、结果为零），旧检查 `f == 0.0f && v != 0.0` 识别不到，
+   静默变成 greedy（已复现）。修复：`parse_temperature()` 在
+   `strtod` 前 reset `errno`，检测 `errno == ERANGE && v == 0.0`
+   并拒绝——非零 temperature 文本绝不能静默变 0/-0；显式
+   `0`/`-0` 仍合法，float subnormal（到 denorm_min）仍合法，
+   overflow/inf/nan 仍拒绝。回归：`test_generate_cli_args` 新增
+   `1e-5000`/`-1e-5000` → usage error，保留 `0`/`-0`/`1e-45`/
+   `1.4e-45`/FLT_MIN/near-FLT_MAX 合法用例。sampler/generator/
+   tokenizer 语义零修改。
+ - **evidence 绑定**：`V04_EVIDENCE_SHA = 5aba21fe0b351079850600f3f8fe7f55a77c8745`（clean
    tree、HEAD == SHA；完整 ctest 45/45 PASS 0 skipped +
    check_no_torch CLEAN + quick tokenizer validation 0 mismatch +
-   CLI compute-sanitizer 0 错误，均于该 SHA）。旧 evidence SHA
-   `a008b437` 因上述 functional 修复按规则**失效**（未删除历史，
-   仅声明失效）。失效规则：此后任何 `src/` / `include/` / `tools/` /
-   `tests/` / functional CMake 修改 → evidence 失效必须重跑；仅
-   **docs/evidence** 修改（文档 + benchmark 证据记录；例如
-   `b7fb4b1` 的性质就是 docs/evidence-only，不是严格 docs-only）不
-   失效（此时最终 HEAD ≠ evidence SHA）。
+   CLI compute-sanitizer 0 错误，均于该 SHA）。更早的 evidence SHA
+   `a008b437` 与 `cb3cb668` 分别因两轮 functional 修复按规则**失效**
+   （未删除历史，仅声明失效）。失效规则：此后任何 `src/` /
+   `include/` / `tools/` / `tests/` / functional CMake 修改 →
+   evidence 失效必须重跑；仅 **docs/evidence** 修改（文档 +
+   benchmark 证据记录；例如 `b7fb4b1`、`bfd01fa` 的性质就是
+   docs/evidence-only，不是严格 docs-only）不失效（此时最终 HEAD ≠
+   evidence SHA）。
  - **停止**：未 merge main；未宣布 v0.4 DONE/FROZEN —— 等待 external
    reviewer 对 v0.4 最终 sign-off。

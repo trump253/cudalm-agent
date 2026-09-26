@@ -3,13 +3,15 @@
 #
 # Host: RTX 2080 Ti (sm_75), CUDA 11.8, single device (CUDA_VISIBLE_DEVICES=0)
 # Tool: /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck --launch-timeout 900
-# git: cb3cb668f1c99b253c65f676b8737896b503ce48   # V04_EVIDENCE_SHA (clean worktree)
+# git: 5aba21fe0b351079850600f3f8fe7f55a77c8745   # V04_EVIDENCE_SHA (clean worktree)
 #
-# Note: the first functional evidence SHA a008b4373a94427695ebe0dafb7086468afd9c90
-# was invalidated by the reviewer fix round (tiny-temperature numerics,
-# binary-safe CLI stdout, --temperature parse range, top_k wording) and the
-# full evidence set — including this sanitizer run — was re-executed at the
-# SHA above.
+# Note: the earlier functional evidence SHAs
+#   a008b4373a94427695ebe0dafb7086468afd9c90 (round-0)
+#   cb3cb668f1c99b253c65f676b8737896b503ce48 (round-1)
+# were invalidated by two reviewer fix rounds (tiny-temperature
+# numerics, binary-safe CLI stdout, --temperature parse range incl.
+# strtod-level underflow, top_k wording); the full evidence set —
+# including this sanitizer run — was re-executed at the SHA above.
 #
 # Scope: the Phase C sampling work adds NO new CUDA kernel, NO new CUDA
 # memory allocation and NO new stream semantics — the sampler is pure CPU

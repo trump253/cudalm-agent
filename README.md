@@ -278,8 +278,9 @@ cmake -S . -B build && cmake --build build -j
 数值合法）：`logits/T`；top-k 留最高的 k 个（`top_k == 0` 禁用、
 `top_k < 0` 非法、`>vocab` 时 clamp 到 vocab，tie → 最小 id）；
 top-p 在 k 幸存者上保留 cumulative 概率达到 p 的最小前缀（≥1 个）；
-softmax 先减 max（数值稳定）。CLI 的 `--temperature` 文本若 overflow
-到 inf 或 underflow 到 0 → usage error（不静默变 inf / 0/greedy）。
+softmax 先减 max（数值稳定）。CLI 的 `--temperature` 文本若 overflow 到 inf 或
+underflow 到 0（含 `strtod` 级 underflow，如 `1e-5000`）→ usage error
+（不静默变 inf / 0/greedy）。
 详见 `docs/qwen35_architecture.md` §21。
 
 ### 当前限制（v0.4 边界）
@@ -294,7 +295,7 @@ server / OpenAI API、无 NCU / CUDA Graph / kernel fusion / 性能调优。
 
 ### v0.4 最终 evidence
 
-`V04_EVIDENCE_SHA = cb3cb668f1c99b253c65f676b8737896b503ce48` —— 完整 ctest + `scripts/check_no_torch.sh`
+`V04_EVIDENCE_SHA = 5aba21fe0b351079850600f3f8fe7f55a77c8745` —— 完整 ctest + `scripts/check_no_torch.sh`
 + tokenizer quick differential validation 于该 SHA（clean tree、
 HEAD == SHA）执行；失效规则：此后任何 `src/`/`include/`/`tools/`/
 `tests/`/functional CMake 修改 → evidence 失效必须重跑（仅

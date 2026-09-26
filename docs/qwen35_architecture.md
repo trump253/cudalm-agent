@@ -1494,11 +1494,14 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    `--temperature 0` → 冻结 greedy 路径）；`--seed` 单独出现**不**
    启用 sampling（greedy 不消耗 RNG，seed 被忽略）。
  - **`--temperature` 数值 range**：文本必须能舍入到可表示的 float。
-   overflow 到 inf（如 `1e40`、`inf`、`nan`）或 underflow 到 0
-   （如 `1e-50`、`7e-46`）→ **usage error（exit 2）**——不允许静默
-   变 inf 或静默变 0/greedy。denormal 到 denorm_min、最大到
-   FLT_MAX 都是合法值（有测试钉死）；显式 `0`/`-0` 仍是文档化的
-   greedy 写法。
+   overflow 到 inf（如 `1e40`、`inf`、`nan`）或 underflow 到 0 →
+   **usage error（exit 2）**——不允许静默变 inf 或静默变 0/greedy。
+   underflow 在**两层**检测：double 级（非零 double 转 float 变
+   0.0f，如 `1e-50`、`7e-46`）和 **strtod 级**（文本小到 `strtod`
+   本身就 range-underflow 到 ±0.0，errno ERANGE，如 `1e-5000`、
+   `-1e-5000`——非零文本绝不能静默变成 0/-0）。denormal 到
+   denorm_min、最大到 FLT_MAX 都是合法值（有测试钉死）；显式
+   `0`/`-0` 仍是文档化的 greedy 写法。
  - 输出：成功时 stdout **只有生成的文本**（正常模式不打印 logits /
    debug tensor）；错误走 stderr。stdout 写入是 **binary-safe /
    length-aware**（`write_generated_text`：按精确字节数 fwrite +
@@ -1534,7 +1537,8 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    forward-count 不变式）；非法 config fail loud 且不 forward。
  - `test_generate_cli_args`（CPU）：--help / 缺必填 / 缺值 / 未知参数 /
    坏数值（含溢出、部分消费）/ **`--temperature` float range
-   （`1e40`/`1e308`/`inf`/`nan`/`1e-50`/`7e-46` → usage error；
+   （`1e40`/`1e308`/`inf`/`nan`/`1e-50`/`7e-46`/`1e-5000`/
+   `-1e-5000`（strtod 级 underflow）→ usage error；
    `0`/`-0`/`1.4e-45`/`1e-45`/`1.17549435e-38`/`3.4e38` → 合法并
    钉死精确 float 值）**/ 模式解析 / `--greedy` 互斥 / 解析后 config
    过单一校验门 / **binary-safe stdout（`write_generated_text`
@@ -1548,18 +1552,22 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
  ### 21.6 v0.4 最终 evidence（Phase C 完成）
 
  **Phase C / v0.4 functional evidence executed on:**
- `V04_EVIDENCE_SHA = cb3cb668f1c99b253c65f676b8737896b503ce48`（工作树
+ `V04_EVIDENCE_SHA = 5aba21fe0b351079850600f3f8fe7f55a77c8745`（工作树
  干净、HEAD == 该 SHA）。
 
  **历史**：第一版 functional evidence 曾绑定
- `a008b4373a94427695ebe0dafb7086468afd9c90`；review 之后做了两处
- correctness 修复（极小正 temperature 的数值溢出 → double 流水线 +
- sampler/generator 防御检查；CLI stdout 改 binary-safe）+ CLI
- --temperature 数值 range 检查 + top_k 措辞统一 —— 属于 functional
- 修改，按规则**该旧 SHA 的 evidence 已失效并整套重跑**（下文即新
+ `a008b4373a94427695ebe0dafb7086468afd9c90`；第一轮 review 之后做了
+ 两处 correctness 修复（极小正 temperature 的数值溢出 → double
+ 流水线 + sampler/generator 防御检查；CLI stdout 改 binary-safe）+
+ CLI --temperature 数值 range 检查 + top_k 措辞统一 → evidence 重绑
+ `cb3cb668`；第二轮 review 又发现 `--temperature` 的 **strtod 级
+ underflow**（`1e-5000` 这类文本让 `strtod` 本身就 range-underflow
+ 到 ±0.0，静默变 greedy）→ functional 修复（commit `5aba21fe`），
+ 按规则 `cb3cb668` 的 evidence 再次**失效并整套重跑**（下文即新
  SHA 的结果）。中间提交 `b7fb4b1`（README/docs + `benchmarks/
- sanitizer_cudalm_generate.txt`）的性质是 **docs/evidence-only**
- （含 benchmark 证据记录，不是严格 docs-only）。
+ sanitizer_cudalm_generate.txt`）与 `bfd01fa` 的性质都是
+ **docs/evidence-only**（含 benchmark 证据记录，不是严格
+ docs-only）。
 
  **失效规则**：此后任何对 `src/`、`include/`、`tools/`、`tests/` 或
  functional CMake 配置的修改都使该 evidence **失效**，必须整套重跑；
@@ -1583,7 +1591,7 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    comp_pair 各 3,030、nfc_fuzz 20,000/seed 777、adjacency 5,000/
    seed 20260925、enc_fuzz 10,000/seed 42、pretok_fuzz 10,000/seed
    999、dec_fuzz 4,000/seed 20250417；脚本自报
-   `head=cb3cb668…`）。Phase C 未修改 tokenizer 实现/工具，extended
+   `head=5aba21fe…`）。Phase C 未修改 tokenizer 实现/工具，extended
    百万级穷举不需要重做，Phase B extended evidence 仍绑定
    `0dc3b576`。
  - **新 CUDA runtime path = 0**（sampler 纯 CPU，无新 kernel/
