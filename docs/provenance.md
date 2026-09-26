@@ -672,3 +672,375 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
    tokenizer prompt→text + `cudalm-generate` CLI；evidence 绑定
    `V04_EVIDENCE_SHA = 5aba21fe0b351079850600f3f8fe7f55a77c8745`
    （失效规则见上）。
+
+## CUDALM v0.5 Phase A（Hybrid State Manager Foundations：state 控制面 + 设备 state 池）
+
+ - **承接**：v0.4 **DONE/FROZEN**（`V04_EVIDENCE_SHA = 5aba21fe…`，已
+   merge 进 main）。Phase A 分支 `v0.5-state-manager` 从 main（`48ede94`）
+   开出；**只做 state ownership**：多序列的 state 控制面 + 设备 state
+   池，standalone，**不**接入 `Qwen35Model` forward（Phase B）。
+   v0.4 冻结面（model forward / attention / DeltaNet kernel /
+   generation / sampling / tokenizer / CLI）**零修改**；旧
+   `Qwen35KvCache` 与 `Qwen35DeltaNetLayer` 自持 state 原样保留
+   （Phase B 才被池取代）。
+ - **新增 runtime 代码（全部 CUDALM-native，无移植）**：
+   `include/cudalm/fixed_id_pool.h`（`FixedIdPool`，CPU 分配器核心，
+   header-only）、`include/cudalm/qwen35_state_layout.h`（config
+   推导的池尺寸公式，header-only）、
+   `include/cudalm/kv_block_table.h`（`KvBlockTable` + `KvPageSource`，
+   header-only）、`include/cudalm/qwen35_kv_page_pool.h` +
+   `src/runtime/qwen35_kv_page_pool.cpp`（`Qwen35KvPagePool`，RAII
+   设备池）、`include/cudalm/qwen35_delta_state_pool.h` +
+   `src/runtime/qwen35_delta_state_pool.cpp`（`Qwen35DeltaStatePool`，
+   RAII 设备池）、`include/cudalm/qwen35_state_manager.h` +
+   `src/runtime/qwen35_state_manager.cpp`（`SequenceState` +
+   `Qwen35StateManager`，host 控制面）。**既有 src/include 文件零
+   修改**（唯一改动的既有文件是 `tests/CMakeLists.txt` 的测试注册）。
+ - **无新 kernel / 无新 CUDA API 类别**：新 CUDA path 仅为池构造的
+   `cudaMalloc` + 整池/整页/整 slot 的 `cudaMemsetAsync`（zero-on-
+   release / zero-on-reset，池 stream 上 ordered）+ D2H 验证读取
+   （测试内）。`page_tokens` 是显式构造参数（非硬编码；测试用 4/8/
+   16）；所有记账公式从 `Qwen35Config` 混合 schedule 推导（6 full /
+   18 linear 于 0.8B，无 magic constant）。
+ - **语义钉死（见架构文档 §22）**：KV 页布局
+   `K/V 各 bf16 [n_full][num_pages][n_kv][page_tokens][head_dim]`，
+   一个物理 page id 跨所有 full 层同指一个逻辑 token block（每序列
+   一张 `KvBlockTable`，不建 per-layer 表）；Delta slot 布局
+   每层 `conv bf16 [capacity, 6144, 3]` + `recurrent fp32
+   [capacity, 16, 128, 128]`（0.8B），一个 slot 寻址全部 18 个
+   DeltaNet 层，state 永不落 host。两个池均为 **zero-on-release**
+   （构造整池清零 + 释放/重置时逐层清零 → 任何 acquire/reset 后
+   资源保证全零），single-stream 资源，Status OOM（不 abort、不部分
+   分配），double-free/double-release/越界 fail loud 且状态不变。
+   `KvBlockTable`：位置分解精确、前缀 append-only、同一逻辑 block
+   仅一次物理 page、**事务性 OOM**（中途失败全回滚，表与池
+   accounting 完全不变、无泄漏 page）。`Qwen35StateManager`：
+   create（唯一全零 slot + 空表 + length 0；slot OOM 什么都不登记）/
+   ensure_kv_capacity（事务性）/ set_length + advance（纯 metadata，
+   不分配 page）/ reset（同 id 同 slot，page 释放、slot 就地清零、
+   length 0，不可能 OOM）/ retire（全资源释放，id 永久失效）。
+   **`SequenceId`（uint64）单调递增、永不复用**（物理资源可复用，
+   外部 id 不可 → 杜绝 stale handle）。
+ - **新增测试（4 个，全部 PASS；3 CPU + 1 CUDA，均无 checkpoint
+   依赖）**：`test_fixed_id_pool`（全唯一 / capacity+1 OOM / LIFO
+   复用 / double-free 与越界拒绝 / reset / 零容量 / **fixed-seed
+   200,000-op 混合 allocate/free stress**（均匀 op 硬币 + live 偏置
+   release → 占用率全区间扫过 [0,64]；独立 host live-set 模型每步
+   对账：live 唯一、**完整 live-set 相等**（非仅 size）、accounting
+   每步精确、满池 OOM 零状态变化、合法 release 精确、非法/重复
+   release 拒绝、released id 实际复用；结束覆盖证明：五类分支计数
+   均 > 0 且 min_occ*2 < CAP 且 max_occ == CAP）；`test_kv_block_table`（位置分解边界矩阵 0 / pt-1 / pt
+   / pt+1 / 最后有效 / max（含不整除 ceil）/ 最小前缀增长与幂等 /
+   同 block 单 page / **中途 OOM 全回滚无泄漏** / 越界 fail loud /
+   clear 精确归还 / LIFO 复用身份，counting fake source）；
+   `test_state_pool_formulas`（0.8B 6/18 层数、page_tokens 4/8/16 的
+   每页字节（16 → 196,608 B）、每 slot 19,537,920 B、小型合成
+   config 钉死）；`test_qwen35_state_manager`（CUDA，小型 valid()
+   config：8 层 = 2 full + 6 linear，max_seq_len 64，page_tokens 4——
+   池分配器全矩阵 + **fixed-seed 100,000-op 设备侧混合 stress**
+   （同 CPU 版 workload 语义，占用率扫过 [0,32]）+ **真
+   设备复用污染门**：对 slot 写非零 pattern（conv + recurrent，全部
+   6 层）/ 对 page 写非零 pattern（K + V，全部 2 层）→ 释放 → 同一
+   物理资源被复用 → 新 owner D2H 读回**逐字节全零**（不只 metadata）
+   + block table 真池边界/OOM 无泄漏/单表共享 + 生命周期
+   （A/B 不别名、A reset 后 B 的 pattern 不受影响且 A 归零、A retire
+   回收资源且 id 永久失效、C 复用物理资源但 `SequenceId != A`——
+   retire 前缓存 A 的物理 slot（retire 后 map 节点已 erase，记录
+   指针悬垂，测试不再解引用；C 的 slot 与缓存值比对，不依赖
+   可能被 node-reuse 制造 false PASS 的悬垂指针）；已 retire id
+   一切操作 fail loud）+ OOM 事务性（跨页边界失败 ensure
+   表与记账完全不变；create OOM 零登记、id 保持单调））。
+ - **完整 regression（于本 evidence SHA）**：完整 ctest **49/49
+   PASS、0 skipped**（v0.4 全部门面回归：generation / sampling /
+   tokenizer / CLI / 各 golden 全 PASS）；`scripts/check_no_torch.sh`
+   **CLEAN**。
+ - **Sanitizer**：v0.5 Phase A **引入新 CUDA 分配/清零/生命周期
+   path**（不同于 v0.4 Phase C 的零新 path）：于本 SHA 对
+   `test_qwen35_state_manager` 跑 `compute-sanitizer --tool memcheck`
+   （`--launch-timeout 1200`，RTX 2080 Ti / CUDA 11.8）：**ERROR
+   SUMMARY: 0 errors**（记录：
+   `benchmarks/sanitizer_qwen35_state_manager.txt`）。
+ - **Review 修复轮（tests/header-doc only，commit `2319a26`）**：
+   (1) `test_sequence_lifecycle` host **use-after-free**：retire 后
+   `ra`（指向已被 `std::map::erase` 的 `SequenceState`）仍被解引用
+   （`ra->delta_slot`）——改为 retire 前缓存 `a_slot`，retire 后不
+   再解引用 `ra`；C create 后以缓存值验证「`C id != A` 且
+   `C delta_slot == a_slot`」（物理 slot 复用证明不再依赖悬垂
+   指针，杜绝 node-reuse false PASS）。(2) 两个 allocator stress
+   的 workload 由 acquire 偏置（未满必然 acquire → release 只发生
+   在满池）改为真正的 fixed-seed **混合 allocate/free** workload
+   （均匀 op 硬币 + live 偏置 release；占用率全区间扫过；完整
+   live-set 相等 + 每步精确 accounting + 五类分支覆盖证明，见
+   上）。(3) `Qwen35StateManager::next_sequence_id()` 注释修正
+   （返回**下一个将发放的** id，非「历史最大 id」；API 行为不
+   变）。(4) KV 池新增 `live_pages()` test/diag accessor。**runtime
+   语义零修改**（KV/Delta 池行为、manager 行为、所有冻结面均未
+   动）。
+ - **evidence 绑定**：`V05A_EVIDENCE_SHA = 2319a261543e1af75f544a6a57592b0193074312`
+   （clean tree、HEAD == SHA；完整 ctest 49/49 PASS 0 skipped +
+   check_no_torch CLEAN + state-manager compute-sanitizer 0 错误，
+   均于该 SHA）。更早的 evidence SHA
+   `866a2e46142f2a3a77deddf72809081eb58b47a1` 因上述 tests/header
+   修改按规则**失效**（未删除历史，仅声明失效）。Phase A 未修改
+   tokenizer 实现/工具 → tokenizer quick differential 不需要重做
+   （v0.4 evidence 的 tokenizer 门仍绑定 `5aba21fe`）。失效规则同
+   v0.4：此后任何 `src/` / `include/` / `tools/` / `tests/` /
+   functional CMake 修改 → 本 evidence 失效必须重跑；仅
+   docs/evidence 修改不失效。
+ - **边界（明说）**：Phase A **不** merge 进 main、**不**自启
+   Phase B；无 paged-attention kernel / 无 external-state model
+   forward / 无多序列执行 / 无 scheduler / 无 batching 类特性（见
+   架构文档 §22.5）。待 external reviewer 签核。
+
+## CUDALM v0.5 Phase B（External Hybrid State 接入 + Paged KV Kernel）
+
+ - **承接**：v0.4 **DONE/FROZEN**（`V04_EVIDENCE_SHA = 5aba21fe…`，已
+   merge 进 main）+ v0.5 Phase A（state 控制面 + 设备 state 池，
+   分支 `v0.5-state-manager`）。Phase B 把 Phase A 的 external
+   hybrid state **接入 model** 并落地**真 paged KV kernel**（写 +
+   因果 decode attention，块表寻址在 kernel 内，**禁止先 gather 成
+   contiguous KV 再调旧 kernel**，无 KV 值 host roundtrip）。冻结的
+   v0.4 数学**零语义修改**：legacy `forward()` /
+   `forward_token()` / `Qwen35Generator` / CLI 行为不变，legacy
+   contiguous `Qwen35KvCache` 原样保留（`forwardImpl` 尾部仅多一个
+   `PagedStateRef* paged = nullptr` 分支参数；DeltaNet `forward()`
+   改为以层自持 state 委托同一 `forward_impl`，数学零修改）。
+ - **新增 runtime 代码（全部 CUDALM-native，无移植）**：
+   `include/cudalm/kernels/paged_kv.h` + `src/kernels/paged_kv.cu`
+   —— `qwen35_paged_kv_write_bf16`（把一个 token 的 `n_kv*head_dim`
+   K/V 元素写入块表指向 page 的 `(n*pt+off)*hd` 行；部分块 guard）
+   + `qwen35_paged_attention_decode_bf16`（对 `[0, position]` 全 KV
+   行做因果 decode attention，块表寻址；scores 每 (h,t) 内 d 升序
+   fp32 累加 / GQA `kh = h*n_kv/n_heads`、softmax 为冻结 kernel 的
+   1:1 镜像（3-pass、O(num_warps) smem、同一 reduction 树）、PV 每
+   (h,d) 内 t 升序 —— **op 序与冻结 contiguous kernel 逐一对齐 →
+   parity 要求 bit-identical 而非容差**；scratch =
+   `[scores2 | probs]` 各 `n_heads*(position+1)` bf16）。
+   **修改**：`qwen35_deltanet.{h,cpp}`（新增
+   `forward_with_state(position, x, ext_conv, ext_rec, stream)` +
+   `forward_impl`，state 指针外提，数学零修改）、
+   `qwen35_full_attention.{h,cpp}`（新增 `PagedStateRef` +
+   `forward_with_paged_state`，只替换 KV 写与 attention 读两个
+   stage）、`qwen35_model.{h,cpp}`（新增
+   `forward_token_with_state(token, seq_id, mgr, stream)` +
+   grow-only `block_table_scratch_`）、
+   `qwen35_kv_page_pool.h`（`page_stride_elems() = page_elems()`：
+   池布局 row-major `[n_full][num_pages][…]`，**同一 ordinal 相邻
+   page 物理相邻**，ordinal 间距 = capacity*page_elems —— Phase B
+   开发中曾因把 page_stride 误设为 ordinal 间距导致 "page p" 落到
+   ordinal (ord+p) 的 page 0，parity 门抓出后修正并固化，见架构
+   §23.2）、`qwen35_state_manager.h`（`kv_pool_mut()` /
+   `delta_pool_mut()` / `page_tokens()`）、`kv_block_table.h`
+   （`page_ids()` host 视图）。
+ - **设备块表策略**：每序列一张 `KvBlockTable`（Phase A，CPU
+   前缀表）；每 token forward 做一次**小 H2D `cudaMemcpyAsync`**
+   把当前前缀 `num_blocks` 个 page id 拷进 grow-only 设备 buffer
+   （`max_blocks()` int，永不重分配）——唯一跨 H/D 的每 token
+   元数据拷贝，stream-ordered；kernel 只读
+   `[0, position/page_tokens]` 前缀（page id 精确、无 stale 读；
+   旧尾部残留的大 id 永不被触及，独立门用 9999 sentinel 双证）。
+ - **Compatibility gate + OOM-before-mutation 契约（钉死）**：
+   `forward_token_with_state` 顺序 = 加载/token 检查 →
+   **compatibility gate（任何 state mutation 前的最先一致性检查）**：
+   `mgr.config() == config()` + Phase A/B **单 stream 契约**（`stream
+   == mgr.kv_pool().stream() && stream == mgr.delta_pool().stream()`；
+   v0.5 correctness-first，不引入 cross-stream event machinery）→
+   lookup →
+   `position = rec->length` → `position >= max_seq_len` 检查 →
+   **`ensure_kv_capacity`（最先的 state 触点）** → 块表 H2D →
+   embedding → 24 层 external forward → final norm + LM head →
+   **`advance(+1)` 最后**。config/stream mismatch（compatibility
+   gate）/ KV OOM / 未知-retire 序列 / 越界长度 /
+   非法 token 全部 Status fail-loud 且**零 mutation**（无 delta 变化、
+   无 KV 变化、length 不变、不进入任何 layer forward、无部分
+   forward；硬门以 48 项 state 前后 bit-identical + 4 项
+   accounting 不变钉死）。
+ - **新增测试（2 个，均 PASS；合成门无 checkpoint 依赖，parity 门
+   真实检查点）**：`test_paged_kv`（合成：写门 非平凡映射
+   {3,0,5,1,4,2}/{5,2,0,3,1,4} × position {0, pt-1, pt, pt+1}
+   物理行 EXACT + 未写行保持零 + stale sentinel；attention 门 16
+   组 (position × mapping) 对冻结 contiguous kernel BIT-IDENTICAL；
+   真实形状门：真实 Qwen3.5-0.8B attention 维度直接从冻结
+   `Qwen35Config::qwen35_08b()` 读取并 CHECK 钉死（n_heads 8 /
+   n_kv_heads 2 / **head_dim 256** —— H1024/8，无手写常量；原
+   16/8/64 为错误常量，reviewer 修复轮更正）+ 2-ordinal miniature
+   池布局 fixture × pt=2 ×（相邻 page + ordinal 间距 =
+   capacity*page_elems）×
+   映射 {2,0,1} × T {2,3,4,5,6}（逐 token 跨页边界）
+   BIT-IDENTICAL）；`test_qwen35_state_parity`（真实
+   Qwen3.5-0.8B checkpoint，CLI 参数
+   `<full_model.cudalm> <checkpoint_dir> <python> <src_dir>`，
+   缺失时 exit 77 → ctest SKIP_RETURN_CODE 77 / TIMEOUT 1800：
+   A = legacy `reset_state` + 6 × `forward_token` vs B = 全新
+   manager（page_tokens 2、池 3 page 恰 6 token 容量、4 delta
+   slot）+ `create_sequence` + 6 × `forward_token_with_state`，
+   token 流 {1024, 2048, 3072, 15, 16, 17}（跨 pt=2 页边界、恰
+   填满池）；每 step embedding + 24 层 final + final norm +
+   全量 logits[248320] **bit-identical**（runtime-vs-runtime →
+   atol=0 / memcmp，无容差）；终态 18 × DeltaNet conv/rec +
+   6 × 全注意力**逻辑行 0..5 K/V**（external 侧经 host 块表从
+   物理 page device→host 逐行读；legacy 侧按
+   `[n_kv][max_seq][hd]` 的 `(n*max_seq+t)*hd` 逐行取）
+   **bit-identical**；第 7 token OOM → `!s.ok` + 48 项 state 前后
+   bit-identical + length/num_blocks/used_state_bytes/live_pages
+   不变；compatibility gate（reviewer 修复轮新增）：config 不一致的
+   manager（n_kv_heads 4 vs 2）→ `!s.ok` 零 mutation（无 KV page、
+   无 Delta 变化、length 不变、不进任何 layer forward）；stream
+   不一致（单 stream 契约）→ `!s.ok` 且 48 项 state 前后
+   bit-identical + length/num_blocks/used_state_bytes/live_pages 不
+   变；未知 id 999 与非法 token（vocab+7）fail-loud 且 length
+   不变；`reset_sequence` 后重放同 6 token → 每 step logits +
+   终态 48 项与首次 B 运行 bit-identical、length == 6）。
+ - **完整 regression（于本 evidence SHA，clean tree）**：完整
+   ctest **51/51 PASS、0 skipped**（含 v0.4 全部门面回归：
+   generation / sampling / tokenizer / CLI / 各 golden /
+   full-model forward 全绿；parity 门在 evidence 环境**真实运行**，
+   非 77 skip）；`scripts/check_no_torch.sh` **CLEAN**。
+ - **Sanitizer（于本 evidence SHA）**：v0.5 Phase B **引入新
+   kernel + 新 H2D 元数据 path**：`compute-sanitizer --tool
+   memcheck`（RTX 2080 Ti / CUDA 11.8）对 `test_paged_kv`：
+   **ERROR SUMMARY: 0 errors**（原始日志记录：
+   `benchmarks/sanitizer_paged_kv.txt`）；对
+   `test_qwen35_state_parity`（真实 checkpoint 全流程，含块表
+   H2D + paged kernel + compatibility gate + state capture 的
+   device→host 拷贝）：**ERROR SUMMARY: 0 errors**（原始日志记录：
+   `benchmarks/sanitizer_qwen35_state_parity.txt`）。
+ - **Review 修复轮（external reviewer Phase B 修复轮，commit
+   `a29b596`；不重设计 Phase B、不启动 Phase C）**：(1)
+   `test_paged_kv` 真实形状门更正：原手写常量 n_heads 16 / n_kv 8
+   / head_dim 64 **错误**；真实 Qwen3.5-0.8B 全注意力维度为
+   `Qwen35Config::qwen35_08b()` 的 **n_heads 8 / n_kv_heads 2 /
+   head_dim 256** —— 改为直接从冻结 config 读维度并 CHECK 钉死
+   （无手写常量）；测试文档明确「真实 0.8B attention 维度 +
+   2-ordinal miniature 池布局 fixture」（真正 6 个 full-attention
+   layer 的 real-checkpoint path 由 `test_qwen35_state_parity`
+   覆盖）。(2) page-stride 错误注释修正（`paged_kv.h` /
+   `paged_kv.cu`）：kernel `page_stride` = page_elems = n_kv*pt*hd
+   （同一 ordinal 相邻 page），ordinal 间距 =
+   capacity_pages*page_elems **不是** kernel page_stride；kernel
+   base = k_page(ord, 0) —— 与 `Qwen35KvPagePool::
+   page_stride_elems() == page_elems()`（正确实现，行为不变，仅
+   注释）对齐；同步清理 Phase B 新代码/测试中的错误 real-shape
+   注释（16/8/64、16 query heads、runtime 16*256；DeltaNet 合法
+   16-head 描述未动）。(3) `Qwen35Model::forward_token_with_state`
+   新增 **compatibility gate**（任何 state mutation 前验证）：
+   `mgr.config() == config()` + Phase A/B 单 stream 契约
+   （`stream == mgr.kv_pool().stream() ==
+   mgr.delta_pool().stream()`；不引入 cross-stream event
+   machinery）；不一致 → Status fail-loud 零 mutation（无 KV
+   allocation、无 Delta mutation、length 不变、不进入任何 layer
+   forward）。(4) `test_qwen35_state_parity` 新增两个 contract
+   测试（config 不一致 / stream 不一致 → mutation 前拒绝，零
+   mutation 钉死）。**kernel 行为与 bit-exact 语义零修改**（paged
+   kernel 本体、冻结 pipeline、legacy 路径均未动）。
+ - **evidence 绑定**：`V05B_EVIDENCE_SHA =
+   a29b59610b39a0ad24fc6d79ce2c61088897330e`（clean tree、
+   HEAD == SHA；完整 ctest 51/51 PASS 0 skipped +
+   check_no_torch CLEAN + `test_paged_kv` 与
+   `test_qwen35_state_parity`（真实 checkpoint 真实运行，非 77
+   skip）的 compute-sanitizer memcheck 各 0 错误，均于该 SHA；
+   原始日志：`benchmarks/sanitizer_paged_kv.txt` /
+   `benchmarks/sanitizer_qwen35_state_parity.txt`）。**失效声明
+   （未删除历史）**：reviewer 修复轮（commit `a29b596`）修改了
+   `include/`、`src/`（runtime + kernels 注释）、`tests/`，按失效
+   规则，原 Phase B evidence 绑定 **`V05B_EVIDENCE_SHA =
+   79d1ac523e4d96a91e75c33b389487ceb37eb2fa` 失效**（未删除历史，
+   仅声明失效）；更早的 **`V05A_EVIDENCE_SHA =
+   2319a261543e1af75f544a6a57592b0193074312`（及其更早绑定
+   `866a2e46142f2a3a77deddf72809081eb58b47a1`）** 与 **`V04_
+   EVIDENCE_SHA = 5aba21fe…`** 维持同规则失效 —— 其全部门面回归
+   已在本 SHA 的 51/51 内重跑全绿。失效规则延续：此后任何
+   `src/` / `include/` / `tools/` / `tests/` / functional CMake
+   修改 → 本 evidence 失效必须重跑；仅 docs/evidence 修改不
+   失效。
+ - **边界（明说）**：Phase B **不** merge 进 main、**不**自启
+   Phase C；无 双序列交错硬门 / scheduler / admission / continuous
+   batching / batched decode / chunked prefill / streaming /
+   PagedAttention perf / CUDA Graph / NCU / fusion / HTTP-OpenAI
+   server（见架构文档 §23.4）。待 external reviewer 签核。
+
+## CUDALM v0.5 Phase C（多序列交错硬门 + v0.5 最终签核）
+
+ - **承接**：v0.5 Phase A（state 控制面 + 设备 state 池，FROZEN）+
+   Phase B（external-state forward + paged KV kernel，FROZEN，
+   `V05B_EVIDENCE_SHA = a29b59610b39a0ad24fc6d79ce2c61088897330e`，
+   分支 `v0.5-state-manager`）。Phase C 证明 external-state runtime
+   在**多个 sequence 交错执行**时仍严格正确，并完成 v0.5 最终
+   sign-off。范围钉死：**单 model、单 CUDA stream、每 step 一次
+   `forward_token_with_state()`**，只有调用顺序在多个 SequenceId
+   之间交错（显式测试脚本，**非** scheduler）；**无** scheduler /
+   request queue / admission policy、**无** continuous batching /
+   batched decode / batched GEMV、**无** chunked prefill / streaming /
+   multi-CUDA-stream / CUDA Graph / NCU / kernel fusion /
+   HTTP-OpenAI API（均属 v0.6+）；**零** src/include 修改 —— 冻结
+   的 Phase B runtime 原样复用（本阶段仅新增测试 + 测试 CMake）。
+ - **新增测试（1 个，PASS；真实 Qwen3.5-0.8B-Base checkpoint；
+   ctest SKIP_RETURN_CODE 77 / TIMEOUT 1800；evidence 环境必须真实
+   跑，77 skip 不是签核）**：`test_qwen35_state_interleave`：
+   - token 流（全部跨 page_tokens=2 页边界）：A =
+     {1024, 2048, 3072, 4096, 5000, 6000}（6 tok → 3 page）、B =
+     {15, 16, 17, 18, 19}（5 tok → 3 page）、C = {7, 8, 9, 10, 11,
+     12}（6 tok → 3 page）；池 6 page（A+B 同时 live）、4 delta
+     slot；
+   - **独立 reference**（fresh manager、单序列独占）：每 step
+     24 层 final + final norm + **FULL logits[248320]**；终态 18 ×
+     DeltaNet conv（bf16）+ rec（fp32）+ 6 × 全注意力**逻辑行
+     K/V**（经块表从物理 page 读，无 host gather）+ length + 块表
+     形状；
+   - **交错运行**（一个 manager，A+B live，非平凡 schedule
+     `A0 B0 A1 A2 B1 A3 B2 A4 B3 A5 B4`）：**A 每步 == refA、B
+     每步 == refB**（runtime-vs-runtime，**BIT-IDENTICAL**，
+     atol=0 / memcmp）；终态 A/B hybrid state 分别 bit-identical；
+     A/B 物理 page 各自唯一且互斥；
+   - **跨序列隔离门**（关键 step 做**完整 hybrid state** pre/post，
+     不只 length/accounting）：A4 前捕获 B（len 3）→ forward A4 →
+     B bit-identical；B2 前捕获 A（len 4）→ forward B2 → A
+     bit-identical；
+   - **retire / 复用污染门**：`retire_sequence(A)` → A 的
+     SequenceId **永久 invalid**（lookup nullptr；advance /
+     ensure_kv_capacity 拒绝）、A 的 3 KV page + Delta slot 回收
+     （精确字节 accounting：used_state_bytes 恰降
+     3*bytes_per_page + bytes_per_slot）、B 的 state
+     bit-identical；`create_sequence(C)` → **C id != A id**（id 永
+     不发放两次），且 C **实际复用** A 释放的 Delta slot（同 slot
+     id）与 A 释放的 KV 物理 page（page id 集合相等 —— 池里只有
+     A 的 3 page 可分配）；C 从 fresh-zero state 跑完整 token 流：
+     每 step 24 层 final + norm + FULL logits + 终态 Delta state +
+     逻辑 KV 与独立 fresh-C reference **bit-identical**；C 的执行
+     不改变仍 live 的 B（完整 state pre/post，含关键 step C0）；
+   - **reset 单序列隔离**：`reset_sequence(B)` **只清 B**（length
+     = 0、全部 page 释放、Delta slot 原地清零 —— 18 ordinal 的
+     conv/rec 逐字节验证为零）、live C 的 state bit-identical。
+ - **完整 regression（于本 evidence SHA，clean tree）**：完整
+   ctest **52/52 PASS、0 failed、0 skipped**（含 v0.4 全部门面回归
+   + Phase A/B 全部硬门；interleave 门在 evidence 环境**真实运
+   行**，非 77 skip）；`scripts/check_no_torch.sh` **CLEAN**。
+ - **Sanitizer（于本 evidence SHA）**：Phase C **引入多序列交错
+   执行路径**（池分配/回收/复用在多序列间交错发生）：
+   `compute-sanitizer --tool memcheck`（RTX 2080 Ti / CUDA 11.8）
+   对 `test_qwen35_state_interleave`（真实 checkpoint 全流程，34
+   次真实 forward，含 retire/reuse + 全部 state capture 的
+   device→host 拷贝）：**PASS + ERROR SUMMARY: 0 errors**（原始
+   日志：`benchmarks/sanitizer_qwen35_state_interleave.txt`）。
+ - **evidence 绑定**：`V05C_EVIDENCE_SHA =
+   1054b69c4f72f3f0238361d5b5e5f5ab8463489c`（clean tree、
+   HEAD == SHA；完整 ctest 52/52 PASS 0 skipped + check_no_torch
+   CLEAN + interleave 门 compute-sanitizer memcheck 0 错误，均于该
+   SHA）。**失效声明（未删除历史）**：Phase C functional commit
+   修改了 `tests/` 与测试 CMake，按失效规则：**`V05B_EVIDENCE_SHA
+   = a29b59610b39a0ad24fc6d79ce2c61088897330e`（及其更早绑定
+   `79d1ac523e4d96a91e75c33b389487ceb37eb2fa`）失效**；更早的
+   **`V05A_EVIDENCE_SHA = 2319a261543e1af75f544a6a57592b0193074312`
+   （及其更早绑定 `866a2e46142f2a3a77deddf72809081eb58b47a1`）**
+   与 **`V04_EVIDENCE_SHA = 5aba21fe…`** 维持同规则失效 —— 其全部
+   门面回归已在本 SHA 的 52/52 内重跑全绿。失效规则延续：此后
+   任何 `src/` / `include/` / `tools/` / `tests/` / functional
+   CMake 修改 → 本 evidence 失效必须重跑；仅 docs/evidence 修改
+   不失效。
+ - **v0.5 终态（明说）**：**v0.5 Phase A / Phase B / Phase C 全部
+   DONE**，**v0.5 Hybrid State Manager DONE**（单序列 parity +
+   多序列交错 + 生命周期/复用污染全部 bit-exact 签核）。本阶段**不**
+   merge 进 main、**不**自启 v0.6（scheduler / admission /
+   continuous batching / batched decode / chunked prefill /
+   streaming / multi-stream / PagedAttention perf 均属 v0.6+，见
+   架构文档 §24）。待 external reviewer 签核。

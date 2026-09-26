@@ -10,10 +10,13 @@
 
 #include "cudalm/qwen35_model.h"
 
+#include <string>
+
 #include "cudalm/cuda_check.h"
 #include "cudalm/kernels/bf16_gemv.h"
 #include "cudalm/kernels/qwen35_kernels.h"
 #include "cudalm/qwen35_kv_cache.h"
+#include "cudalm/qwen35_kv_page_pool.h"
 
 namespace cudalm {
 
@@ -172,6 +175,122 @@ void Qwen35Model::forward_token(int token_id, int position,
   bf16_gemv(embed_.data<__nv_bfloat16>(), normed,
             logits_buf_.data<__nv_bfloat16>(), /*N=*/cfg_.vocab_size,
             /*K=*/H, stream);
+}
+
+Status Qwen35Model::forward_token_with_state(int token_id, SequenceId seq_id,
+                                             Qwen35StateManager& mgr,
+                                             cudaStream_t stream) {
+  if (!loaded_)
+    return Status::error("Qwen35Model::forward_token_with_state: not loaded");
+  if (token_id < 0 || token_id >= cfg_.vocab_size)
+    return Status::error("Qwen35Model::forward_token_with_state: token_id " +
+                         std::to_string(token_id) + " out of range [0, " +
+                         std::to_string(cfg_.vocab_size) + ")");
+  // COMPATIBILITY GATE (before ANY state mutation — no KV allocation, no
+  // Delta mutation, length unchanged, no layer forward): the manager's
+  // config must be EXACTLY the model's config. A mismatched manager would
+  // address pool pages / delta slots with the wrong layout, so it is
+  // rejected fail-loud up front.
+  if (!(mgr.config() == cfg_))
+    return Status::error(
+        "Qwen35Model::forward_token_with_state: manager config does not "
+        "match the model config");
+  // SINGLE-STREAM CONTRACT (Phase A/B; v0.5 is single-stream,
+  // correctness-first — no cross-stream event machinery): every pool
+  // access happens on the pools' streams, so the caller's stream must be
+  // exactly the KV pool's and the Delta pool's stream.
+  if (stream != mgr.kv_pool().stream() || stream != mgr.delta_pool().stream())
+    return Status::error(
+        "Qwen35Model::forward_token_with_state: stream mismatch — v0.5 "
+        "is single-stream; the forward stream must equal the manager "
+        "pool streams");
+  const SequenceState* rec = mgr.lookup(seq_id);
+  if (rec == nullptr)
+    return Status::error(
+        "Qwen35Model::forward_token_with_state: sequence id " +
+        std::to_string(seq_id) + " is not a live sequence");
+  // position is DERIVED from the sequence length (single source of truth).
+  const int position = rec->length;
+  if (position >= cfg_.max_seq_len)
+    return Status::error(
+        "Qwen35Model::forward_token_with_state: sequence length " +
+        std::to_string(position) + " >= max_seq_len " +
+        std::to_string(cfg_.max_seq_len));
+
+  // OOM GATE FIRST: ensure the KV page for `position` BEFORE any model
+  // state is touched. TRANSACTIONAL: on failure the block table, the pool
+  // accounting, the DeltaNet slot, the KV pages, and `rec->length` are all
+  // exactly unchanged, and no layer forward runs below.
+  Status s = mgr.ensure_kv_capacity(seq_id, position);
+  if (!s.ok) return s;
+
+  // H2D the current block-table page IDs (per-token metadata; stream-ordered
+  // before every paged kernel that reads them). Grow-only scratch sized to
+  // the manager's max number of logical blocks.
+  const int num_blocks = rec->block_table.num_blocks();
+  const int max_blocks = rec->block_table.max_blocks();
+  if (block_table_scratch_.bytes() <
+      static_cast<std::size_t>(max_blocks) * sizeof(int)) {
+    block_table_scratch_.allocate(
+        static_cast<std::size_t>(max_blocks) * sizeof(int), stream);
+  }
+  CUDA_CHECK(cudaMemcpyAsync(
+      block_table_scratch_.data(), rec->block_table.page_ids(),
+      static_cast<std::size_t>(num_blocks) * sizeof(int),
+      cudaMemcpyHostToDevice, stream));
+  const int* d_block_table = static_cast<int*>(block_table_scratch_.data());
+
+  Qwen35KvPagePool& kpool = mgr.kv_pool_mut();
+  Qwen35DeltaStatePool& dpool = mgr.delta_pool_mut();
+  const int slot = rec->delta_slot;
+  const int pt = mgr.page_tokens();
+
+  const int H = cfg_.hidden_size;
+  // 1. Embedding lookup (bit-exact D2D row copy, same as forward_token).
+  const __nv_bfloat16* emb_row =
+      embed_.data<__nv_bfloat16>() +
+      static_cast<std::size_t>(token_id) * static_cast<std::size_t>(H);
+  CUDA_CHECK(cudaMemcpyAsync(
+      embed_out_.data(), emb_row,
+      static_cast<std::size_t>(H) * sizeof(__nv_bfloat16),
+      cudaMemcpyDeviceToDevice, stream));
+  const __nv_bfloat16* x = embed_out_.data<__nv_bfloat16>();
+
+  // 2. Chain all 24 decoder layers with EXTERNAL state (v0.5 Phase B).
+  for (int i = 0; i < num_layers(); ++i) {
+    if (is_linear_attention(i)) {
+      const int ord = dpool.linear_layer_ordinal(i);
+      delta(i)->forward_with_state(position, x, dpool.conv_mut(ord, slot),
+                                   dpool.recurrent_mut(ord, slot), stream);
+      x = delta(i)->stage_final_output();
+    } else {
+      const int ord = kpool.full_layer_ordinal(i);
+      Qwen35FullAttentionLayer::PagedStateRef ps;
+      ps.k_pages = kpool.k_page_mut(ord, 0);
+      ps.v_pages = kpool.v_page_mut(ord, 0);
+      ps.block_table = d_block_table;
+      ps.page_tokens = pt;
+      ps.page_stride = kpool.page_stride_elems();
+      attention(i)->forward_with_paged_state(position, x, ps, stream);
+      x = attention(i)->stage_final_output();
+    }
+  }
+
+  // 3. Final zero-centered RMSNorm (same as forward_token).
+  kernels::qwen35_rmsnorm_zc_bf16(x, norm_.data<__nv_bfloat16>(),
+                                  norm_out_.data<__nv_bfloat16>(),
+                                  /*M=*/1, /*H=*/H, cfg_.eps, stream);
+  const __nv_bfloat16* normed = norm_out_.data<__nv_bfloat16>();
+
+  // 4. Tied LM head (same as forward_token).
+  bf16_gemv(embed_.data<__nv_bfloat16>(), normed,
+            logits_buf_.data<__nv_bfloat16>(), /*N=*/cfg_.vocab_size,
+            /*K=*/H, stream);
+
+  // 5. Commit: only AFTER the whole forward is enqueued do we advance the
+  //    sequence length (pure metadata; cannot fail: position+1 <= max).
+  s = mgr.advance(seq_id, 1);
+  return s;
 }
 
 const __nv_bfloat16* Qwen35Model::layer_final_output(int i) const {

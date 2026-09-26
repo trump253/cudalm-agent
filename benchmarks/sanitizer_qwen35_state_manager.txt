@@ -1,0 +1,41 @@
+# compute-sanitizer memcheck — CUDALM v0.5 Phase A (hybrid state-manager
+# foundations: KV page pool + DeltaNet state pool + sequence state manager)
+#
+# Host: RTX 2080 Ti (sm_75), CUDA 11.8, single device (CUDA_VISIBLE_DEVICES=0)
+# Tool: /usr/local/cuda/bin/compute-sanitizer --tool memcheck --launch-timeout 1200
+# git: 2319a261543e1af75f544a6a57592b0193074312  # V05A_EVIDENCE_SHA (clean worktree)
+#
+# Scope: the NEW CUDA allocation/memset/lifecycle paths introduced by
+# v0.5 Phase A, exercised by tests/cuda/test_qwen35_state_manager
+# (small valid() synthetic config: 8 layers, 2 full + 6 linear,
+# max_seq_len 64, page_tokens 4):
+#   * KV page pool: all-unique allocation, OOM, free/reuse (LIFO),
+#     double-free/invalid rejection, 100k-op fixed-seed MIXED stress
+#     (occupancy sweep [0,32]; device memset zeroing on every free/reset
+#     in every layer), pool reset;
+#   * Delta state pool: acquire/release/reset_slot, zero-on-release /
+#     zero-on-reset (every conv + recurrent buffer of every layer);
+#   * REAL on-device reuse contamination: non-zero pattern written to a
+#     full slot (conv+recurrent, all 6 linear layers) / a full page
+#     (K+V, all 2 full layers) -> release -> same physical resource
+#     re-acquired -> new owner reads back ALL ZEROS (D2H verified);
+#   * block table on the real pool + manager lifecycle (create/reset/
+#     retire — incl. the post-retire slot-reuse check that no longer
+#     dereferences the erased record; OOM transactional paths).
+#
+# Result (full run below): test_qwen35_state_manager PASS +
+# ERROR SUMMARY: 0 errors.
+#
+========= COMPUTE-SANITIZER
+test_qwen35_state_manager: CUDALM v0.5 Phase A device gate (small synthetic config)
+  [ok] KV pool: unique/OOM/reuse/double-free/accounting
+  [ok] KV pool: fixed-seed mixed stress (100000 ops, cap 32: 8 live at end, occupancy range [0, 32]; 47333 alloc-ok, 2827 OOM, 47325 free-ok, 2515 rejected, 47301 reuses)
+  [ok] Delta pool: unique/OOM/reuse/double-release/accounting
+  [ok] Delta reuse contamination: reused slot reads back ALL ZEROS (conv+recurrent, all layers)
+  [ok] KV reuse contamination: reused page reads back ALL ZEROS (K+V, all layers)
+  [ok] block table on real pool: boundaries, OOM no-leak, single shared table
+  [ok] lifecycle: create/no-alias/reset/retire/id non-reuse/length contract
+  [ok] KV OOM transactional: failed cross-boundary ensure leaves everything unchanged
+  [ok] create OOM transactional: nothing registered, ids stay monotone
+test_qwen35_state_manager: PASS
+========= ERROR SUMMARY: 0 errors

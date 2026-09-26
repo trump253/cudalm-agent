@@ -37,6 +37,24 @@ cudalm_add_test(test_sampling test_sampling cpu/test_sampling.cpp)
 cudalm_add_test(test_generate_cli_args test_generate_cli_args
                 cpu/test_generate_cli_args.cpp)
 
+# v0.5 Phase A: hybrid state-manager foundations (CPU metadata gates).
+#   * test_fixed_id_pool: the shared allocator core — unique live ids,
+#     LIFO reuse, OOM, double-free/invalid rejection, fixed-seed stress,
+#     exact accounting.
+#   * test_kv_block_table: logical block table vs a fake page source —
+#     position decomposition boundary matrix, minimal prefix growth,
+#     one page per block, TRANSACTIONAL OOM rollback (no leaked page),
+#     bounds, clear, LIFO reuse identity.
+#   * test_state_pool_formulas: ALL pool sizing derives from the
+#     Qwen35Config hybrid schedule (0.8B: 6 full/18 linear; page/slot
+#     byte sizes for page_tokens 4/8/16) — no magic constants.
+cudalm_add_test(test_fixed_id_pool test_fixed_id_pool
+                cpu/test_fixed_id_pool.cpp)
+cudalm_add_test(test_kv_block_table test_kv_block_table
+                cpu/test_kv_block_table.cpp)
+cudalm_add_test(test_state_pool_formulas test_state_pool_formulas
+                cpu/test_state_pool_formulas.cpp)
+
 # --- CUDA tests ---------------------------------------------------------------
 cudalm_add_test(test_cuda_smoke test_cuda_smoke cuda/test_cuda_smoke.cpp)
 cudalm_add_test(test_elementwise_rmsnorm test_elementwise_rmsnorm cuda/test_elementwise_rmsnorm.cpp)
@@ -53,6 +71,44 @@ cudalm_add_test(test_qwen35_kernels test_qwen35_kernels cuda/test_qwen35_kernels
 cudalm_add_test(test_rope test_rope cuda/test_rope.cpp)
 cudalm_add_test(test_kv_cache test_kv_cache cuda/test_kv_cache.cpp)
 cudalm_add_test(test_attention test_attention cuda/test_attention.cpp)
+# v0.5 Phase A: hybrid state-manager DEVICE gate (no checkpoint): KV page
+# pool + Delta state pool allocator/OOM/stress, REAL on-device reuse
+# contamination (dirty pattern -> release -> reuse -> all zeros, conv+rec
+# and K+V across every layer), block table on the real pool, sequence
+# lifecycle (no aliasing, reset/retire, SequenceId monotone non-reuse),
+# and OOM transactional behavior (table/accounting unchanged on failure).
+cudalm_add_test(test_qwen35_state_manager test_qwen35_state_manager
+                cuda/test_qwen35_state_manager.cpp)
+# v0.5 Phase B: paged-KV kernel standalone hard gate (synthetic data, NO
+# checkpoint): paged KV write (physical rows bit-exact, unwritten rows
+# untouched) + paged causal decode attention BIT-IDENTICAL to the frozen
+# contiguous attention under two NON-trivial physical mappings (not the
+# identity) across the position boundary matrix (0, pt-1, pt, pt+1,
+# multi-page crossings), with OUT-OF-RANGE sentinels in the block-table
+# stale region proving stale entries are never read.
+cudalm_add_test(test_paged_kv test_paged_kv cuda/test_paged_kv.cpp)
+# v0.5 Phase B: single-sequence external-state parity hard gate (real
+# checkpoint). A = frozen legacy owned-state forward_token (p0..p5, page
+# boundaries at positions 2+4 with page_tokens=2) vs B = Qwen35StateManager
+# sequence + forward_token_with_state (DeltaNet forward_with_state over the
+# pool slot + paged attention over the pool + device block table). Gates:
+# every step's embedding/24 layer finals/final-norm/FULL logits BIT-IDENTICAL,
+# final hybrid state (18x delta conv+rec, 6x KV logical rows via block table)
+# BIT-IDENTICAL, OOM-BEFORE-MUTATION (exhausted 3-page pool: 7th forward
+# fails with length/block-table/pool/Delta/KV all unchanged), reset parity
+# (reset_sequence + same tokens == first external run), fail-loud unknown id
+# + invalid token. Self-skips (77) when the checkpoint is absent; the
+# Phase B evidence environment MUST actually run it.
+add_executable(test_qwen35_state_parity cuda/test_qwen35_state_parity.cpp)
+target_link_libraries(test_qwen35_state_parity PRIVATE cudalm)
+add_test(NAME test_qwen35_state_parity
+         COMMAND test_qwen35_state_parity
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_state_parity PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 # --- Cross-language weight-file tests (Python tools -> C++ loader) ------------
 # tools/convert_weights.py (torch, offline) emits data/block_v01.cudalm into
@@ -74,6 +130,31 @@ if(CUDALM_TOOL_PYTHON3)
 else()
   set(CUDALM_TOOL_PY_ROI_OK 1)
 endif()
+
+# v0.5 Phase C: multi-sequence INTERLEAVED external-state hard gate (real
+# checkpoint) — the v0.5 final sign-off test. Single model, single CUDA
+# stream, one forward_token_with_state per step; the call order interleaves
+# SequenceIds (no scheduler). Gates: A (6 tok) + B (5 tok) interleaved
+# (A0 B0 A1 A2 B1 A3 B2 A4 B3 A5 B4) vs INDEPENDENT fresh-manager
+# references — per step 24 layer finals + final norm + FULL logits and
+# final hybrid state (18x delta conv/rec + 6x logical KV rows) BIT-IDENTICAL;
+# cross-sequence ISOLATION (full hybrid state pre/post a key A and B step);
+# RETIRE/reuse (A's id permanently invalid, A's 3 pages + delta slot
+# reclaimed, B unchanged; C reuses A's slot + pages with a FRESH id and
+# matches the fresh-C reference from fresh-zero state, B still unchanged);
+# RESET-ONE-SEQUENCE isolation (reset B clears only B, live C unchanged).
+# Self-skips (77) when the checkpoint is absent; the Phase C evidence
+# environment MUST actually run it.
+add_executable(test_qwen35_state_interleave cuda/test_qwen35_state_interleave.cpp)
+target_link_libraries(test_qwen35_state_interleave PRIVATE cudalm)
+add_test(NAME test_qwen35_state_interleave
+         COMMAND test_qwen35_state_interleave
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_state_interleave PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 if(CUDALM_PYTHON3)
   set(CUDALM_CROSSLANG_WEIGHTS ${CMAKE_BINARY_DIR}/data/block_v01.cudalm)

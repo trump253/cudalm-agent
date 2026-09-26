@@ -84,6 +84,20 @@ class Qwen35DeltaNetLayer {
   void forward(int position, const __nv_bfloat16* x_in,
                cudaStream_t stream);
 
+  // v0.5 Phase B: the SAME pipeline as forward(), but the persistent state
+  // lives OUTSIDE the layer: `ext_conv` is a device bf16 buffer
+  // [linear_conv_dim(), 3] and `ext_rec` a device fp32 buffer
+  // [lin_num_v_heads, lin_value_head_dim, lin_value_head_dim] (the exact
+  // layout of one slot of a Phase-A Qwen35DeltaStatePool,
+  // conv(ordinal, slot) / recurrent(ordinal, slot)). The state is read +
+  // updated IN PLACE at those external addresses (same kernels, same math,
+  // no host roundtrip); the layer's OWN conv_state_/rec_state_ are NOT
+  // touched. Precondition (host-checked, abort on violation):
+  // 0 <= position < max_seq_len.
+  void forward_with_state(int position, const __nv_bfloat16* x_in,
+                          __nv_bfloat16* ext_conv, float* ext_rec,
+                          cudaStream_t stream);
+
   // ---- persistent state (Phase C hard gate) --------------------------------
   // Zero both conv_state and recurrent_state (first-token / reset).
   void reset_state(cudaStream_t stream);
@@ -119,6 +133,14 @@ class Qwen35DeltaNetLayer {
   const __nv_bfloat16* stage_silu_mul() const { return silu_mul_.data<__nv_bfloat16>(); }
   const __nv_bfloat16* stage_mlp_down() const { return mlp_down_.data<__nv_bfloat16>(); }
   const __nv_bfloat16* stage_final_output() const { return final_.data<__nv_bfloat16>(); }
+
+  // Shared pipeline (frozen v0.2 math, unchanged): the persistent conv/rec
+  // state is addressed through `conv_state` / `rec_state` — the layer's own
+  // buffers for forward(), an external slot (Phase B) for
+  // forward_with_state().
+  void forward_impl(int position, const __nv_bfloat16* x_in,
+                    __nv_bfloat16* conv_state, float* rec_state,
+                    cudaStream_t stream);
 
  private:
   const Qwen35LayerWeights* w_;

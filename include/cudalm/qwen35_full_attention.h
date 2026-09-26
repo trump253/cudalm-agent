@@ -91,6 +91,39 @@ class Qwen35FullAttentionLayer {
                     cudaStream_t stream, cudaEvent_t* events,
                     float* stage_us, float* whole_block_us);
 
+  // v0.5 Phase B: the SAME 21-stage pipeline as forward(), but only the two
+  // cache-touching stages differ:
+  //   * stage 6 (KV write)    -> paged write into the external page array
+  //   * stage 7 (attention)   -> paged causal decode attention
+  // through the DEVICE block table. Everything else (RMSNorm, projections,
+  // RoPE, gate, MLP, residual) REUSES the exact frozen implementation.
+  // The layer's OWN contiguous Qwen35KvCache (kv_) is NOT touched — the
+  // legacy forward() keeps using it.
+  //
+  // PagedStateRef describes one full-attention layer's slice of a Phase-A
+  // Qwen35KvPagePool:
+  //   k_pages/v_pages: base of this layer's page storage in the pool:
+  //     pool.k_page_mut(full_layer_ordinal, 0) / v_page_mut(...) (non-const:
+  //     the paged KV WRITE stage writes into the pages)
+  //   page_stride    : bf16 elements between consecutive pages of this
+  //     layer (= pool.page_stride_elems() for the Phase-A pool layout)
+  //   block_table    : DEVICE int32 [num_blocks], logical block -> physical
+  //     page id (entries beyond position/page_tokens may be stale — the
+  //     kernels never read them)
+  //   page_tokens    : the pool's page size (must match the pool)
+  // Precondition (host-checked, abort on violation): 0 <= position
+  // < max_seq_len, page_tokens >= 1,
+  // page_stride >= n_kv_heads*page_tokens*head_dim, non-null pointers.
+  struct PagedStateRef {
+    __nv_bfloat16* k_pages = nullptr;
+    __nv_bfloat16* v_pages = nullptr;
+    const int* block_table = nullptr;
+    int page_tokens = 0;
+    std::size_t page_stride = 0;
+  };
+  void forward_with_paged_state(int position, const __nv_bfloat16* x_in,
+                                const PagedStateRef& ps, cudaStream_t stream);
+
   // Names of the 21 timed stages, in order (shared with the benchmark).
   static const char* const* stage_names();
 
@@ -128,8 +161,12 @@ class Qwen35FullAttentionLayer {
   const Qwen35Config& config() const { return cfg_; }
 
  private:
+  // Shared pipeline (frozen v0.2 math, unchanged): when `paged` is null the
+  // KV write + attention use the layer's OWN contiguous cache (legacy);
+  // otherwise they use the external paged state (v0.5 Phase B).
   void forwardImpl(int position, const __nv_bfloat16* x_in,
-                   cudaStream_t stream, cudaEvent_t* events);
+                   cudaStream_t stream, cudaEvent_t* events,
+                   const PagedStateRef* paged = nullptr);
 
   const Qwen35LayerWeights* w_ = nullptr;
   Qwen35Config cfg_{};

@@ -1,0 +1,34 @@
+# compute-sanitizer memcheck — CUDALM v0.5 Phase B (external-state forward
+# + paged KV kernels: paged KV write + paged causal decode attention,
+# device block-table addressing, no host gather)
+#
+# Host: RTX 2080 Ti (sm_75), CUDA 11.8, single device
+# Tool: /usr/local/cuda/bin/compute-sanitizer --tool memcheck
+# Command: /usr/local/cuda/bin/compute-sanitizer --tool memcheck \
+#            ./build/tests/test_paged_kv
+# git: a29b59610b39a0ad24fc6d79ce2c61088897330e  # V05B_EVIDENCE_SHA (clean
+#        worktree, HEAD == SHA; build/ rebuilt from that SHA)
+#
+# Scope: the NEW paged-KV pipeline exercised by
+# tests/cuda/test_paged_kv (synthetic, no checkpoint):
+#   * paged KV write under non-trivial physical mappings (positions
+#     0, pt-1, pt, pt+1; stale 9999 sentinels in the block table — a
+#     stale-entry dereference would be an OOB read);
+#   * paged causal decode attention BIT-IDENTICAL to the frozen
+#     contiguous kernel (16 position × mapping cases, pt=4);
+#   * real-shape gate: REAL Qwen3.5-0.8B attention dims read from the
+#     frozen Qwen35Config::qwen35_08b() (n_heads 8, n_kv_heads 2,
+#     head_dim 256) + a 2-ordinal miniature pool-layout fixture
+#     (page_tokens 2, mapping {2,0,1}, page-boundary positions,
+#     stale sentinels) — BIT-IDENTICAL.
+#
+# Result (full run below): test_paged_kv PASS +
+# ERROR SUMMARY: 0 errors.
+#
+========= COMPUTE-SANITIZER
+test_paged_kv: CUDALM v0.5 Phase B paged-KV hard gate (synthetic, vs frozen contiguous kernels)
+  [ok] paged KV write: physical rows EXACT, unwritten rows untouched (stale sentinels present)
+  [ok] paged attention == frozen contiguous: 16 position/mapping cases BIT-IDENTICAL (stale sentinels never read)
+  [ok] real-shape (8/2/256, pt=2, 2-ordinal pool fixture, map {2,0,1}) attention BIT-IDENTICAL: 5 cases
+test_paged_kv: PASS
+========= ERROR SUMMARY: 0 errors
