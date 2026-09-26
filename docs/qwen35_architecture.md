@@ -1945,3 +1945,69 @@ kernel fusion、**无** HTTP/OpenAI server。legacy 路径
 （`forward()` / `forward_token()` / `Qwen35Generator` /
 `cudalm-generate` CLI）行为不变、legacy contiguous cache 保留。
 Phase C = 多序列交错正确性硬门 + 复用污染 + v0.5 最终 evidence。
+
+## 24. v0.5 Phase C —— 多序列交错硬门 + v0.5 最终签核（DONE）
+
+v0.5 Hybrid State Manager 的最后一块：证明 external-state runtime 在
+**多个 sequence 交错执行**时仍严格正确。范围钉死（明说）：
+
+- **单 model、单 CUDA stream、每 step 一次 `forward_token_with_state()`**
+  —— 只是**调用顺序**在多个 SequenceId 之间交错；
+- **无** scheduler / request queue / admission policy、**无**
+  continuous batching / batched decode / batched GEMV、**无** chunked
+  prefill / streaming、**无** multi-CUDA-stream、**无** CUDA Graph / NCU /
+  kernel fusion、**无** HTTP/OpenAI API（均属 v0.6+）；
+- 不改 paged-attention 数学、不重构已冻结的 Phase B runtime（本阶段
+  **零** src/include 修改，纯新增测试）。
+
+### 24.1 Interleave 硬门（`tests/cuda/test_qwen35_state_interleave.cpp`，
+真实 Qwen3.5-0.8B-Base checkpoint）
+
+- **token 流**（全部跨 `page_tokens = 2` 页边界）：
+  A = {1024, 2048, 3072, 4096, 5000, 6000}（6 tok → 3 page）、
+  B = {15, 16, 17, 18, 19}（5 tok → 3 page）、
+  C = {7, 8, 9, 10, 11, 12}（6 tok → 3 page）；池 6 page（A+B 同时
+  live）、4 delta slot。
+- **独立 reference**（fresh manager、单序列独占）：每 step 记录
+  24 层 final + final norm + **FULL logits[248320]**；终态记录
+  18 × DeltaNet conv（bf16）+ rec（fp32）+ 6 × 全注意力**逻辑行
+  K/V**（经块表从物理 page 读，无 host gather）+ length + 块表形状。
+- **交错运行**（一个 manager，A+B live，非平凡 schedule
+  `A0 B0 A1 A2 B1 A3 B2 A4 B3 A5 B4`）：**A 每步 == refA、B 每步
+  == refB**（runtime-vs-runtime，**BIT-IDENTICAL**，atol=0）；终态
+  A/B hybrid state 分别 bit-identical；A/B 物理 page 各自唯一且
+  互斥。
+- **跨序列隔离门**（关键 step 做**完整 hybrid state** pre/post，不
+  只 length/accounting）：A4 前捕获 B（len 3）→ forward A4 → B
+  bit-identical；B2 前捕获 A（len 4）→ forward B2 → A
+  bit-identical。
+- **retire / 复用污染门**：`retire_sequence(A)` → A 的 SequenceId
+  **永久 invalid**（lookup nullptr；advance / ensure_kv_capacity 拒绝）、
+  A 的 3 KV page + Delta slot 回收（**精确字节 accounting**）、B 的
+  state bit-identical；随后 `create_sequence(C)` → **C id != A id**
+  （id 永不复用），但 C **实际复用** A 释放的 Delta slot 与 A 释放的
+  KV 物理 page（集合相等）；C 从 fresh-zero state 跑完整 token 流：
+  每 step 输出 + 终态 Delta state + 逻辑 KV 与独立 fresh-C reference
+  **bit-identical**；C 的执行不改变仍 live 的 B（完整 state pre/post，
+  含关键 step C0）。
+- **reset 单序列隔离**：`reset_sequence(B)` **只清 B**（length = 0、
+  全部 page 释放、Delta slot 原地清零——逐字节验证）、live C 的 state
+  bit-identical。
+
+parity 纪律同 §23.3：runtime-vs-runtime，**一切比较 bit-exact**。
+
+### 24.2 Evidence（于 `V05C_EVIDENCE_SHA`，clean tree）
+
+- 完整 ctest **52/52 PASS、0 failed、0 skipped**（Phase C 门在
+  evidence 环境**真实运行**，非 77 skip）；
+- `scripts/check_no_torch.sh` **CLEAN**；
+- `compute-sanitizer --tool memcheck` 对 `test_qwen35_state_interleave`
+  （真实 checkpoint 全流程，34 次真实 forward）：**PASS + ERROR
+  SUMMARY: 0 errors**（原始日志：
+  `benchmarks/sanitizer_qwen35_state_interleave.txt`）。
+
+### 24.3 v0.5 终态（明说）
+
+**v0.5 Phase A / Phase B / Phase C 全部 DONE**，v0.5 Hybrid State
+Manager **DONE**。本阶段不 merge 进 main、不自启 v0.6 —— 待 external
+reviewer 签核。

@@ -958,3 +958,89 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
    batching / batched decode / chunked prefill / streaming /
    PagedAttention perf / CUDA Graph / NCU / fusion / HTTP-OpenAI
    server（见架构文档 §23.4）。待 external reviewer 签核。
+
+## CUDALM v0.5 Phase C（多序列交错硬门 + v0.5 最终签核）
+
+ - **承接**：v0.5 Phase A（state 控制面 + 设备 state 池，FROZEN）+
+   Phase B（external-state forward + paged KV kernel，FROZEN，
+   `V05B_EVIDENCE_SHA = a29b59610b39a0ad24fc6d79ce2c61088897330e`，
+   分支 `v0.5-state-manager`）。Phase C 证明 external-state runtime
+   在**多个 sequence 交错执行**时仍严格正确，并完成 v0.5 最终
+   sign-off。范围钉死：**单 model、单 CUDA stream、每 step 一次
+   `forward_token_with_state()`**，只有调用顺序在多个 SequenceId
+   之间交错（显式测试脚本，**非** scheduler）；**无** scheduler /
+   request queue / admission policy、**无** continuous batching /
+   batched decode / batched GEMV、**无** chunked prefill / streaming /
+   multi-CUDA-stream / CUDA Graph / NCU / kernel fusion /
+   HTTP-OpenAI API（均属 v0.6+）；**零** src/include 修改 —— 冻结
+   的 Phase B runtime 原样复用（本阶段仅新增测试 + 测试 CMake）。
+ - **新增测试（1 个，PASS；真实 Qwen3.5-0.8B-Base checkpoint；
+   ctest SKIP_RETURN_CODE 77 / TIMEOUT 1800；evidence 环境必须真实
+   跑，77 skip 不是签核）**：`test_qwen35_state_interleave`：
+   - token 流（全部跨 page_tokens=2 页边界）：A =
+     {1024, 2048, 3072, 4096, 5000, 6000}（6 tok → 3 page）、B =
+     {15, 16, 17, 18, 19}（5 tok → 3 page）、C = {7, 8, 9, 10, 11,
+     12}（6 tok → 3 page）；池 6 page（A+B 同时 live）、4 delta
+     slot；
+   - **独立 reference**（fresh manager、单序列独占）：每 step
+     24 层 final + final norm + **FULL logits[248320]**；终态 18 ×
+     DeltaNet conv（bf16）+ rec（fp32）+ 6 × 全注意力**逻辑行
+     K/V**（经块表从物理 page 读，无 host gather）+ length + 块表
+     形状；
+   - **交错运行**（一个 manager，A+B live，非平凡 schedule
+     `A0 B0 A1 A2 B1 A3 B2 A4 B3 A5 B4`）：**A 每步 == refA、B
+     每步 == refB**（runtime-vs-runtime，**BIT-IDENTICAL**，
+     atol=0 / memcmp）；终态 A/B hybrid state 分别 bit-identical；
+     A/B 物理 page 各自唯一且互斥；
+   - **跨序列隔离门**（关键 step 做**完整 hybrid state** pre/post，
+     不只 length/accounting）：A4 前捕获 B（len 3）→ forward A4 →
+     B bit-identical；B2 前捕获 A（len 4）→ forward B2 → A
+     bit-identical；
+   - **retire / 复用污染门**：`retire_sequence(A)` → A 的
+     SequenceId **永久 invalid**（lookup nullptr；advance /
+     ensure_kv_capacity 拒绝）、A 的 3 KV page + Delta slot 回收
+     （精确字节 accounting：used_state_bytes 恰降
+     3*bytes_per_page + bytes_per_slot）、B 的 state
+     bit-identical；`create_sequence(C)` → **C id != A id**（id 永
+     不发放两次），且 C **实际复用** A 释放的 Delta slot（同 slot
+     id）与 A 释放的 KV 物理 page（page id 集合相等 —— 池里只有
+     A 的 3 page 可分配）；C 从 fresh-zero state 跑完整 token 流：
+     每 step 24 层 final + norm + FULL logits + 终态 Delta state +
+     逻辑 KV 与独立 fresh-C reference **bit-identical**；C 的执行
+     不改变仍 live 的 B（完整 state pre/post，含关键 step C0）；
+   - **reset 单序列隔离**：`reset_sequence(B)` **只清 B**（length
+     = 0、全部 page 释放、Delta slot 原地清零 —— 18 ordinal 的
+     conv/rec 逐字节验证为零）、live C 的 state bit-identical。
+ - **完整 regression（于本 evidence SHA，clean tree）**：完整
+   ctest **52/52 PASS、0 failed、0 skipped**（含 v0.4 全部门面回归
+   + Phase A/B 全部硬门；interleave 门在 evidence 环境**真实运
+   行**，非 77 skip）；`scripts/check_no_torch.sh` **CLEAN**。
+ - **Sanitizer（于本 evidence SHA）**：Phase C **引入多序列交错
+   执行路径**（池分配/回收/复用在多序列间交错发生）：
+   `compute-sanitizer --tool memcheck`（RTX 2080 Ti / CUDA 11.8）
+   对 `test_qwen35_state_interleave`（真实 checkpoint 全流程，34
+   次真实 forward，含 retire/reuse + 全部 state capture 的
+   device→host 拷贝）：**PASS + ERROR SUMMARY: 0 errors**（原始
+   日志：`benchmarks/sanitizer_qwen35_state_interleave.txt`）。
+ - **evidence 绑定**：`V05C_EVIDENCE_SHA =
+   1054b69c4f72f3f0238361d5b5e5f5ab8463489c`（clean tree、
+   HEAD == SHA；完整 ctest 52/52 PASS 0 skipped + check_no_torch
+   CLEAN + interleave 门 compute-sanitizer memcheck 0 错误，均于该
+   SHA）。**失效声明（未删除历史）**：Phase C functional commit
+   修改了 `tests/` 与测试 CMake，按失效规则：**`V05B_EVIDENCE_SHA
+   = a29b59610b39a0ad24fc6d79ce2c61088897330e`（及其更早绑定
+   `79d1ac523e4d96a91e75c33b389487ceb37eb2fa`）失效**；更早的
+   **`V05A_EVIDENCE_SHA = 2319a261543e1af75f544a6a57592b0193074312`
+   （及其更早绑定 `866a2e46142f2a3a77deddf72809081eb58b47a1`）**
+   与 **`V04_EVIDENCE_SHA = 5aba21fe…`** 维持同规则失效 —— 其全部
+   门面回归已在本 SHA 的 52/52 内重跑全绿。失效规则延续：此后
+   任何 `src/` / `include/` / `tools/` / `tests/` / functional
+   CMake 修改 → 本 evidence 失效必须重跑；仅 docs/evidence 修改
+   不失效。
+ - **v0.5 终态（明说）**：**v0.5 Phase A / Phase B / Phase C 全部
+   DONE**，**v0.5 Hybrid State Manager DONE**（单序列 parity +
+   多序列交错 + 生命周期/复用污染全部 bit-exact 签核）。本阶段**不**
+   merge 进 main、**不**自启 v0.6（scheduler / admission /
+   continuous batching / batched decode / chunked prefill /
+   streaming / multi-stream / PagedAttention perf 均属 v0.6+，见
+   架构文档 §24）。待 external reviewer 签核。
