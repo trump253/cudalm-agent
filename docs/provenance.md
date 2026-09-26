@@ -572,3 +572,57 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
   tokenizer 与文本层均为纯 C++，运行时零 Python 依赖）。
 - v0.3 模型数学 / Qwen35Model/Generator 语义 / CUDA kernel / Phase A golden
   **零改动**（Phase A 场景 A/B + 污染门原样通过）。
+
+ ---
+
+## CUDALM v0.4 Phase C（基础 sampling + `cudalm-generate` CLI）
+
+ - **承接**：Phase B **DONE/FROZEN**（functional/evidence SHA
+   `0dc3b576d8171bedebe96d487cf83a59d5f98bef`）。tokenizer / NFC / BPE /
+   decode 语义**未动**（Phase C 只新增 sampling + CLI；`src/
+   runtime/qwen35_tokenizer*`、`tools/*tokenizer*` 零修改）。
+ - **新增 runtime 代码**：`include/cudalm/sampling.h`（SamplingConfig /
+   SplitMix64 / 纯流水线 / Sampler，CPU-only）、
+   `include/cudalm/generate_cli.h` + `src/cli/generate_cli.cpp`（CLI
+   参数解析，CPU-only）、`tools/cudalm_generate.cpp`（CLI 入口）。
+   既有文件的改动仅为**接线**：`qwen35_generator.{h,cpp}`（新
+   sampling overload；旧 greedy overload 委托共享 core +
+   `SamplingConfig::greedy()` —— 冻结路径本体）、`qwen35_text_
+   generator.{h,cpp}`（新 sampling overload，thin facade 不变）。
+ - **新增 CUDA runtime path = 0**：无新 kernel、无新 CUDA memory
+   分配、无新 stream 语义 —— sampler 作用在 generator 原本就 D2H 的
+   host logits 上。Phase A CUDA sanitizer 证据因此**可复用**；另在
+   Phase C 于本 SHA 对 `cudalm-generate` greedy 路径重跑
+   `compute-sanitizer --tool memcheck`（`--launch-timeout 900`，
+   RTX 2080 Ti / CUDA 11.8）：**0 错误**（记录：
+   `benchmarks/sanitizer_cudalm_generate.txt`）。
+ - **RNG**：SplitMix64（常量在 `sampling.h` 内完全指定 → 跨平台确定性）；
+   每请求一个实例（`Sampler` 随 generate() 新建），无全局随机状态；
+   greedy 零消耗。
+ - **测试（新增 4 个，全部 PASS）**：`test_sampling`（CPU synthetic
+   logits：greedy 兼容 / temperature / top-k / top-p / k+p 组合顺序 /
+   seed 复现 / 不同 seed / 非法 config / 极值与全负 logits / 精确 tie /
+   单一幸存者）；`test_qwen35_sampling`（real checkpoint：greedy EXACT、
+   seed 确定性、A(42)→B(123)→A(42) 污染门 id 级+text 级、forward-count
+   不变式、非法 config fail loud）；`test_generate_cli_args`（CPU 参数
+   解析全矩阵）；`test_cudalm_generate_cli`（真二进制：--help / 用法
+   错误 / 坏路径 / 非法 config / greedy / sampling 同 seed 逐字节相同 /
+   CJK prompt）。
+ - **Phase A/B evidence 不变**（完整 regression 于本 SHA 全 PASS：
+   **ctest 45/45 PASS、0 skipped**，见架构文档 §21.6）：Phase A
+   greedy generation golden（EXACT）、
+   repeat-generate 污染门、Phase B tokenizer exactness（1883/1883
+   corpus）、text-generation E2E（EXACT）、`tokenizers == 0.22.2`
+   provenance 门（converter selftest 内版本门回归）。tokenizer
+   **quick** differential validation 于本 SHA 0 mismatch（extended
+   百万级穷举未重做 —— Phase C 未修改 tokenizer 实现/工具，Phase B
+   extended evidence 仍绑定 `0dc3b576`）。
+ - **`scripts/check_no_torch.sh`**：CLEAN（新代码全部 PyTorch/
+   pybind-free）。
+ - **evidence 绑定**：`V04_EVIDENCE_SHA = a008b4373a94427695ebe0dafb7086468afd9c90`（clean tree、HEAD ==
+   SHA；完整 ctest + check_no_torch + quick tokenizer validation 于该
+   SHA）。失效规则同 Phase B：此后任何 `src/` / `include/` / `tools/` /
+   `tests/` / functional CMake 修改 → evidence 失效必须重跑；仅 docs
+   修改不失效（此时最终 HEAD ≠ evidence SHA）。
+ - **停止**：未 merge main；未宣布 v0.4 DONE/FROZEN —— 等待 external
+   reviewer 对 v0.4 最终 sign-off。

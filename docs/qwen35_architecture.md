@@ -1388,3 +1388,185 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
    Phase A `--gen-a/b-tokens` 不动）：文本经 pinned HF tokenizer 编码后走
    同一 pinned-quantized 生成 oracle，golden 额外携带 `gen.prompt_text` +
    `gen.hf_decoded` 两个 metadata 字段。
+
+ ---
+
+ ## 21. v0.4 Phase C —— 基础 sampling + `cudalm-generate` CLI
+
+ Phase B（tokenizer/prompt→text）**冻结**之后（functional/evidence SHA
+ `0dc3b576d8171bedebe96d487cf83a59d5f98bef`，DONE/FROZEN），Phase C 在
+ 其上增加：**基础 sampling**（greedy / temperature / top-k / top-p /
+ seed）+ **用户可用 CLI**（raw prompt → 生成 UTF-8 文本）。保持
+ single request + serial prefill/decode；不进入 v0.5 state manager /
+ v0.6 scheduler。tokenizer/NFC/BPE/decode 语义未动。
+
+ ### 21.1 Sampling API（`include/cudalm/sampling.h`，CPU-only）
+
+ ```cpp
+ struct SamplingConfig {
+   float temperature = 0.0f;   // <=0 -> 冻结 greedy 路径; >0 -> sampling
+   int   top_k = 0;            // <=0 -> 不启用; >vocab_size -> clamp 到 vocab
+   float top_p = 1.0f;         // (0,1]; 1.0 -> 不启用
+   std::uint64_t seed = 0;     // 每请求 RNG 种子（greedy 不消耗 RNG）
+ };
+ ```
+
+ - **greedy**：`temperature <= 0`（或 `SamplingConfig::greedy()`）走**冻结
+   的 Phase A `argmax_bf16`**（数值最大 BF16 logit；tie → 最小 id），
+   bit-for-bit，**零 RNG 消耗**。greedy config 即使携带 top-k/top-p 字段
+   也是 greedy 路径（`is_greedy()` 只看 temperature）。
+ - **固定流水线顺序**（与调用顺序无关，sampling 模式）：
+   `temperature → top-k → top-p → normalize → sample`。
+   1. **temperature**：`f[i] = logits[i] / temperature`（T > 0；非法值
+      fail loud，见下）。
+   2. **top-k**：只留概率最高的 k 个（`top_k <= 0` 不启用；
+      **`top_k > vocab_size` clamp 到 vocab_size**（已测试并文档化）；
+      值相同（tie）时**最小 token id** 占名额）。
+   3. **top-p**：在 **top-k 幸存者**上按概率从高到低（tie → 最小 id），
+      保留 cumulative probability 达到 top_p 的**最小前缀**（`top_p == 1`
+      不裁剪；**至少保留 1 个** token）。
+   4. **normalize**：`p[i] = exp(f[i] - max_f) / sum_survivors` ——
+      **先减 max 再 exp**（数值稳定，无 overflow）；被排除 token p == 0。
+   5. **sample**：单次 RNG 抽取 u ∈ [0,1)，按 token id 升序走 cumulative，
+      首个 `u < cum` 者胜；u 落在尾部舍入缝隙时取**最后一个**幸存者。
+ - **fail loud（单一校验门 `validate_sampling_config`）**：temperature
+   NaN/inf、`top_k < 0`、top_p NaN/≤0/>1 → 拒绝（generator 层面：
+   ok == false + error，**不 forward 任何 token**）。temperature ≤ 0
+   合法（= greedy）。
+ - **组合顺序证明**：CPU 门里有一个 k-then-p 与 p-alone 存活集合**不同**
+   的用例（5 个 3.0 平手 + 1 个 0.0：top-k=2 + top-p=0.8 留 {0,1}；
+   单独 top-p=0.8 留 {0..4}）——顺序是钉死的，不是隐式的。
+
+ ### 21.2 RNG / 确定性（每请求，无全局随机状态）
+
+ - 生成器：**SplitMix64**（常量与运算在 `sampling.h` 中完全指定，跨平台/
+   跨编译器确定性）；`next_double()` = 高 53 位 × 2^-53 ∈ [0,1)。
+ - `Sampler` 对象**每 generate() 新建**，seed 来自请求 config —— 上一
+   请求消耗的 RNG 状态**不可能**污染下一次请求（Phase A/B state
+   contamination 纪律在 sampler 上的延伸）。
+ - 语义：**相同 (prompt, sampling config, seed, model) → 完全相同 token
+   序列**；不同 seed 产生不同 sampling stream（synthetic-logits 单测
+   证明：16 个 seed 的首 token 覆盖全部 4 个候选；8192 次抽取均匀在
+   [20%,30%] 内）。
+ - greedy 路径**不消耗 RNG**（状态不变，单测断言）。
+
+ ### 21.3 Generator / TextGenerator 集成
+
+ - `Qwen35Generator::generate(prompt, max_new, eos, stream,
+   SamplingConfig, observer)`（新重载）；**旧 greedy API 原样保留**。
+   两个 overload 共享一个 request core；greedy overload 传
+   `SamplingConfig::greedy()` —— 即冻结路径本体（**generated ids /
+   stop reason / forward count 完全一致**，有集成门）。EOS /
+   max_new_tokens / max_seq_len 语义与 position 语义不变；仍然禁止
+   re-forward last prompt token；forward-count 不变式
+   `= prompt_len + generated - 1` 对 sampling 同样成立。
+ - `Qwen35TextGenerator::generate_text(prompt, max_new, SamplingConfig,
+   stream)`（新重载）：**仍为 thin facade**（encode → generate →
+   decode 三行缝合），不复制任何 sampler/generation 逻辑；旧 greedy
+   overload 委托新 overload + greedy config。
+ - 新增 **CUDA runtime path = 0**：sampler 是纯 CPU（作用在 generator
+   原本就 D2H 的 host logits 上）；没有新 kernel / 新 CUDA memory 分配 /
+   新 stream 语义 —— Phase A CUDA sanitizer 证据可复用（见 §21.6）。
+
+ ### 21.4 `cudalm-generate` CLI（`tools/cudalm_generate.cpp`）
+
+ ```bash
+ ./build/cudalm-generate \
+   --model build/data/qwen35_08b_full.cudalm \
+   --tokenizer build/data/qwen35_tokenizer.cudaltk \
+   --prompt "The capital of France is" \
+   --max-new-tokens 32 --temperature 0.8 --top-k 40 --top-p 0.95 --seed 42
+ ```
+
+ - 参数：`--model` / `--tokenizer` / `--prompt`（必填）；
+   `--max-new-tokens`（默认 64）；`--temperature` / `--top-k` /
+   `--top-p` / `--seed`（可选）；`--greedy`（显式关闭 sampling，与
+   sampling 参数互斥）；`--help`/`-h`。
+ - **模式解析**：默认 greedy；出现任一 `--temperature`/`--top-k`/
+   `--top-p` → sampling（未显式给 `--temperature` 时默认 1.0；
+   `--temperature 0` → 冻结 greedy 路径）；`--seed` 单独出现**不**
+   启用 sampling（greedy 不消耗 RNG，seed 被忽略）。
+ - 输出：成功时 stdout **只有生成的文本**（正常模式不打印 logits /
+   debug tensor）；错误走 stderr。
+ - **exit code**：0 成功；1 运行时失败（model load failure /
+   tokenizer load failure / 生成契约违规，如 empty prompt、prompt 超
+   max_seq_len）；2 用法错误（缺参 / 坏参数 / 非法 sampling config，
+   在**任何 CUDA 工作之前**失败）。
+ - 参数解析是独立可测逻辑（`include/cudalm/generate_cli.h` +
+   `src/cli/generate_cli.cpp`，CPU-only），CLI smoke 测试在其上跑真
+   二进制。
+
+ ### 21.5 测试门
+
+ - `test_sampling`（CPU，synthetic logits，数学钉死）：greedy 兼容
+   （== 冻结 argmax、零 RNG）；temperature scaling（== softmax(logits/T)
+   fp32/double 对照）；top-k（含 tie → 最小 id、>vocab clamp）；top-p
+   （最小前缀、≥1 保留、1.0 禁用）；k+p 组合（顺序证明）；seed 复现；
+   不同 seed 不同 stream + 均匀性；非法 config（单一门 fail loud）；
+   极值 logits（1000/1000 量级，max 相减无 overflow）/ 全负 logits；
+   精确 tie（greedy 最小 id、sampling 均匀、k=1 钉死）；单一幸存者
+   （top_k=1 任意 seed 都 = argmax）。
+ - `test_qwen35_sampling`（real checkpoint，self-skip 77）：greedy
+   EXACT（旧 API == greedy-config 新 API == temperature-0 带字段 config，
+   ids/stop/forward 全同）；seed 确定性（A(42) == A(42)）；
+   **request 级污染门 A(42) → B(123) → A(42)**（id 级 + text 级，
+   generated ids/text/stop/forward 全 EXACT —— model state reset +
+   sampler RNG reset 都无跨请求污染）；sampling 健全性（id ∈ vocab、
+   forward-count 不变式）；非法 config fail loud 且不 forward。
+ - `test_generate_cli_args`（CPU）：--help / 缺必填 / 缺值 / 未知参数 /
+   坏数值（含溢出、部分消费）/ 模式解析 / `--greedy` 互斥 /
+   解析后 config 过单一校验门。
+ - `test_cudalm_generate_cli`（真二进制 fork/exec，无 shell，CJK 原样
+   传递）：--help；用法错误 exit 2 + 信息；坏 model/tokenizer 路径
+   exit 1 + 信息；非法 sampling config exit 2；greedy 路径 exit 0 +
+   非空文本；sampling 路径 exit 0 + **同 seed 两次 stdout 逐字节相同**；
+   UTF-8（CJK）prompt exit 0 + 非空。
+
+ ### 21.6 v0.4 最终 evidence（Phase C 完成）
+
+ **Phase C / v0.4 functional evidence executed on:**
+ `V04_EVIDENCE_SHA = a008b4373a94427695ebe0dafb7086468afd9c90`（工作树干净、HEAD == 该 SHA）。
+
+ **失效规则**：此后任何对 `src/`、`include/`、`tools/`、`tests/` 或
+ functional CMake 配置的修改都使该 evidence **失效**，必须整套重跑；
+ 仅 docs 修改不使其失效（此时注明最终 HEAD 与 evidence SHA 不同）。
+ 若 Phase C 之后任何人修改了**冻结的 tokenizer 语义**（§18/§20），
+ 必须停止并报告，而不是继续。
+
+ 证据内容（于该 SHA，全部真实执行）：
+ - **完整 ctest：45/45 PASS，0 failed，0 skipped**（含 Phase A/B 全部
+   既有门：`test_qwen35_generation` greedy golden EXACT、
+   `test_qwen35_generation_contract`、`test_qwen35_text_generation`
+   E2E EXACT、`test_qwen35_tokenizer` 1883/1883 corpus、
+   `test_qwen35_tokenizer_python_selftest`（含 `tokenizers == 0.22.2`
+   版本门回归）；新增 `test_sampling` / `test_qwen35_sampling` /
+   `test_generate_cli_args` / `test_cudalm_generate_cli` 全 PASS）。
+ - **`scripts/check_no_torch.sh`：CLEAN**（`forbidden_deps_check`
+   亦在 ctest 内 PASS）。
+ - **tokenizer quick differential validation：14 pass 全 0 mismatch**
+   （regressions 26、ws_battery 400、nfc_single/enc_single 各
+   69,504、class_probe 208,512、decomp_cp(+enc) 各 13,232、
+   comp_pair 各 3,030、nfc_fuzz 20,000/seed 777、adjacency 5,000/
+   seed 20260925、enc_fuzz 10,000/seed 42、pretok_fuzz 10,000/seed
+   999、dec_fuzz 4,000/seed 20250417；脚本自报
+   `head=a008b437…`）。Phase C 未修改 tokenizer 实现/工具，extended
+   百万级穷举不需要重做，Phase B extended evidence 仍绑定
+   `0dc3b576`。
+ - **新 CUDA runtime path = 0**（sampler 纯 CPU，无新 kernel/
+   分配/stream 语义）：Phase A CUDA sanitizer 证据**复用**，并于
+   该 SHA 对 `cudalm-generate` greedy 路径（真实 model 加载 +
+   serial prefill + 16 decode + 每步全量 logits D2H + decode）
+   **重跑 compute-sanitizer：0 错误**（记录：
+   `benchmarks/sanitizer_cudalm_generate.txt`）。
+
+ ### 21.7 当前限制（v0.4 边界，明说）
+
+ single request / serial prefill（token-by-token，correctness-first
+ 基线，**非**性能声明）；**无** streaming、**无** chat template /
+ 会话历史、**无** batching / chunked prefill、**无** multi-request /
+ scheduler / continuous batching、**无** Paged KV / state pool、**无**
+ beam search / repetition & frequency & presence penalty / typical /
+ min-p / speculative decoding、**无** HTTP server / OpenAI API、**无**
+ NCU / CUDA Graph / kernel fusion / 性能调优。**不是** production
+ serving engine —— 是 v0.4 的 correctness-first 单请求生成核 +
+ 最小采样 + 一个真实可用的 CLI。

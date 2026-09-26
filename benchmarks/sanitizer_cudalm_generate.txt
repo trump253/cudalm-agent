@@ -1,0 +1,31 @@
+# compute-sanitizer memcheck — CUDALM v0.4 Phase C (cudalm-generate CLI:
+# the ONLY new user-facing executable; new CUDA runtime path = 0)
+#
+# Host: RTX 2080 Ti (sm_75), CUDA 11.8, single device (CUDA_VISIBLE_DEVICES=0)
+# Tool: /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck --launch-timeout 900
+# git: a008b4373a94427695ebe0dafb7086468afd9c90   # V04_EVIDENCE_SHA (clean worktree)
+#
+# Scope: the Phase C sampling work adds NO new CUDA kernel, NO new CUDA
+# memory allocation and NO new stream semantics — the sampler is pure CPU
+# over the host logits the generator already D2H's each step (docs §21.3).
+# This run nonetheless covers the full user-facing CLI path end to end:
+#   * model load (CUDALMW02 -> Qwen35Model, 509 MB tied embedding) +
+#     tokenizer load (CUDLMTK1);
+#   * native encode of the raw UTF-8 prompt;
+#   * SERIAL prefill (positions 0..5) + 16 greedy decode steps (the frozen
+#     Phase A path — the greedy CLI mode is bit-for-bit that path);
+#   * per-step FULL logits [248320] D2H every step (greedy argmax reads it);
+#   * native decode of the generated ids; stream destroy.
+#
+#   $ CUDA_VISIBLE_DEVICES=0 /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck \
+#       --launch-timeout 900 \
+#       build/cudalm-generate \
+#       --model build/data/qwen35_08b_full.cudalm \
+#       --tokenizer build/data/qwen35_tokenizer.cudaltk \
+#       --prompt "The capital of France is" --max-new-tokens 16 --greedy
+#
+# Result:
+ located in the northern part of the country.
+A. True
+B.
+========= ERROR SUMMARY: 0 errors

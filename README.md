@@ -232,3 +232,67 @@ Qwen35 KV cache、`Qwen35FullAttentionLayer`。W4A16 权重契约不变
 **停止（STOP）。** 按交接简报要求，Phase B（Full Attention）完成后停止，
 **不自动进入 Phase C（DeltaNet）**。下一阶段（未开始）：Phase C
 `Qwen35DeltaNetLayer` + state 转移硬门；Phase D 4 层混合 micro-stack。
+
+ ---
+
+## v0.4：文本生成（`cudalm-generate` CLI）
+
+v0.4（Phase A/B/C，分支 `v0.4-generation`）在 Qwen3.5-0.8B 上提供
+**single-request、serial prefill** 的 token 级生成：原生 tokenizer
+（prompt → ids → 文本，oracle-exact）+ 生成核（greedy 为 Phase A/B
+冻结路径；Phase C 增加基础 sampling）+ 一个真实可用的 native CLI。
+**不是** production serving engine（无 streaming / chat template /
+batching / scheduler / Paged KV —— 见下"当前限制"）。
+
+### 用法
+
+```bash
+cmake -S . -B build && cmake --build build -j
+
+./build/cudalm-generate \
+  --model build/data/qwen35_08b_full.cudalm \
+  --tokenizer build/data/qwen35_tokenizer.cudaltk \
+  --prompt "The capital of France is" \
+  --max-new-tokens 32 \
+  --temperature 0.8 \
+  --top-k 40 \
+  --top-p 0.95 \
+  --seed 42
+```
+
+- 成功：stdout **只有生成的文本**；错误：stderr + 非零退出
+  （1 = 运行时失败：model/tokenizer 加载、生成契约；
+  2 = 用法错误：缺参 / 坏参数 / 非法 sampling config）。
+- 模式：默认 **greedy**（冻结 Phase A 路径，bit-for-bit）；
+  `--temperature` / `--top-k` / `--top-p` 任一出现 → sampling
+  （未显式给 `--temperature` 时默认 1.0）；`--greedy` 显式关闭
+  sampling（与 sampling 参数互斥）；`--seed` 只在 sampling 模式生效
+  （相同 prompt + config + seed → 完全相同输出）。
+- `--help` 打印完整用法。
+
+### Sampling 语义（摘要）
+
+固定流水线 `temperature → top-k → top-p → normalize → sample`：
+`logits/T`；top-k 留最高的 k 个（`>vocab` 时 clamp 到 vocab，tie →
+最小 id）；top-p 在 k 幸存者上保留 cumulative 概率达到 p 的最小前缀
+（≥1 个）；softmax 先减 max（数值稳定）。详见
+`docs/qwen35_architecture.md` §21。
+
+### 当前限制（v0.4 边界）
+
+single request / serial prefill（correctness-first，非性能声明）；
+无 streaming、无 chat template / 会话历史、无 batching / chunked
+prefill、无 multi-request / scheduler / continuous batching、无
+Paged KV / state pool、无 beam search / repetition / frequency /
+presence penalty / typical / min-p / speculative decoding、无 HTTP
+server / OpenAI API、无 NCU / CUDA Graph / kernel fusion / 性能调优。
+后续阶段（v0.5+）再进入。
+
+### v0.4 最终 evidence
+
+`V04_EVIDENCE_SHA = a008b4373a94427695ebe0dafb7086468afd9c90` —— 完整 ctest + `scripts/check_no_torch.sh`
++ tokenizer quick differential validation 于该 SHA（clean tree、
+HEAD == SHA）执行；失效规则：此后任何 `src/`/`include/`/`tools/`/
+`tests/`/functional CMake 修改 → evidence 失效必须重跑（仅 docs 不
+失效）。细节见 `docs/qwen35_architecture.md` §21.6 与
+`docs/provenance.md`（v0.4 Phase C）。
