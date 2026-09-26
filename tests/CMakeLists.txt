@@ -131,6 +131,31 @@ else()
   set(CUDALM_TOOL_PY_ROI_OK 1)
 endif()
 
+# v0.5 Phase C: multi-sequence INTERLEAVED external-state hard gate (real
+# checkpoint) — the v0.5 final sign-off test. Single model, single CUDA
+# stream, one forward_token_with_state per step; the call order interleaves
+# SequenceIds (no scheduler). Gates: A (6 tok) + B (5 tok) interleaved
+# (A0 B0 A1 A2 B1 A3 B2 A4 B3 A5 B4) vs INDEPENDENT fresh-manager
+# references — per step 24 layer finals + final norm + FULL logits and
+# final hybrid state (18x delta conv/rec + 6x logical KV rows) BIT-IDENTICAL;
+# cross-sequence ISOLATION (full hybrid state pre/post a key A and B step);
+# RETIRE/reuse (A's id permanently invalid, A's 3 pages + delta slot
+# reclaimed, B unchanged; C reuses A's slot + pages with a FRESH id and
+# matches the fresh-C reference from fresh-zero state, B still unchanged);
+# RESET-ONE-SEQUENCE isolation (reset B clears only B, live C unchanged).
+# Self-skips (77) when the checkpoint is absent; the Phase C evidence
+# environment MUST actually run it.
+add_executable(test_qwen35_state_interleave cuda/test_qwen35_state_interleave.cpp)
+target_link_libraries(test_qwen35_state_interleave PRIVATE cudalm)
+add_test(NAME test_qwen35_state_interleave
+         COMMAND test_qwen35_state_interleave
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_state_interleave PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 if(CUDALM_PYTHON3)
   set(CUDALM_CROSSLANG_WEIGHTS ${CMAKE_BINARY_DIR}/data/block_v01.cudalm)
 
