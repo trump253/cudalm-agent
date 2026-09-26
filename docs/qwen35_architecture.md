@@ -1004,3 +1004,615 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
     CUDA 分配生命周期）；
   - `benchmarks/sanitizer_bf16_gemv.txt`（覆盖 **bf16_gemv vec4 路径 + scalar
     回退（K%8!=0 及错位）**）。
+
+ ## 19. v0.4 Phase A —— token-ID 级单请求 serial prefill + 贪心 decode 生成核
+
+ 范围 = **token-ID 级单请求生成**（`prompt_token_ids + max_new_tokens +
+ eos_token_id → generated_token_ids + stop_reason`），correctness bring-up：
+ serial prefill（正确性优先，**不** batched/chunked）+ 贪心 decode（greedy
+ only）。**不做** tokenizer / prompt 字符串 / detokenizer / sampling /
+ temperature / top-k / top-p / repetition penalty / beam / batched-chunked
+ prefill / Paged KV / multi-request / scheduler / continuous batching / NCU /
+ kernel fusion / CUDA Graph / 性能优化。serial prefill 的速度**不是**最终性能
+ 数字（本 phase 不 benchmark）。
+
+ ### 19.1 生成核契约（`include/cudalm/qwen35_generator.h` +
+ `src/runtime/qwen35_generator.cpp`）
+
+ - **接口**：`Qwen35Generator::generate(const std::vector<int>& prompt_tokens,
+   int max_new_tokens, int eos_token_id, cudaStream_t stream,
+   const LogitsObserver* = nullptr) → GenerationResult`。`GenerationResult`
+   = `{ok, error, prompt_count, generated_token_ids, stop_reason,
+   forward_count}`。generator 持 **非 const** `Qwen35Model&`（模型自身持久
+   状态 in-place 线程化整条序列）。
+ - **生命周期（钉死）**：每次 `generate()` 开头 **`reset_state()` 一次**；
+   **serial prefill** `forward_token(t_i, i)` for i=0..N-1（**故意** serial，
+   正确性优先，不 batched/chunked）；prefill 最后一个 token 的 logits 预测
+   position N；**greedy decode**：`next = argmax(prefill-last logits)` →
+   position N，放置 `next`；若不 stop 则 `forward_token(next, N+step)` →
+   position N+step+1，再 `argmax`。**禁止**：重 forward prompt 末 token、
+   position off-by-one、decode 前再 reset、golden 状态回填 runtime。
+ - **position 守卫**：`position_of(step) = prompt_len + step`；每个 decode
+   forward 前守卫 `position_of(step) < max_seq_len`（**绝不**以
+   `position >= max_seq_len` 调 `forward_token`）。
+ - **贪心 argmax（CPU，`include/cudalm/greedy.h`）**：`argmax_bf16` **最大化
+   bf16 数值 logit**，**tie → 最小 token id**；**不**用 CUDA argmax/reduction
+   kernel（Phase A 正确性优先：D2H 全 [248320] bf16 logits → CPU argmax）。
+ - **EOS/stop 控制器（确定性，`greedy.h::GreedyStopController`）**：
+   **EOS 选中 → 立即 stop**（该 token **在** `generated_token_ids` 里、**不**
+   再 forward）；否则 `step+1 >= max_new_tokens` → stop；否则可继续；
+   `max_seq_len` 由 position 守卫触发（`position_of(step) >= max_seq_len`）。
+   同一步 EOS **优先于** max_new_tokens。
+ - **容量契约（loudly fail）**：空 prompt / 非法 token id / 非法 eos（不在
+   `[0, vocab)`）/ `max_new_tokens < 0` / `prompt_len > max_seq_len`。
+   `max_new_tokens == 0` → 空生成、不 decode（文档化）。
+ - **forward_count 语义**：= prefill N + decode forward 次数。EOS 在 step k →
+   decode forward = k（EOS 不 forward）；max_new_tokens（G token）→ decode
+   forward = G-1（末 token 不 forward）；max_seq_len（G_avail token）→ decode
+   forward = G_avail。等于 oracle 的 `t_used`。
+
+ ### 19.2 生成级 golden oracle（pinned quantized，
+ `tools/generate_qwen35_golden.py --gen-prefix`）
+
+ - **pinned quantized oracle**：复用 §18 的全模型 oracle（同一份 `.cudalm v2`
+   W4A16 权重 + tied BF16 embedding + 18× DeltaNet / 6× FullAttention 层 +
+   pinned `Qwen3_5RMSNorm` + tied LM head = `normed @ embedding^T`）。
+ - **serial prefill + greedy decode 镜像 C++ 循环**：同一 reset、同一 position
+   守卫、同一 argmax 契约（bf16 数值 max、tie→最小 id，`torch.argmax` on bf16）、
+   同一 stop 顺序、stop token 不 forward、**不回填 golden 状态**。
+ - **输出 CUDLMW02 容器**（C++ `WeightFileV2::load` 可载）：metadata = 生成
+   token 序列 + stop_reason + `t_used`；张量 = **每个生成步的全 [248320] bf16
+   logits**（`gen.logits.t{k}`，预测 `generated[k]`）+（场景 B）**最终持久
+   状态**（18× DeltaNet conv bf16 [6144,3] + recurrent fp32 [16,128,128]；
+   6× FullAttention K/V used rows bf16 [kv, t_used, 256]）。
+ - **confident prompt（钉死）**：oracle 的 top-1 vs top-2 logit gap 在**每个**
+   生成步都需**显著高于** runtime/oracle bf16-logits 舍入（~0.13），贪心序列
+   才是**稳定 golden**（near-tie 会让 ~0.13 舍入翻转 argmax → 两 runtime 选
+   不同 token → 序列分叉）。`tools/diag_gen_gaps.py` 测逐步 gap；选定 prompt
+   min gap **1.0625**（A=[1024,2048,3072]）/ **3.625**（B=[1024,2048,3072]×5+
+   [1024]）。
+ - **收紧的 per-step / per-layer envelope**：比较阈值**不**用共享 atol，而是
+   每步 / 每层独立 envelope = `实测 worst × 1.3 + floor`（**不让**某个 late
+   layer / worst step 放宽其他 step/layer）。**BF16 与 FP32 状态用不同
+   floor**：per-step 全 logits + DeltaNet conv + FullAttention KV（均 BF16）
+   用 `+ 0.01`；DeltaNet **recurrent（FP32）** 用 `+ 0.001`（其 chain 更紧，
+   实测 worst ~0.033，远低于 0.01 floor）。envelope：per-step 全 logits（A 8
+   步 / B 16 步各自）+ per-layer DeltaNet conv / recurrent / FullAttention KV
+   （B 最终状态：18× conv/recurrent + 6× KV，非适用层为 0）。实测 worst
+   （pinned oracle，RTX 2080 Ti）：per-step logits ≤ 0.5625（A t4）、
+   conv ≤ 0.15625（L17）、recurrent ≤ 0.0326（L20，**非** 0.5）、KV ≤ 0.1875
+   （L11 K）。每次运行 compare 打印 max_abs，可重新收紧到实测误差（非猜值）。
+
+ ### 19.3 测试与签核证据
+
+ - **`test_greedy_argmax`**（CPU，无 checkpoint）：argmax（normal / negative /
+   exact tie→最小 id / single / bf16-rounding tie）。
+ - **`test_greedy_stop`**（CPU，无 checkpoint）：确定性控制器（eos /
+   max_new_tokens / max_seq_len / 末 token eos 优先）。
+ - **`test_qwen35_generation`**（real checkpoint，self-skip 77）：场景 A（短
+   confident prompt，8 token）+ B（长 confident prompt，16 token，最终状态）+
+   C（repeat-generate 污染门，**强化**：两次 `generate()` 用 `LogitsObserver`
+   抓 **EVERY 生成步全 [248320] logits** 逐 step **原始字节（memcmp）bit-exact** 比较（**非**仅数值相等，`+0/-0`
+   等 bit 不同也 FAIL），证明第二次
+   reset 后数值轨迹与第一次相同，而非仅 greedy token 恰好没变）。比较 **EVERY
+   生成 token id** + **EVERY 生成步全 [248320] logits**（per-step envelope）+
+   stop_reason + forward_count（== t_used）+（B）最终混合持久状态（18× DeltaNet
+   conv/recurrent + 6× FA K/V used rows，per-layer envelope）。
+ - **`test_qwen35_generation_contract`**（real checkpoint，self-skip 77）：生成核
+   **输入契约** hardening —— `not_loaded` / 空 prompt / 非法 token id（<0 与
+   ≥vocab）/ 非法 eos（<0 与 ≥vocab）/ `max_new_tokens < 0` /
+   `prompt_len > max_seq_len` 全部 → `ok == false` + generated 空 +
+   `forward_count == 0`（无 prefill/decode、无状态变更）；`max_new_tokens == 0`
+   → `ok == true` + 空生成 + stop=max_new_tokens + prefill 已跑（forward_count
+   == prompt_len）但**不** decode。不扩大 API（只驱动现有 `generate()`）。
+ - 签核（RTX 2080 Ti / CUDA 11.8）：完整 ctest **38/38 PASS**；
+   `check_no_torch.sh` **CLEAN**；`compute-sanitizer --tool memcheck` **0 错误**
+   （`benchmarks/sanitizer_qwen35_generation.txt`，`--no-gen` CUDA-only，覆盖
+   multi-token prompt + multi-step greedy decode：真实 prefill/decode 状态转换 +
+   重复 tied-LM-head GEMV + KV history 增长 + DeltaNet recurrent 更新 + 最终
+   状态读回）。
+
+ ## 20. v0.4 Phase B —— 原生 tokenizer + prompt→text（钉死，来自 pinned 官方源）
+
+ 范围 = **raw UTF-8 prompt → token id → 生成 → token id → raw UTF-8 text** 的
+ 全链路原生（PyTorch-free）实现：
+
+ ```
+ raw UTF-8 prompt
+   -> Qwen35Tokenizer::encode      （NFC → added-token 切分 → 左优先正则
+                                    预分词 → ByteLevel BPE）
+   -> Qwen35Generator::generate    （§19 冻结生成核；EOS = 真实 tokenizer
+                                    EOS 248044，**非** Phase A 哨兵 248319）
+   -> Qwen35Tokenizer::decode      （ids → 完整字节流：base 原始字节 /
+                                    added 字面量 / padding 丢弃；再对**整个**
+                                    字节流做一次有损 UTF-8 转换 —— 每个最大
+                                    非法子段 → 一个 U+FFFD；合法的跨 token
+                                    多字节字符仍按一个字符解出）
+   -> raw UTF-8 生成文本（恒为合法 UTF-8）
+ ```
+
+ `Qwen35TextGenerator`（`include/cudalm/qwen35_text_generator.h`）是**纯
+ 拼接层**（thin facade）：encode → generate → decode 三行缝合，**不**新增任何
+ 模型状态 / 生成逻辑 / sampling / chat-template / streaming / batching ——
+ 每一字节输入输出都由既有硬门覆盖（tokenizer 语料门 + 生成 golden 门）。
+
+ ### 20.1 官方源钉死（pinned，只取 tokenizer 文件，**不**下载权重）
+
+ - 仓库 `Qwen/Qwen3.5-0.8B-Base` @ revision
+   `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68`（与 §1 同一 pinned 源）。
+ - 本地已下载于 `/root/models/Qwen3.5-0.8B-Base/tokenizer/`，4 个文件 sha256
+   钉死（`tools/common/qwen35_tokenizer_ref.py` 的 `EXPECTED_SHA256`，读取
+   前强制校验）：
+
+   | 文件 | sha256 |
+   |---|---|
+   | `tokenizer.json` | `fe000e3ed39ed12b8d2481d527d44f93c65d37e87645d2dcc80d1bf9d50d2927` |
+   | `tokenizer_config.json` | `e611fbccc7c29ef3b1cafb1cb7ea548d189968632901d678fd62be68c47885de` |
+   | `vocab.json` | `ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003` |
+   | `merges.txt` | `a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d` |
+
+ - **oracle 版本（pinned + 版本门）**：主 oracle = 本地 venv
+   （py3.11.16）`tokenizers 0.22.2`（Rust 引擎，pinned 语义）。版本在
+   `tools/common/qwen35_tokenizer_ref.py` 中钉死：
+   `EXPECTED_TOKENIZERS_VERSION = "0.22.2"` + `check_oracle_version()`；
+   `build_tokenizer()` 在任何引擎调用**之前**跑该门，因此**所有
+   authoritative oracle 路径**（converter、语料生成、differential
+   validator、text golden）都经过同一个检查。实际版本 ≠ 0.22.2 =
+   **provenance violation，fail loud，不可 skip**（资产缺失仍按既有
+   规则 self-skip 77 —— 二者不同）；converter `--selftest` 含版本门
+   回归（0.22.2 接受；0.15.1 / 0.22.3 / None 拒绝）。系统
+   `tokenizers 0.15.1` **不是**可接受 oracle（无 silent fallback）。
+   **pinned `tokenizer.json` 含 `"normalizer": {"type": "NFC"}`** ——
+   引擎在预分词前对输入做 NFC，encode 的可观测行为包含 NFC。
+ - **Unicode 数据口径（BLOCKER-D1/D2 —— 已解决）**：converter 的
+   Unicode 表**不再**来自构建机 Python `unicodedata`（本机 U14，与引擎
+   数据版本不一致 —— 上一轮上报 BLOCKER-D1 的根因）。现口径（全部
+   sha256 钉死、离线可复现、无网络）：
+   - **normalizer 子系统（ccc/分解/合成）= Unicode 9.0.0** —— pinned
+     引擎的真实数据版本（`unicode-normalization-alignments` 0.1.12
+     crate 常量 `UNICODE_VERSION=(9,0,0)`，全表行为实证一致）。数据源
+     = `tools/ucd/UnicodeData-9.0.0.txt`（sha256
+     `68dfc414d28257b9b5d6ddbb8b466c768c00ebdf6cbf7784364a9b6cad55ee8f`，
+     unicode.org 官方 U9 UCD；`tools/common/qwen35_unicode_ref.py`
+     读取前强制校验 sha，含 UCD range 记法展开）。合成对由 U9 完全
+     分解流推导，且**每个 (x,y)→z 构建时逐一过 pinned 引擎
+     `normalizer.normalize_str` 验证**（引擎 = 构建期 oracle；Python
+     U14 在此不可用 —— 它对 98 个 ccc 差异 cp 与 Divès Akuru 对的
+     行为就是 U14 行为）。
+   - **regex 类子系统（\pL/\pN/\pM）= Unicode 16.0.0** —— pinned
+     regex 引擎（tokenizers `regex = "1.10"`）的真实数据版本，由
+     **全 1,112,064 非代理 cp 逐 cp chunking 探测**实证（`"a"+cp` /
+     `"a"+cp+"b"` / `cp+cp+"x"` 三探针 vs 引擎
+     `pre_tokenize_str`）：L∪M == U16 UCD 恰（143,529 cp）、N == U16
+     UCD 恰（1,911 cp）。数据源 = `tools/ucd/UnicodeData-16.0.0.txt`
+     （sha256 `ff58e5823bd095166564a006e47d111130813dcf8bf234ef79fa51a870edb48f`）。
+     旧 U14 L/N/M 区间对 ~5k 个 U15/U16 新增 cp 分类错误（预分词阶段
+     可观测；id 级恰因稀有文字无跨边界 BPE 合并而侥幸一致 —— 语料
+     P 行 + 逐 cp 探测是真正闸门）。
+   - **\s = UAX #44 White_Space，恰 25 个 cp**（09-0D/20/85/**A0**/
+     1680/2000-200A/2028/2029/202F/205F/3000），逐 cp 实证。**U+00A0
+     已含**（BLOCKER-D2 修复）。
+   - 引擎 vs Python `unicodedata`（U14）的**全部**差异 = 上述数据版本
+     差：恰 98 个 ccc 差异 cp（U14 ccc>0、U9 ccc=0，如 U+1715）+
+     Divès Akuru 对 (U+11935,U+11930)↔U+11938（U13 新增，U9 中原子）。
+     **算法本身无差异**：200k 样本（seed 20260925）NFC 差分 +
+     针对性 ccc/合成 battery，引擎与 Python 算法层面 100% 一致（0
+     未解释发散）。上一轮文档中“Python 给 `U+0391 U+093C U+0301`”
+     的示例系**测量错误**（Python 实测 `U+0386 U+093C`，与引擎相同），
+     已删除；不声称任何算法级语义差异（未观察到，亦无证据）。
+ - 词汇结构（钉死）：base BPE 词汇 **248044**（id 0..248043，GPT-2 byte
+   map：33..126/161..172/174..255 自映射，其余 68 字节 → U+0100..U+0143）；
+   added token **33** 个（id 248044..248076 = `tokenizer.json` added_tokens
+   与 `tokenizer_config.json` 的并集、config 优先；其中 **21 special +
+   12 non-special**）；**padding id 248077..248319**（model vocab 248320）
+   decode → `""`（HF/Rust 均静默丢弃，逐一对齐）；**单 EOS = 248044**
+   （= `raw/config.json` `text_config.eos_token_id`）。
+
+ ### 20.2 管线契约（逐段 oracle 验证，C++ 只做离线转录的查表）
+
+ 1. **NFC**（**pinned 引擎算法的精确移植**，非教科书简化版）：
+    引擎的 NFC = Rust `unicode-normalization`（tokenizers crate 依赖
+    `unicode-normalization-alignments` 0.1.12）的 Decompositions +
+    Recompositions 双迭代器算法，C++ 逐语句移植（`nfc_impl`）：
+    (a) 完全规范分解（含单部件分解，如 U+1FBE→U+03B9、Hangul 音节→jamo）；
+    (b) **流式规范重排**：分解流分批发射 —— 读入一个 `ccc == 0` 的
+    codepoint（或输入结束）时，对**尚未发射的尾部**按 ccc **升序、稳定**
+    排序后放行（`ccc == 0` = starter / 序列边界；jamo 在表中 ccc 0，
+    序列永不重排 —— oracle 验证 `V+L`(U+1161,U+1100) 原样不动，而
+    `L+V`→U+AC00）；
+    (c) **合成与重排同趟进行**（关键差异）：composee 只能与**入流**
+    非 starter 合成，且仅当**所有已缓冲（延迟）mark 的 ccc 都严格小于**
+    该 mark；否则该 mark 被缓冲、延后发射。纯合成表查表（表 = 恰好
+    `NFC(x y) == 单 codepoint` 的 (x,y) 集合，exclusions 已含）。
+   该算法即标准 UAX #15 NFC：差分验证（200k seed-20260925 扫描 +
+   ccc/合成 battery）中 pinned 引擎与 Python `unicodedata` 在**算法**
+   层面 100% 一致（0 未解释发散）；两者行为差异**全部**来自数据版本
+   （引擎 U9 vs 本机 U14，见 §20.1），已用 pinned U9/U16 UCD 表消除。
+   oracle 排序：**pinned 引擎**（构建期 + 验证期）> Python
+   `unicodedata`（仅诊断；其 U14 数据与引擎差 98+1 cp，见 §20.1）。
+    关键回归（descending CCC，旧“不重排”实现全部 FAIL、修复后 PASS）：
+    `U+0041 U+0315 U+0300`（ccc 232,230）→ **`U+00C0 U+0315`**。
+    Hangul：27 个可合成 T-jamo = **U+11A8..U+11C2**（U+11C3+ 为保留区，
+    **永不**合成 —— oracle 验证 `AC00+U+11F2/U+11F6` 原样不动）；
+    (L,V)→S(L,V,0)，(S(L,V,0),T_t)→S(L,V,t)，音节 = 0xAC00+(L×21+V)×28+T，
+    jongseong(T=t) = 0x11A8+(t−1)。
+ 2. **added-token 切分**：先 NFC；每位置**最长** added-token 匹配 → 单 id；
+    否则取到下一个 added-token 起点之前的最大 chunk，chunk 走正则+BPE。
+ 3. **左优先正则预分词**（leftmost-first，PCRE/Onig 语义；`(?i:)` 仅作用于
+    分支 1 的 ASCII tolower casefold）：
+
+    | # | 分支 |
+    |---|---|
+    | B1 | `(?i:'s\|'t\|'re\|'ve\|'m\|'ll\|'d)` |
+    | B2 | `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+` |
+    | B3 | `\p{N}` |
+    | B4 | ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*` |
+    | B5 | `\s*[\r\n]+` |
+    | B6 | `\s+(?!\S)` |
+    | B7 | `\s+` |
+
+    `\s`/`\pL`/`\pN`/`\pM` 用 artifact 的**精确区间表**（Unicode
+    White_Space = 09-0D/20/85/**A0**/1680/2000-200A/2028/2029/202F/205F/
+    3000，恰 25 cp，逐 cp 实证；**U+00A0 已含** —— 旧表漏 U+00A0，
+    已修复并重生成 artifact/语料，回归见 §20.5）。L/N/M 区间来自
+    pinned U16 UCD（§20.1）。
+    语义要点（oracle 对齐）：B1 优先于 B2（`'mX`→`'m`+`X`）；B2 的可选前导
+    字符可吃空格/非字母（`a   b`→`a`,`  `,` b`）；B6 的 `\s+` 是**贪心
+    带回退**：一个 k 个 \s 的 run 后跟 \S 时匹配前 k−1 个（lookahead 在
+    run 内回溯成功），末尾或单 \s 除外 —— 零宽 lookahead 本身**不消费**
+    字符；BPE **只在预分词内部**合并。
+ 4. **ByteLevel BPE**：`byte_fallback=false`（256 单字节 token + 全部 merge
+    产物均在词汇表内，artifact 构建时逐条校验）；每预分词独立；贪心取
+    全位置**最低 rank** merge（tie → 最左）；输出 = 拼接字节查词汇表。
+
+ ### 20.3 CUDLMTK1 artifact（确定性、全界检、fail-loud）
+
+ 离线转录：`tools/convert_qwen35_tokenizer.py`（tokenizers lib，无 checkpoint
+ 权重）→ `build/data/qwen35_tokenizer.cudaltk`（~4.7MB，gitignore）。
+ 格式（LE）：`"CUDLMTK1"` + u32 version(1) + u32 reserved(0) + u32
+ crc32（zlib，poly 0xEDB88320，覆盖 body）+ body = 15×u32 meta（全钉死
+ 常量，逐条校验）+ 10 个 size-prefixed section：S1 base 词汇（[u16 长][字节]
+ ×248044）；S2 merges（[u32 l][u32 r] ×247587）；S3 added（[u32 id][u8
+ special][u16 len][utf8] ×33）；S4 ccc 表（**814** = pinned U9 UCD 的
+ ccc>0 全集）；S5 分解表（**13232** = U9 2,060 + Hangul 音节 11,172）；
+ S6 合成表（**12118** = U9 946 + Hangul 11,172，key=(a<<21)|b，**每对
+ 构建时过 pinned 引擎验证**）；S7–S10 WS/L/N/M 区间表（WS **10** 区间/
+ 25 cp；L/N/M 来自 pinned U16 UCD，**677/144/321** 区间）。数据源与
+ sha 见 §20.1。C++ loader
+ （`src/runtime/qwen35_tokenizer.cpp`）对 magic/version/reserved/crc/截断/
+ 重复/越界/区间重叠/非 UTF-8/词汇连续性**全部 fail loud**（
+ `test_qwen35_tokenizer` 的 load-failure 契约逐项覆盖）。
+
+ ### 20.4 安全契约（无裸特殊 token 字面量）
+
+ 全仓库（C++/Python 测试/文档）**不出现**任何 raw 特殊/控制 token 字符串
+ （EOS、im-start/im-end 等 `<|...|>` 形态）：added token 只由 artifact
+ 承载（id + utf8 字节）；测试语料中它们只以 **UTF-8 hex** 出现；文档只引用
+ id/名称/长度/sha。C++ 侧所需的一切字符串都来自 artifact 查表或拆分拼接，
+ 源码零字面量。
+
+ ### 20.5 硬门（ctest）
+
+ - **`test_qwen35_tokenizer_python_selftest`**（无 checkpoint）：converter
+   自测（确定性双跑 bit-exact、round-trip、损坏类；pinned 资产缺失 → 77）。
+ - **`test_qwen35_tokenizer`**（pinned 资产，self-skip 77）：
+   (a) loader 失败契约（空/过小/坏 magic/坏 version/坏 reserved/crc 翻转/
+   body 截断/header 截断）；(b) NFC 阶段向量（**descending-CCC 规范重排
+   回归**（`A+U+0315+U+0300`→`U+00C0+U+0315` 等 7 条，旧“不重排”实现
+   全部 FAIL）、等 ccc 稳定不重排、jamo T27、U+11F6 不合成、递归分解、
+   Greek 1FEE→0385 等 oracle 验证期望）；(c) 预分词阶段向量（leftmost-first、
+   nbsp 黏词、trailing space、CRLF、CJK、**孤立 combining mark**
+   （B2 的 `?` 需回退，kOpt 回退回归））；(d) decode 契约（padding→""、
+   越界 fail loud、is_special 21/33、EOS==248044、非法 UTF-8 fail loud）；
+   (e) **跨语言精确语料**：`tools/gen_tokenizer_refs.py` 生成 **1883 行**
+   = E（encode，**305** 文本，含 D1/D2/U16 类回归文本）/ D（decode
+   skip_special=false，305）/ D1（skip_special=true，305）/ N（NFC，
+   **65** 向量，11 类 —— 期望 = pinned 引擎 `normalizer.normalize_str`
+   （U9）逐 cp 精确，含 (11) **BLOCKER-D1 回归类**：98 个 ccc 差异 cp 的
+   代表性 `A+<cp>+U+0337` 序列（ccc 9/220/230 三档）+ Divès Akuru
+   `U+11935 U+11930` 对及其 +x/单独 U+11938 变体）/ P（预分词，**317**
+   文本 —— 期望 = pinned 引擎 `pre_tokenize_str(normalize_str(t))`（经
+   ByteLevel 逆映射回 raw text），含 **25 个 White_Space cp × 11 上下文
+   的边界 battery**（BLOCKER-D2 回归：U+00A0 在词/符/run 边界）+ U15/U16
+   新增 L/N/M cp 的类探测）/ **X（任意 id 序列 decode，586 行 = 293 序列
+   × 2 skip 模式：单非法字节、2/3/4 字节不完整、非法 lead+cont 组合、
+   连续非法、合法字符跨 token 拆分、base+padding、base+added、special；
+   byte→id 映射从 pinned vocab 动态推导，期望 = pinned 引擎 decode，hex
+   编码）** —— C++ 逐行与 pinned oracle **EXACT** 相等。Python
+   `unicodedata`/re 镜像降为**二级诊断**（U14 数据 ≠ 引擎 U9，不可作
+   等价断言）。
+ - **regression-first 证据（旧实现必须 FAIL 新语料）**：用 reviewed HEAD
+   （63b884f，U14 表 + 9 区间 WS）的 converter 重建 artifact（sha256
+   `729da2cf274cfb23819ebcfedff1c5365dea013a73786a3464696aff08b980ac`），
+   跑**新**语料 → **21 行 FAIL**（恰为 D1/D2/U16 回归行：E 151/154/160/
+   169/172/175/178、N 971-979、P 1097/1100/1102/1103/1292/1293/1294/1296），
+   新 artifact → **1883/1883 PASS**。即新语料对旧实现是**穿透性回归**，
+   非自我印证。
+ - **differential validation（已固化为仓库工具，固定 seed，非 ctest）**：
+   `tools/dump_qwen35_tokenizer.cpp`（CMake target
+   `tool_qwen35_tokenizer_dump`，native 各阶段 dump）+ `tools/
+   validate_qwen35_tokenizer.py`（pinned 引擎 sha-gated oracle + 全阶段
+   EXACT 比对，打印每 pass 的 samples/mismatches/seed 与 git HEAD）。
+   命令：
+   ```
+   cmake --build build --target tool_qwen35_tokenizer_dump
+   /root/py311/venv/bin/python3 tools/validate_qwen35_tokenizer.py \
+     --mode extended \
+     --dump-binary build/tool_qwen35_tokenizer_dump \
+     --artifact build/data/qwen35_tokenizer.cudaltk \
+     --tokenizer-dir /root/models/Qwen3.5-0.8B-Base/tokenizer
+   ```
+   **Phase B final evidence executed on:**
+   `PHASE_B_EVIDENCE_SHA = 0dc3b576d8171bedebe96d487cf83a59d5f98bef`
+   （工作树干净、HEAD == 该 SHA；artifact 由该 SHA 的 converter 重新
+   生成，未复用旧件）。**失效规则**：此后任何对 `src/`、`include/`、
+   `tools/`、`tests/` 或 functional CMake 配置的修改都使该 evidence
+   **失效**，必须整套重跑；仅 docs 修改不使其失效（此时注明最终 HEAD
+   与 evidence SHA 不同）。
+   extended（穷举）真实结果（于上述 SHA）：regressions 26/0；
+   ws_battery 400/0；nfc_single **1,112,064/0（全 cp 穷举）**；
+   enc_single **1,112,064/0**（`"a"+cp` 全 cp）；class_probe
+   **3,336,190/0**（**实际比较数**：3 探针 × 全 cp，第三探针跳过
+   CR/LF → 3×1,112,064−2）；decomp_cp(+enc) **13,232/0（全可分解 cp
+   穷举）**；comp_pair nfc(+enc) **12,118/0（全合成对穷举）**；
+   nfc_fuzz 200,000/0（seed 777）；adjacency 50,000/0（seed
+   20260925）；enc_fuzz 100,000/0（seed 42）；pretok_fuzz 100,000/0
+   （seed 999）；dec_fuzz 40,000/0（seed 20250417，双 skip 模式）。
+   quick 模式 = 同 seed 缩减规模（stride 16 单 cp、20k/10k fuzz），
+   供常规 CI。
+ - **BLOCKER-D1/D2 —— 本轮已解决**（上一轮按纪律上报，本轮批准修复）：
+   - **D1（Unicode 数据版本）**：修复 = converter 表改从 pinned U9 UCD
+     （sha-gated）+ 引擎构建期合成对验证 + L/N/M 改 pinned U16 UCD（见
+     §20.1）。**算法未动**（`nfc_impl` 冻结）—— 全部差异是数据。回归：
+     N 行 971-979 + E 行 169/172/175/178（旧 U14 artifact 全部 FAIL、新
+     PASS）+ nfc_single/enc_single/comp_pair/decomp_cp 全穷举 0。
+   - **D2（\s 缺 U+00A0）**：修复 = `WHITE_SPACE`/`WS_RANGES` 各加
+     `(0x00A0,0x00A0)` + 重生成（一行数据修复）。回归：E 行 151/154/160
+     （**final-encode 级**：`"a\u00a0\u00a0b"` 旧=64,8965,65 新=64,3966,3966,65
+     == 引擎）+ P 行 1097-1103 + ws_battery 25 cp 全边界 0。
+   - **停止条件（本轮达成）**：上表所有 pass **0 mismatch** + 语料 1883/1883
+     EXACT + regression-first 21 行对旧实现 FAIL。任何新发现的 mismatch
+     一律报 BLOCKER，禁止排除 cp / 缩小域。
+ - **`test_qwen35_text_generation`**（real checkpoint + tokenizer，self-skip
+   77）：E2E 文本级门。4 个 **confident prompt**（2 EN + 2 CJK；
+   `tools/diag_gen_gaps.py --text` 在 pinned-quantized oracle 上选得，
+   每步 top1-top2 logit gap **> 0.4**：T1 `January, February, March,`
+   min 0.625；T2 `1, 2, 3, ..., 10,` min 2.875；T3 `一月，二月，三月，`
+   min 1.4375；T4 `一，二，三，…，十，` min 0.75）。每场景比较：
+   **native encode == pinned HF encode（EXACT）** + **greedy 生成 ==
+   pinned-quantized oracle（EXACT）** + **native decode == pinned HF decode
+   （EXACT，skip_special_tokens=False，生成 EOS 留在文本里）** + stop_reason
+   + forward_count（== t_used）+ golden `gen.prompt_text` 回环 drift 守卫；
+   污染门 T1→T3→T1 二次运行**逐字段相同**。EOS 用**真实 248044**。
+ - **oracle 扩展**：`tools/generate_qwen35_golden.py --gen-text`（新参数，
+   Phase A `--gen-a/b-tokens` 不动）：文本经 pinned HF tokenizer 编码后走
+   同一 pinned-quantized 生成 oracle，golden 额外携带 `gen.prompt_text` +
+   `gen.hf_decoded` 两个 metadata 字段。
+
+ ---
+
+ ## 21. v0.4 Phase C —— 基础 sampling + `cudalm-generate` CLI
+
+ Phase B（tokenizer/prompt→text）**冻结**之后（functional/evidence SHA
+ `0dc3b576d8171bedebe96d487cf83a59d5f98bef`，DONE/FROZEN），Phase C 在
+ 其上增加：**基础 sampling**（greedy / temperature / top-k / top-p /
+ seed）+ **用户可用 CLI**（raw prompt → 生成 UTF-8 文本）。保持
+ single request + serial prefill/decode；不进入 v0.5 state manager /
+ v0.6 scheduler。tokenizer/NFC/BPE/decode 语义未动。
+
+ ### 21.1 Sampling API（`include/cudalm/sampling.h`，CPU-only）
+
+ ```cpp
+ struct SamplingConfig {
+   float temperature = 0.0f;   // <=0 -> 冻结 greedy 路径; >0 -> sampling
+   int   top_k = 0;            // 0 -> 不启用; <0 非法; >vocab_size -> clamp 到 vocab
+   float top_p = 1.0f;         // (0,1]; 1.0 -> 不启用
+   std::uint64_t seed = 0;     // 每请求 RNG 种子（greedy 不消耗 RNG）
+ };
+ ```
+
+ - **greedy**：`temperature <= 0`（或 `SamplingConfig::greedy()`）走**冻结
+   的 Phase A `argmax_bf16`**（数值最大 BF16 logit；tie → 最小 id），
+   bit-for-bit，**零 RNG 消耗**。greedy config 即使携带 top-k/top-p 字段
+   也是 greedy 路径（`is_greedy()` 只看 temperature）。
+ - **固定流水线顺序**（与调用顺序无关，sampling 模式）：
+   `temperature → top-k → top-p → normalize → sample`。
+   1. **temperature**：`f[i] = logits[i] / temperature`（T > 0；非法值
+      fail loud，见下）。**scaled logits / max / exp 全程用 double**：
+      有限 BF16 logit 除以最小合法正 float temperature（denorm_min）
+      约 2.4e83 —— 远超 float 范围但在 double 之内，因此**对每个合法
+      有限正 float temperature**，有限 logits 都产生合法分布（全部
+      p finite、至少一个严格为正、sum ≈ 1）；`sample_token()` 对
+      vocab ≥ 1 恒返回 `[0, vocab)`（generator 另有防御性 range
+      检查，`-1` 永不进 `forward_token`）。
+   2. **top-k**：只留概率最高的 k 个（`top_k == 0` 不启用；`top_k < 0` 非法 fail loud；
+      **`top_k > vocab_size` clamp 到 vocab_size**（已测试并文档化）；
+      值相同（tie）时**最小 token id** 占名额）。
+   3. **top-p**：在 **top-k 幸存者**上按概率从高到低（tie → 最小 id），
+      保留 cumulative probability 达到 top_p 的**最小前缀**（`top_p == 1`
+      不裁剪；**至少保留 1 个** token）。
+   4. **normalize**：`p[i] = exp(f[i] - max_f) / sum_survivors`（double）
+      —— **先减 max 再 exp**（数值稳定，无 overflow）；被排除 token
+      p == 0。
+   5. **sample**：单次 RNG 抽取 u ∈ [0,1)，按 token id 升序走 cumulative，
+      首个 `u < cum` 者胜；u 落在尾部舍入缝隙时取**最后一个**幸存者。
+ - **fail loud（单一校验门 `validate_sampling_config`）**：temperature
+   NaN/inf、`top_k < 0`、top_p NaN/≤0/>1 → 拒绝（generator 层面：
+   ok == false + error，**不 forward 任何 token**）。temperature ≤ 0
+   合法（= greedy）。
+ - **组合顺序证明**：CPU 门里有一个 k-then-p 与 p-alone 存活集合**不同**
+   的用例（5 个 3.0 平手 + 1 个 0.0：top-k=2 + top-p=0.8 留 {0,1}；
+   单独 top-p=0.8 留 {0..4}）——顺序是钉死的，不是隐式的。
+
+ ### 21.2 RNG / 确定性（每请求，无全局随机状态）
+
+ - 生成器：**SplitMix64**（常量与运算在 `sampling.h` 中完全指定，跨平台/
+   跨编译器确定性）；`next_double()` = 高 53 位 × 2^-53 ∈ [0,1)。
+ - `Sampler` 对象**每 generate() 新建**，seed 来自请求 config —— 上一
+   请求消耗的 RNG 状态**不可能**污染下一次请求（Phase A/B state
+   contamination 纪律在 sampler 上的延伸）。
+ - 语义：**相同 (prompt, sampling config, seed, model) → 完全相同 token
+   序列**；不同 seed 产生不同 sampling stream（synthetic-logits 单测
+   证明：16 个 seed 的首 token 覆盖全部 4 个候选；8192 次抽取均匀在
+   [20%,30%] 内）。
+ - greedy 路径**不消耗 RNG**（状态不变，单测断言）。
+
+ ### 21.3 Generator / TextGenerator 集成
+
+ - `Qwen35Generator::generate(prompt, max_new, eos, stream,
+   SamplingConfig, observer)`（新重载）；**旧 greedy API 原样保留**。
+   两个 overload 共享一个 request core；greedy overload 传
+   `SamplingConfig::greedy()` —— 即冻结路径本体（**generated ids /
+   stop reason / forward count 完全一致**，有集成门）。EOS /
+   max_new_tokens / max_seq_len 语义与 position 语义不变；仍然禁止
+   re-forward last prompt token；forward-count 不变式
+   `= prompt_len + generated - 1` 对 sampling 同样成立。
+ - `Qwen35TextGenerator::generate_text(prompt, max_new, SamplingConfig,
+   stream)`（新重载）：**仍为 thin facade**（encode → generate →
+   decode 三行缝合），不复制任何 sampler/generation 逻辑；旧 greedy
+   overload 委托新 overload + greedy config。
+ - 新增 **CUDA runtime path = 0**：sampler 是纯 CPU（作用在 generator
+   原本就 D2H 的 host logits 上）；没有新 kernel / 新 CUDA memory 分配 /
+   新 stream 语义 —— Phase A CUDA sanitizer 证据可复用（见 §21.6）。
+
+ ### 21.4 `cudalm-generate` CLI（`tools/cudalm_generate.cpp`）
+
+ ```bash
+ ./build/cudalm-generate \
+   --model build/data/qwen35_08b_full.cudalm \
+   --tokenizer build/data/qwen35_tokenizer.cudaltk \
+   --prompt "The capital of France is" \
+   --max-new-tokens 32 --temperature 0.8 --top-k 40 --top-p 0.95 --seed 42
+ ```
+
+ - 参数：`--model` / `--tokenizer` / `--prompt`（必填）；
+   `--max-new-tokens`（默认 64）；`--temperature` / `--top-k` /
+   `--top-p` / `--seed`（可选）；`--greedy`（显式关闭 sampling，与
+   sampling 参数互斥）；`--help`/`-h`。
+ - **模式解析**：默认 greedy；出现任一 `--temperature`/`--top-k`/
+   `--top-p` → sampling（未显式给 `--temperature` 时默认 1.0；
+   `--temperature 0` → 冻结 greedy 路径）；`--seed` 单独出现**不**
+   启用 sampling（greedy 不消耗 RNG，seed 被忽略）。
+ - **`--temperature` 数值 range**：文本必须能舍入到可表示的 float。
+   overflow 到 inf（如 `1e40`、`inf`、`nan`）或 underflow 到 0 →
+   **usage error（exit 2）**——不允许静默变 inf 或静默变 0/greedy。
+   underflow 在**两层**检测：double 级（非零 double 转 float 变
+   0.0f，如 `1e-50`、`7e-46`）和 **strtod 级**（文本小到 `strtod`
+   本身就 range-underflow 到 ±0.0，errno ERANGE，如 `1e-5000`、
+   `-1e-5000`——非零文本绝不能静默变成 0/-0）。denormal 到
+   denorm_min、最大到 FLT_MAX 都是合法值（有测试钉死）；显式
+   `0`/`-0` 仍是文档化的 greedy 写法。
+ - 输出：成功时 stdout **只有生成的文本**（正常模式不打印 logits /
+   debug tensor）；错误走 stderr。stdout 写入是 **binary-safe /
+   length-aware**（`write_generated_text`：按精确字节数 fwrite +
+   约定的结尾换行，短写 → exit 1）——原生 decode 合法产生的
+   **embedded NUL 字节不会被截断**。
+ - **exit code**：0 成功；1 运行时失败（model load failure /
+   tokenizer load failure / 生成契约违规，如 empty prompt、prompt 超
+   max_seq_len）；2 用法错误（缺参 / 坏参数 / 非法 sampling config，
+   在**任何 CUDA 工作之前**失败）。
+ - 参数解析是独立可测逻辑（`include/cudalm/generate_cli.h` +
+   `src/cli/generate_cli.cpp`，CPU-only），CLI smoke 测试在其上跑真
+   二进制。
+
+ ### 21.5 测试门
+
+ - `test_sampling`（CPU，synthetic logits，数学钉死）：greedy 兼容
+   （== 冻结 argmax、零 RNG）；temperature scaling（== softmax(logits/T)
+   fp32/double 对照）；top-k（含 tie → 最小 id、>vocab clamp）；top-p
+   （最小前缀、≥1 保留、1.0 禁用）；k+p 组合（顺序证明）；seed 复现；
+   不同 seed 不同 stream + 均匀性；非法 config（单一门 fail loud）；
+   极值 logits（1000/1000 量级，max 相减无 overflow）/ 全负 logits；
+   精确 tie（greedy 最小 id、sampling 均匀、k=1 钉死）；单一幸存者
+   （top_k=1 任意 seed 都 = argmax）；**极值 temperature（FLT_MIN /
+   denorm_min / FLT_MAX × 正/负极值与平手 logits：所有 p finite、
+   sum ≈ 1、16 个 seed 下 sampled id ∈ [0, vocab)）——该组 regression
+   在旧的 float 流水线下必然击穿（NaN + sample == -1）**。
+ - `test_qwen35_sampling`（real checkpoint，self-skip 77）：greedy
+   EXACT（旧 API == greedy-config 新 API == temperature-0 带字段 config，
+   ids/stop/forward 全同）；seed 确定性（A(42) == A(42)）；
+   **request 级污染门 A(42) → B(123) → A(42)**（id 级 + text 级，
+   generated ids/text/stop/forward 全 EXACT —— model state reset +
+   sampler RNG reset 都无跨请求污染）；sampling 健全性（id ∈ vocab、
+   forward-count 不变式）；非法 config fail loud 且不 forward。
+ - `test_generate_cli_args`（CPU）：--help / 缺必填 / 缺值 / 未知参数 /
+   坏数值（含溢出、部分消费）/ **`--temperature` float range
+   （`1e40`/`1e308`/`inf`/`nan`/`1e-50`/`7e-46`/`1e-5000`/
+   `-1e-5000`（strtod 级 underflow）→ usage error；
+   `0`/`-0`/`1.4e-45`/`1e-45`/`1.17549435e-38`/`3.4e38` → 合法并
+   钉死精确 float 值）**/ 模式解析 / `--greedy` 互斥 / 解析后 config
+   过单一校验门 / **binary-safe stdout（`write_generated_text`
+   roundtrip：`ab\0cd`、单个 NUL、空串 → 逐字节全保留 + 结尾换行）**。
+ - `test_cudalm_generate_cli`（真二进制 fork/exec，无 shell，CJK 原样
+   传递）：--help；用法错误 exit 2 + 信息；坏 model/tokenizer 路径
+   exit 1 + 信息；非法 sampling config exit 2；greedy 路径 exit 0 +
+   非空文本；sampling 路径 exit 0 + **同 seed 两次 stdout 逐字节相同**；
+   UTF-8（CJK）prompt exit 0 + 非空。
+
+ ### 21.6 v0.4 最终 evidence（Phase C 完成）
+
+ **Phase C / v0.4 functional evidence executed on:**
+ `V04_EVIDENCE_SHA = 5aba21fe0b351079850600f3f8fe7f55a77c8745`（工作树
+ 干净、HEAD == 该 SHA）。
+
+ **历史**：第一版 functional evidence 曾绑定
+ `a008b4373a94427695ebe0dafb7086468afd9c90`；第一轮 review 之后做了
+ 两处 correctness 修复（极小正 temperature 的数值溢出 → double
+ 流水线 + sampler/generator 防御检查；CLI stdout 改 binary-safe）+
+ CLI --temperature 数值 range 检查 + top_k 措辞统一 → evidence 重绑
+ `cb3cb668`；第二轮 review 又发现 `--temperature` 的 **strtod 级
+ underflow**（`1e-5000` 这类文本让 `strtod` 本身就 range-underflow
+ 到 ±0.0，静默变 greedy）→ functional 修复（commit `5aba21fe`），
+ 按规则 `cb3cb668` 的 evidence 再次**失效并整套重跑**（下文即新
+ SHA 的结果）。中间提交 `b7fb4b1`（README/docs + `benchmarks/
+ sanitizer_cudalm_generate.txt`）与 `bfd01fa` 的性质都是
+ **docs/evidence-only**（含 benchmark 证据记录，不是严格
+ docs-only）。
+
+ **失效规则**：此后任何对 `src/`、`include/`、`tools/`、`tests/` 或
+ functional CMake 配置的修改都使该 evidence **失效**，必须整套重跑；
+ 仅 docs/evidence 修改（文档 + benchmark 证据记录）不使其失效（此时
+ 注明最终 HEAD 与 evidence SHA 不同）。若 Phase C 之后任何人修改了
+ **冻结的 tokenizer 语义**（§18/§20），必须停止并报告，而不是继续。
+
+ **sign-off**：external reviewer 判 **PASS** —— v0.4 正式
+ **DONE / FROZEN**；`v0.4-generation` 已 merge 进 main（v0.5+ 再
+ 开新分支）。
+
+ 证据内容（于该 SHA，全部真实执行）：
+ - **完整 ctest：45/45 PASS，0 failed，0 skipped**（含 Phase A/B 全部
+   既有门：`test_qwen35_generation` greedy golden EXACT、
+   `test_qwen35_generation_contract`、`test_qwen35_text_generation`
+   E2E EXACT、`test_qwen35_tokenizer` 1883/1883 corpus、
+   `test_qwen35_tokenizer_python_selftest`（含 `tokenizers == 0.22.2`
+   版本门回归）；新增 `test_sampling` / `test_qwen35_sampling` /
+   `test_generate_cli_args` / `test_cudalm_generate_cli` 全 PASS）。
+ - **`scripts/check_no_torch.sh`：CLEAN**（`forbidden_deps_check`
+   亦在 ctest 内 PASS）。
+ - **tokenizer quick differential validation：14 pass 全 0 mismatch**
+   （regressions 26、ws_battery 400、nfc_single/enc_single 各
+   69,504、class_probe 208,512、decomp_cp(+enc) 各 13,232、
+   comp_pair 各 3,030、nfc_fuzz 20,000/seed 777、adjacency 5,000/
+   seed 20260925、enc_fuzz 10,000/seed 42、pretok_fuzz 10,000/seed
+   999、dec_fuzz 4,000/seed 20250417；脚本自报
+   `head=5aba21fe…`）。Phase C 未修改 tokenizer 实现/工具，extended
+   百万级穷举不需要重做，Phase B extended evidence 仍绑定
+   `0dc3b576`。
+ - **新 CUDA runtime path = 0**（sampler 纯 CPU，无新 kernel/
+   分配/stream 语义）：Phase A CUDA sanitizer 证据**复用**，并于
+   该 SHA 对 `cudalm-generate` greedy 路径（真实 model 加载 +
+   serial prefill + 16 decode + 每步全量 logits D2H + decode）
+   **重跑 compute-sanitizer：0 错误**（记录：
+   `benchmarks/sanitizer_cudalm_generate.txt`）。
+
+ ### 21.7 当前限制（v0.4 边界，明说）
+
+ single request / serial prefill（token-by-token，correctness-first
+ 基线，**非**性能声明）；**无** streaming、**无** chat template /
+ 会话历史、**无** batching / chunked prefill、**无** multi-request /
+ scheduler / continuous batching、**无** Paged KV / state pool、**无**
+ beam search / repetition & frequency & presence penalty / typical /
+ min-p / speculative decoding、**无** HTTP server / OpenAI API、**无**
+ NCU / CUDA Graph / kernel fusion / 性能调优。**不是** production
+ serving engine —— 是 v0.4 的 correctness-first 单请求生成核 +
+ 最小采样 + 一个真实可用的 CLI。

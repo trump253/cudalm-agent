@@ -15,6 +15,28 @@ cudalm_add_test(test_qwen35_config test_qwen35_config cpu/test_qwen35_config.cpp
 cudalm_add_test(test_qwen35_deltanet_config test_qwen35_deltanet_config
                 cpu/test_qwen35_deltanet_config.cpp)
 
+# v0.4 Phase A: greedy generation helpers (CPU-only, no checkpoint).
+#   * argmax: maximize the numeric BF16 logit value; tie -> lowest token id
+#     (normal / negative / exact-tie / single / bf16-rounding-tie).
+#   * stop controller: EOS (immediate + included + no forward after) /
+#     max_new_tokens / max_seq_len / EOS-priority + the pure decisions.
+cudalm_add_test(test_greedy_argmax test_greedy_argmax cpu/test_greedy_argmax.cpp)
+cudalm_add_test(test_greedy_stop test_greedy_stop cpu/test_greedy_stop.cpp)
+
+# v0.4 Phase C: CPU sampling (cudalm/sampling.h) — mathematically pinned
+# synthetic-logits correctness: greedy compatibility (frozen argmax),
+# temperature scaling (== softmax(logits/T)), top-k (ties -> lowest id,
+# >vocab clamps), top-p (minimal prefix, >=1 kept), k+p composition (fixed
+# order), seed reproducibility, different-seed streams, invalid config,
+# extreme/all-negative logits, exact ties, single remaining candidate.
+cudalm_add_test(test_sampling test_sampling cpu/test_sampling.cpp)
+
+# v0.4 Phase C: CLI argument parsing (cudalm/generate_cli.h) — CPU-only, no
+# model: --help, missing required args, unknown flags, bad numerics, mode
+# resolution (greedy default / sampling flags / --greedy exclusivity).
+cudalm_add_test(test_generate_cli_args test_generate_cli_args
+                cpu/test_generate_cli_args.cpp)
+
 # --- CUDA tests ---------------------------------------------------------------
 cudalm_add_test(test_cuda_smoke test_cuda_smoke cuda/test_cuda_smoke.cpp)
 cudalm_add_test(test_elementwise_rmsnorm test_elementwise_rmsnorm cuda/test_elementwise_rmsnorm.cpp)
@@ -360,10 +382,139 @@ if(CUDALM_PYTHON3)
                      ${CMAKE_BINARY_DIR}/data/qwen35_full)
     set_tests_properties(test_qwen35_full_forward PROPERTIES
       SKIP_RETURN_CODE 77 TIMEOUT 1800)
+      # v0.4 Phase A: generation-level golden hard gate (single-request serial
+    # prefill + greedy decode). Scenario A (short prompt) + B (longer prompt,
+    # final persistent state) + C (repeat-generate contamination). Compares
+    # EVERY generated token id + EVERY generation-step FULL logits [vocab] +
+    # the final hybrid persistent state against the pinned-quantized oracle.
+    # Self-skips (77) when the checkpoint is absent.
+    add_executable(test_qwen35_generation cuda/test_qwen35_generation.cpp)
+    target_link_libraries(test_qwen35_generation PRIVATE cudalm)
+    add_test(NAME test_qwen35_generation
+             COMMAND test_qwen35_generation
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR}
+                     ${CMAKE_BINARY_DIR}/data/qwen35_gen)
+    set_tests_properties(test_qwen35_generation PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
+    # v0.4 Phase A: generator input-contract hardening. Verifies generate()'s
+    # input / capacity contract (fail loud): empty prompt / invalid token /
+    # invalid eos / max_new_tokens < 0 / prompt_len > max_seq_len all ->
+    # ok == false, generated empty, forward_count == 0 (no prefill/decode);
+    # max_new_tokens == 0 -> ok == true, empty, no decode. Self-skips (77) when
+    # the checkpoint / full-model .cudalm is absent.
+    add_executable(test_qwen35_generation_contract
+                   cuda/test_qwen35_generation_contract.cpp)
+    target_link_libraries(test_qwen35_generation_contract PRIVATE cudalm)
+    add_test(NAME test_qwen35_generation_contract
+             COMMAND test_qwen35_generation_contract
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR}
+                     ${CMAKE_BINARY_DIR}/data/qwen35_gen)
+    set_tests_properties(test_qwen35_generation_contract PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 600)
+    # v0.4 Phase B: text-level E2E hard gate (raw UTF-8 in / out). Four
+    # confident prompts (2 EN, 2 CJK; min top1-top2 logit gap > 0.4 at every
+    # step, selected via tools/diag_gen_gaps.py): native encode == pinned HF
+    # encode, greedy generation == pinned-quantized oracle, native decode ==
+    # pinned HF decode — all EXACT — with the REAL tokenizer EOS (248044),
+    # plus the text-level contamination repeat. Self-skips (77) when the
+    # checkpoint / tokenizer files are absent.
+    add_executable(test_qwen35_text_generation
+                   cuda/test_qwen35_text_generation.cpp)
+    target_link_libraries(test_qwen35_text_generation PRIVATE cudalm)
+    add_test(NAME test_qwen35_text_generation
+             COMMAND test_qwen35_text_generation
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk
+                     /root/models/Qwen3.5-0.8B-Base
+                     ${CUDALM_TOOL_PYTHON3}
+                     ${CMAKE_SOURCE_DIR}
+                     ${CMAKE_BINARY_DIR}/data/qwen35_textgen)
+    set_tests_properties(test_qwen35_text_generation PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+    # --- v0.4 Phase C: sampling integration (real checkpoint) ---------------
+    # greedy EXACT (old API == greedy-config new API, ids/stop/forward),
+    # seed determinism (A(42) == A(42)), the request-level contamination gate
+    # A(42) -> B(123) -> A(42) at the id AND the text level (model-state reset
+    # + per-request sampler RNG reset), sampling sanity + invalid-config
+    # fail-loud. Self-skips (77) when the artifacts are absent.
+    add_executable(test_qwen35_sampling cuda/test_qwen35_sampling.cpp)
+    target_link_libraries(test_qwen35_sampling PRIVATE cudalm)
+    add_test(NAME test_qwen35_sampling
+             COMMAND test_qwen35_sampling
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk)
+    set_tests_properties(test_qwen35_sampling PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+    # --- v0.4 Phase C: `cudalm-generate` CLI smoke (the real binary) --------
+    # --help / usage errors (exit 2 + message) / bad model+tokenizer paths
+    # (exit 1 + message) / invalid sampling config (exit 2) / greedy path /
+    # sampling path with same-seed byte-identical stdout / UTF-8 (CJK) prompt.
+    add_executable(test_cudalm_generate_cli
+                   cuda/test_cudalm_generate_cli.cpp)
+    target_link_libraries(test_cudalm_generate_cli PRIVATE cudalm)
+    add_test(NAME test_cudalm_generate_cli
+             COMMAND test_cudalm_generate_cli
+                     $<TARGET_FILE:cudalm-generate>
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk)
+    set_tests_properties(test_cudalm_generate_cli PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
   else()
     message(STATUS "tool python lacks torch/safetensors/numpy: "
                    "qwen35 ingestion tests disabled")
   endif()
 else()
   message(STATUS "python3 not found: cross-language weight tests disabled")
+endif()
+
+# --- v0.4 Phase B: native tokenizer (CUDLMTK1) cross-language gate ----------
+# tools/convert_qwen35_tokenizer.py (tokenizers lib, offline) transcribes the
+# pinned Qwen3.5 tokenizer (tokenizer.json + tokenizer_config.json union) into
+# the CUDLMTK1 artifact; tools/gen_tokenizer_refs.py emits the multilingual
+# oracle corpus (E/D/D1/N/P lines). test_qwen35_tokenizer loads the artifact
+# with the PyTorch-free C++ loader and gates: loader failure contract
+# (corruption classes), NFC/pre-tokenization stage vectors, the decode
+# contract (padding ids -> "", out-of-range fail loud, is_special exact), and
+# EXACT cross-language equality on the whole corpus. Needs the `tokenizers`
+# python lib (NOT torch) + the pinned local assets; self-skips (77) when the
+# assets are absent.
+if(CUDALM_TOOL_PYTHON3)
+  execute_process(
+    COMMAND ${CUDALM_TOOL_PYTHON3} -c "import tokenizers"
+    RESULT_VARIABLE CUDALM_TOOL_PY_TOK_OK
+    OUTPUT_QUIET ERROR_QUIET)
+endif()
+if(CUDALM_TOOL_PYTHON3 AND CUDALM_TOOL_PY_TOK_OK EQUAL 0)
+  set(CUDALM_TK_ARTIFACT ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk)
+  set(CUDALM_TK_CORPUS ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer_refs.txt)
+
+  # Python-side converter selftest (determinism, round-trip, corruption
+  # classes; self-skips 77 when the pinned assets are absent).
+  add_test(NAME test_qwen35_tokenizer_python_selftest
+           COMMAND ${CUDALM_TOOL_PYTHON3}
+                   ${CMAKE_SOURCE_DIR}/tools/convert_qwen35_tokenizer.py
+                   --selftest)
+  set_tests_properties(test_qwen35_tokenizer_python_selftest PROPERTIES
+    SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+  add_executable(test_qwen35_tokenizer cpu/test_qwen35_tokenizer.cpp)
+  target_link_libraries(test_qwen35_tokenizer PRIVATE cudalm)
+  add_test(NAME test_qwen35_tokenizer
+           COMMAND test_qwen35_tokenizer ${CUDALM_TK_ARTIFACT}
+                   /root/models/Qwen3.5-0.8B-Base
+                   ${CUDALM_TOOL_PYTHON3}
+                   ${CMAKE_SOURCE_DIR}
+                   ${CUDALM_TK_CORPUS})
+  set_tests_properties(test_qwen35_tokenizer PROPERTIES
+    SKIP_RETURN_CODE 77 TIMEOUT 600)
+else()
+  message(STATUS "tokenizers lib not available: tokenizer tests disabled")
 endif()
