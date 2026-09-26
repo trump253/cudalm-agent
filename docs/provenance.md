@@ -1044,3 +1044,130 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
    continuous batching / batched decode / chunked prefill /
    streaming / multi-stream / PagedAttention perf 均属 v0.6+，见
    架构文档 §24）。待 external reviewer 签核。
+
+## CUDALM v0.6 Phase A（Request Scheduler / Control Plane — semantics only）
+
+ - **承接**：v0.5 Hybrid State Manager（Phase A/B/C 全部 DONE）已由
+   external reviewer 确认并 **merge 进 main**（no-ff merge commit
+   `88ce595`，merge tree 与 v0.5-state-manager 的
+   `c21f8cb071dc860b9602be0b5d1bcc0619365c99` tree **完全一致**）；
+   本阶段在分支 `v0.6-scheduler`（从新 main 切出）上工作。v0.6 目标：
+   把**冻结的 v0.5 multi-sequence runtime** 上层接入一个**正确、确定、
+   可测试**的 request scheduler / control plane。本阶段**只**解决：
+   request lifecycle、admission、waiting/running/finished、iteration
+   scheduling、prefill/decode progression、EOS / max-new-tokens
+   completion、state create/retire ownership、deterministic
+   multi-request execution。**不实现真正的 batched CUDA compute**。
+ - **Phase A 执行模型（钉死）**：**scheduler semantics only —— GPU
+   执行仍然是每次一个 sequence forward**：一个 iteration
+   （`Scheduler::step()`）让每个 eligible request 最多前进一步，每步 =
+   一次单序列 `forward_token_with_state()`（单 model、单 CUDA stream）；
+   **无** batched CUDA kernels / batched forward / batched GEMV / true
+   GPU continuous batch / PagedAttention 优化 / chunked prefill /
+   multi-stream / CUDA Graph / NCU / fusion / HTTP-OpenAI / async /
+   priority scheduler / beam search / speculative decoding（均属
+   Phase B+ / v0.6+）。Phase A 目的：证明 **scheduler/control-plane
+   语义 == 独立执行语义**。**无吞吐改进声明、无 true batched GPU
+   execution 声明。**
+ - **冻结 v0.5 runtime（零修改）**：`Qwen35Model` /
+   `Qwen35StateManager` / paged KV / Delta state pool /
+   `forward_token_with_state()` / tokenizer / sampling / legacy
+   generator / CLI 全部原样复用；v0.5 已证明的 multi-SequenceId /
+   interleaved forward / retire-reuse / reset isolation 语义继续成立。
+ - **新增代码（3 个文件）**：
+   - `include/cudalm/request.h`：`RequestId`（**monotonic、永不复
+     用**；与 `SequenceId` 是两个独立 id 空间，绝不混用）、
+     `RequestStatus`（Waiting/Running/Finished/Cancelled/Failed）、
+     `FinishReason`、`Request`（prompt、prefill_pos、generated、
+     max_new_tokens、eos_token_id、**per-request** SamplingConfig +
+     **per-request** Sampler（per-request SplitMix64 —— 两个 request
+     绝不共享 RNG progression）、status/finish_reason/forward_count）；
+     头部钉死 **v0.4 token progression**（early prefill 不采样；最后
+     一个 prompt token 的 logits 产生 g0；之后 forward g_{k-1} →
+     采样 g_k；以 m 个 generated 结束的 request 恰好 forward
+     N + m - 1 次）；
+   - `include/cudalm/scheduler.h` + `src/runtime/scheduler.cpp`：
+     `SequenceForwarder`（抽象 forward/logits 源，CPU 可 fake）+
+     `ModelForwarder`（真实包装 loaded Qwen35Model，委托冻结的 v0.5
+     gate-including forward）+ `Scheduler`：
+     * **admission（transactional）**：validate → create_sequence →
+       register → issue RequestId；任何失败：**无 half-request、无泄
+       漏 SequenceState、无被消耗 RequestId**（id 只在 create 成功之
+       后发放）；
+     * **iteration（deterministic FIFO / round-robin）**：每轮开始先
+       **snapshot** non-terminal RequestId（升序 == admission 顺序），
+       然后逐 id **重新 lookup** 各前进一步（mutation safety 硬要求：
+       不跨 advance 持有 iterator/pointer/reference；terminal 自然跳
+       过）；iteration 之间 admit 的 request 从**下一轮**开始执行（绝
+       不插进当前 snapshot）；无 priority/fairness heuristic；
+     * **TERMINAL EXACTLY ONCE**：恰好一次 terminal 转移 + 恰好一次
+       `retire_sequence`；stale request 永不再 advance；terminal
+       record 保留可 inspect；
+     * **cancel（钉死契约，测试 + 文档化）**：Waiting/Running →
+       Cancelled + retire；**已 terminal → 幂等 ok**（无状态变化）；
+       未知 id → fail-loud Status error；
+     * **fatal Status**：forward 失败 → 该 request Failed + retire
+       （恰一次）；同一 snapshot 其余 id 继续推进；step() 返回首个错
+       误。Scheduler 不拥有 model / state manager / stream（non-owning
+       引用；v0.5 config/stream compatibility gate 在
+       forward_token_with_state 内部 fail-loud 强制执行）；policy 不
+       塞进 StateManager。
+ - **新增测试（2 个，PASS）**：
+   - `test_qwen35_scheduler`（**CPU control-plane gate**；无
+     checkpoint / 无 model —— 确定性 fake forwarder 跑在**真实**
+     Qwen35StateManager 池上，create/retire/capacity 都是真的）：
+     request lifecycle、monotonic never-reused RequestId、
+     transactional admission（delta-slot 耗尽 + 输入校验：无泄漏
+     sequence / 无 half-request / 无消耗 id；finish/cancel 后可再
+     admit）、FIFO/round-robin snapshot 语义（forward 调用顺序日志；
+     晚 admit 进下一轮）、prefill/decode 共存、EOS + max_new_tokens
+     （精确 token 流 + forward count）、cancel + retire（幂等
+     re-cancel / 未知 id fail-loud / stale 永不 advance）、per-request
+     采样 RNG 隔离（A(seed42) 交错 == A 单独；B(seed123) 交错 == B
+     单独；同 prompt+同 seed ⇒ 同流，与 interleave/admission 顺序无
+     关）、fatal Status（Failed + retire 恰一次；snapshot 其余 id 继
+     续推进）；
+   - `test_qwen35_scheduler_integration`（**real-checkpoint
+     integration gate**；真实 Qwen3.5-0.8B-Base；无 checkpoint 自
+     skip 77，evidence 环境**必须真实运行**，非签核）：A（3-tok
+     prompt，max_new 3，seed 42）+ B（7-tok prompt，max_new 2，seed
+     123）先 admit，2 轮后**动态 admit** C（2-tok prompt，max_new 3，
+     seed 7），跑到底 —— 每 request 的 **generated token IDs、每个
+     generated step 的 FULL logits[248320]、forward count、finish
+     reason** 与独立 fresh-manager reference（直接 forward，不走
+     scheduler）全部 **EXACT（memcmp）**；B 的完整 hybrid state 在
+     length 4（A finish 之前）与 length 5（A finish + retire 之后）
+     与 B-alone reference 同 length 状态 bit-identical（另一 request
+     的 finish/retire 不触碰仍-live request 的 state）；real-logits
+     采样隔离（同 prompt + 同 seed ⇒ X 单独 == Y 单独 == X+Y 交错
+     相同流）。
+ - **完整 regression（于本 evidence SHA，clean tree）**：完整 ctest
+   **54/54 PASS、0 failed、0 skipped**（含 v0.4/v0.5 全部门面回归 +
+   两个新 gate；integration gate 真实运行，非 77 skip）；
+   `scripts/check_no_torch.sh` **CLEAN**。
+ - **Sanitizer（于本 evidence SHA）**：Phase A **引入 scheduler 控制
+   面**（动态 admission / 中途 finish+retire / 每 forward 全量 logits
+   D2H / per-request sampler 在真实 forward 之上交错）：
+   `compute-sanitizer --tool memcheck`（RTX 2080 Ti / CUDA 11.8）对
+   `test_qwen35_scheduler_integration`（真实 checkpoint 全流程，55 次
+   真实 forward + 全部 state capture）：**PASS + ERROR SUMMARY: 0
+   errors**（原始日志：`benchmarks/sanitizer_qwen35_scheduler.txt`）。
+ - **evidence 绑定**：`V06A_EVIDENCE_SHA =
+   459ff12f1a4d1365112d65f8863a4e5010710c11`（clean tree、HEAD ==
+   SHA；完整 ctest 54/54 PASS 0 skipped + check_no_torch CLEAN +
+   scheduler integration 门 compute-sanitizer memcheck 0 错误，均于
+   该 SHA）。**失效声明（未删除历史）**：Phase A 修改了
+   `src/`、`include/`、`tests/` 与测试 CMake，按失效规则：**
+   `V05C_EVIDENCE_SHA = 1054b69c4f72f3f0238361d5b5e5f5ab8463489c`**
+   （及其更早的 V05B `a29b59610b39a0ad24fc6d79ce2c61088897330e` /
+   V05A `2319a261543e1af75f544a6a57592b0193074312` / V04 绑定）对
+   本 tree **失效** —— 其全部门面回归已在本 SHA 的 54/54 内重跑全绿
+   （v0.5 的 merge 状态与历史 SHA 不变，仅 evidence 绑定按规则推进）。
+   失效规则延续：此后任何 `src/` / `include/` / `tools/` / `tests/` /
+   functional CMake 修改 → 本 evidence 失效必须重跑；仅 docs/evidence
+   修改不失效。
+ - **v0.6 Phase A 终态（明说）**：**Phase A = scheduler semantics
+   only；GPU 执行仍是每次一个 sequence forward；无吞吐改进声明、无
+   true batched GPU execution 声明。** 本阶段**不** merge 进 main、
+   **不**自启 Phase B（batched GPU execution / true continuous
+   batching）—— 待 external reviewer 签核。

@@ -1,0 +1,147 @@
+# compute-sanitizer memcheck — CUDALM v0.6 Phase A (request scheduler /
+# control plane integration gate — real checkpoint)
+#
+# Host: RTX 2080 Ti (sm_75), CUDA 11.8, single device
+# Tool: /usr/local/cuda/bin/compute-sanitizer --tool memcheck
+# Command: /usr/local/cuda/bin/compute-sanitizer --tool memcheck \
+#            ./build/tests/test_qwen35_scheduler_integration \
+#            build/data/qwen35_08b_full.cudalm \
+#            /root/models/Qwen3.5-0.8B-Base \
+#            /root/py311/venv/bin/python3 \
+#            /root/code/cudalm-agent
+# git: 459ff12f1a4d1365112d65f8863a4e5010710c11  # V06A_EVIDENCE_SHA (clean
+#        worktree, HEAD == SHA; build/ rebuilt from that SHA)
+#
+# Scope: the FULL real-checkpoint scheduler integration flow
+# (Qwen3.5-0.8B-Base; the preconverted build/data/qwen35_08b_full.cudalm
+# is present, so the test RUNS, it does not exit-77 skip):
+#   * 3 INDEPENDENT reference runs (fresh manager per request, direct
+#     forward_token_with_state, NOT the scheduler) + the B-partial
+#     reference (B alone, states captured at length 4 and 5);
+#   * one scheduler run: A + B admitted, 2 iterations, C admitted
+#     DYNAMICALLY, run to completion (deterministic FIFO/round-robin;
+#     one single-sequence forward_token_with_state per advance; dynamic
+#     admission, prefill/decode coexistence, finish + retire mid-run,
+#     full per-forward logits D2H capture + per-request sampling);
+#   * the real-logits SAMPLING ISOLATION runs (X alone / Y alone /
+#     X+Y interleaved, same prompt + same seed).
+#
+# Result (full run below): test_qwen35_scheduler_integration PASS +
+# ERROR SUMMARY: 0 errors.
+#
+========= COMPUTE-SANITIZER
+[scheduler] model loaded: 24 layers, vocab 248320, page_tokens 2, pool pages 10, delta slots 4
+[reference] A   : 3 generated, 5 forwards, max_new_tokens
+[reference] B   : 2 generated, 8 forwards, max_new_tokens
+[reference] C   : 3 generated, 4 forwards, max_new_tokens
+  B@len4 interleaved vs B-alone L0 delta.conv  bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L0 delta.rec   bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L1 delta.conv  bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L1 delta.rec   bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L2 delta.conv  bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L2 delta.rec   bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L3 kv.K[0..3]  bit-identical (n=2048)
+  B@len4 interleaved vs B-alone L3 kv.V[0..3]  bit-identical (n=2048)
+  B@len4 interleaved vs B-alone L4 delta.conv  bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L4 delta.rec   bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L5 delta.conv  bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L5 delta.rec   bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L6 delta.conv  bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L6 delta.rec   bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L7 kv.K[0..3]  bit-identical (n=2048)
+  B@len4 interleaved vs B-alone L7 kv.V[0..3]  bit-identical (n=2048)
+  B@len4 interleaved vs B-alone L8 delta.conv  bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L8 delta.rec   bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L9 delta.conv  bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L9 delta.rec   bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L10 delta.conv bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L10 delta.rec  bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L11 kv.K[0..3] bit-identical (n=2048)
+  B@len4 interleaved vs B-alone L11 kv.V[0..3] bit-identical (n=2048)
+  B@len4 interleaved vs B-alone L12 delta.conv bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L12 delta.rec  bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L13 delta.conv bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L13 delta.rec  bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L14 delta.conv bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L14 delta.rec  bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L15 kv.K[0..3] bit-identical (n=2048)
+  B@len4 interleaved vs B-alone L15 kv.V[0..3] bit-identical (n=2048)
+  B@len4 interleaved vs B-alone L16 delta.conv bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L16 delta.rec  bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L17 delta.conv bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L17 delta.rec  bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L18 delta.conv bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L18 delta.rec  bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L19 kv.K[0..3] bit-identical (n=2048)
+  B@len4 interleaved vs B-alone L19 kv.V[0..3] bit-identical (n=2048)
+  B@len4 interleaved vs B-alone L20 delta.conv bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L20 delta.rec  bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L21 delta.conv bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L21 delta.rec  bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L22 delta.conv bit-identical (n=18432)
+  B@len4 interleaved vs B-alone L22 delta.rec  bit-identical (n=262144)
+  B@len4 interleaved vs B-alone L23 kv.K[0..3] bit-identical (n=2048)
+  B@len4 interleaved vs B-alone L23 kv.V[0..3] bit-identical (n=2048)
+  B@len5 interleaved vs B-alone (post-A-retire) L0 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L0 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L1 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L1 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L2 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L2 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L3 kv.K[0..4] bit-identical (n=2560)
+  B@len5 interleaved vs B-alone (post-A-retire) L3 kv.V[0..4] bit-identical (n=2560)
+  B@len5 interleaved vs B-alone (post-A-retire) L4 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L4 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L5 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L5 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L6 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L6 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L7 kv.K[0..4] bit-identical (n=2560)
+  B@len5 interleaved vs B-alone (post-A-retire) L7 kv.V[0..4] bit-identical (n=2560)
+  B@len5 interleaved vs B-alone (post-A-retire) L8 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L8 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L9 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L9 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L10 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L10 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L11 kv.K[0..4] bit-identical (n=2560)
+  B@len5 interleaved vs B-alone (post-A-retire) L11 kv.V[0..4] bit-identical (n=2560)
+  B@len5 interleaved vs B-alone (post-A-retire) L12 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L12 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L13 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L13 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L14 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L14 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L15 kv.K[0..4] bit-identical (n=2560)
+  B@len5 interleaved vs B-alone (post-A-retire) L15 kv.V[0..4] bit-identical (n=2560)
+  B@len5 interleaved vs B-alone (post-A-retire) L16 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L16 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L17 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L17 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L18 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L18 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L19 kv.K[0..4] bit-identical (n=2560)
+  B@len5 interleaved vs B-alone (post-A-retire) L19 kv.V[0..4] bit-identical (n=2560)
+  B@len5 interleaved vs B-alone (post-A-retire) L20 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L20 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L21 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L21 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L22 delta.conv bit-identical (n=18432)
+  B@len5 interleaved vs B-alone (post-A-retire) L22 delta.rec bit-identical (n=262144)
+  B@len5 interleaved vs B-alone (post-A-retire) L23 kv.K[0..4] bit-identical (n=2560)
+  B@len5 interleaved vs B-alone (post-A-retire) L23 kv.V[0..4] bit-identical (n=2560)
+  [parity] A: generated 3, forwards 5 (expected 5), reason 2
+  A gen_logits[0][vocab]                       bit-identical (n=248320)
+  A gen_logits[1][vocab]                       bit-identical (n=248320)
+  A gen_logits[2][vocab]                       bit-identical (n=248320)
+  [parity] B: generated 2, forwards 8 (expected 8), reason 2
+  B gen_logits[0][vocab]                       bit-identical (n=248320)
+  B gen_logits[1][vocab]                       bit-identical (n=248320)
+  [parity] C: generated 3, forwards 4 (expected 4), reason 2
+  C gen_logits[0][vocab]                       bit-identical (n=248320)
+  C gen_logits[1][vocab]                       bit-identical (n=248320)
+  C gen_logits[2][vocab]                       bit-identical (n=248320)
+[ok] A/B/C scheduler run == independent references (generated IDs + per-step FULL logits + forward count + finish reason, all EXACT); B state unchanged across A's finish/retire
+[ok] sampling isolation: same prompt+seed => identical streams (X alone == Y alone == X+Y interleaved); per-request Sampler, admission order never changes the RNG
+test_qwen35_scheduler_integration: PASS (A/B/C dynamic-admission scheduler run == independent references: generated IDs + per-step FULL logits + forward count + finish reason EXACT; B state unchanged across A's finish/retire; sampling RNG isolation)
+========= ERROR SUMMARY: 0 errors
