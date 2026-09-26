@@ -129,11 +129,42 @@ int main() {
     rc |= check_bad("--max-new-tokens", "-3", "--max-new-tokens");
     rc |= check_bad("--temperature", "abc", "--temperature");
     rc |= check_bad("--temperature", "1.5x", "--temperature");
+    // --temperature float-range guarantees: text that does not round to a
+    // representable float is a USAGE error — it must never silently become
+    // inf (invalid config) or 0 (silent greedy).
+    rc |= check_bad("--temperature", "1e40", "--temperature");      // float overflow -> inf
+    rc |= check_bad("--temperature", "1e308", "--temperature");     // double-finite, float inf
+    rc |= check_bad("--temperature", "inf", "--temperature");
+    rc |= check_bad("--temperature", "nan", "--temperature");
+    rc |= check_bad("--temperature", "1e-50", "--temperature");     // underflow -> 0 (no silent greedy)
+    rc |= check_bad("--temperature", "7e-46", "--temperature");     // below half of the smallest denormal -> 0
     rc |= check_bad("--top-k", "-1", "--top-k");
     rc |= check_bad("--top-k", "1.5", "--top-k");
     rc |= check_bad("--top-p", "zz", "--top-p");
     rc |= check_bad("--seed", "-7", "--seed");
     rc |= check_bad("--seed", "99999999999999999999999999", "--seed");
+  }
+  // ---- representable extreme temperatures are LEGAL ----------------------------
+  // (the float-range gate rejects only text that cannot round to a float;
+  // denormals down to denorm_min and values up to FLT_MAX stay legal)
+  {
+    auto check_good_temp = [&](const std::string& value, float expect) -> int {
+      Args a = base_args();
+      a.add("--temperature").add(value);
+      if (!parse_ok(a, &o, &err) || o.temperature != expect) {
+        std::fprintf(stderr, "expected %s to parse to %g, got %g ('%s')\n",
+                     value.c_str(), (double)expect, (double)o.temperature,
+                     err.c_str());
+        return 1;
+      }
+      return 0;
+    };
+    rc |= check_good_temp("0", 0.0f);                            // greedy spelling
+    rc |= check_good_temp("-0", -0.0f);
+    rc |= check_good_temp("1.4e-45", static_cast<float>(1.4e-45));   // denorm_min
+    rc |= check_good_temp("1e-45", static_cast<float>(1e-45));       // rounds TO denorm_min (legal)
+    rc |= check_good_temp("1.17549435e-38", static_cast<float>(1.17549435e-38));  // FLT_MIN
+    rc |= check_good_temp("3.4e38", static_cast<float>(3.4e38));  // near FLT_MAX
   }
 
   // ---- valid full set: options land in the right fields -----------------------
@@ -228,6 +259,49 @@ int main() {
     // ... but the resolved config fails the unified gate
     CHECK(!validate_sampling_config(o.resolved_sampling(), &err));
     CHECK(err.find("top_p") != std::string::npos);
+  }
+
+  // ---- binary-safe stdout payload: embedded NUL bytes are NOT truncated --------
+  // (the CLI used to fputs(c_str()): a legal generated text containing a
+  // NUL byte — the native decode can produce one — would have been cut at
+  // the first NUL. write_generated_text is length-aware.)
+  {
+    auto write_roundtrip = [&](const std::string& text,
+                               const std::string& expect) -> int {
+      std::FILE* f = std::tmpfile();
+      if (f == nullptr) {
+        std::fprintf(stderr, "tmpfile failed\n");
+        return 1;
+      }
+      const bool ok = write_generated_text(text, f);
+      std::fflush(f);
+      std::fseek(f, 0, SEEK_SET);
+      std::string got;
+      char buf[64];
+      std::size_t n = 0;
+      while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0)
+        got.append(buf, n);
+      std::fclose(f);
+      if (!ok || got != expect) {
+        std::fprintf(stderr, "write roundtrip failed: wrote %zu bytes, "
+                             "ok=%d, read %zu bytes (expected %zu)\n",
+                     text.size(), (int)ok, got.size(), expect.size());
+        return 1;
+      }
+      return 0;
+    };
+    // "ab\0cd" + the contract trailing newline: all 6 bytes must land.
+    std::string text = "ab";
+    text.push_back('\0');
+    text.append("cd");
+    std::string expect = "ab";
+    expect.push_back('\0');
+    expect.append("cd\n");
+    rc |= write_roundtrip(text, expect);
+    // text that IS a NUL byte (plus newline): 2 bytes.
+    rc |= write_roundtrip(std::string(1, '\0'), std::string("\0\n", 2));
+    // empty text: just the newline.
+    rc |= write_roundtrip(std::string(), "\n");
   }
 
   if (rc != 0) {

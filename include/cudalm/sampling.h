@@ -13,7 +13,8 @@
 //
 // Fixed pipeline order (never call-order dependent), sampling mode only:
 //   1. temperature : f[i] = logits[i] / temperature        (T > 0)
-//   2. top-k       : keep only the best k values (top_k <= 0 disables;
+//   2. top-k       : keep only the best k values (top_k == 0 disables;
+//                    top_k < 0 is INVALID / fail loud;
 //                    top_k > vocab_size CLAMPS to vocab_size; ties ->
 //                    lowest token id wins the tiebreak)
 //   3. top-p       : over the SURVIVORS (ascending probability = descending
@@ -55,7 +56,7 @@ namespace cudalm {
 // One request's sampling configuration.
 struct SamplingConfig {
   float temperature = 0.0f;  // <=0 -> frozen greedy path; >0 -> sampling
-  int top_k = 0;  // <=0 -> disabled; >vocab_size clamps to vocab_size
+  int top_k = 0;  // 0 -> disabled; <0 invalid (fail loud); >vocab_size clamps
   float top_p = 1.0f;  // (0,1]; 1.0 -> disabled
   std::uint64_t seed = 0;  // per-request RNG seed (ignored in greedy mode)
 
@@ -114,9 +115,19 @@ struct SplitMix64 {
 
 // The effective probability vector after temperature -> top-k -> top-p ->
 // normalize (stages 1-4; does NOT consume the RNG). p[i] == 0 for excluded
-// tokens; the sum over survivors is 1 within fp32 rounding. Greedy mode:
-// one-hot at argmax_bf16 (the frozen pick). Precondition: vocab >= 1,
-// logits non-null, finite logits (the model produces finite bf16).
+// tokens; the sum over survivors is 1 within fp32 rounding of the stored
+// probabilities. Greedy mode: one-hot at argmax_bf16 (the frozen pick).
+// Precondition: vocab >= 1, logits non-null, finite logits (the model
+// produces finite bf16).
+//
+// NUMERICAL CONTRACT: the scaled logits / max / exp chain runs in DOUBLE.
+// A finite bf16 logit (|x| <= ~3.4e38) divided by the SMALLEST legal
+// positive float temperature (denorm_min ~1.4e-45) is ~2.4e83 — far inside
+// the double range, so for EVERY valid finite positive temperature the
+// result is a legal normalized distribution: all probabilities finite, at
+// least one strictly positive (the max-scaled argmax contributes exp(0)),
+// and no inf/NaN can ever be produced (a float-scaled pipeline overflows
+// to inf for such temperatures and then inf - max -> NaN).
 inline std::vector<float> effective_probabilities(const __nv_bfloat16* logits,
                                                   int vocab,
                                                   const SamplingConfig& cfg) {
@@ -126,12 +137,14 @@ inline std::vector<float> effective_probabilities(const __nv_bfloat16* logits,
     p[static_cast<std::size_t>(argmax_bf16(logits, vocab))] = 1.0f;
     return p;
   }
-  // Stage 1: temperature scaling (T > 0 here; contract-gated upstream).
-  std::vector<float> f(static_cast<std::size_t>(vocab));
-  float max_f = -std::numeric_limits<float>::infinity();
+  // Stage 1: temperature scaling in DOUBLE (see the numerical contract
+  // above; T > 0 here, contract-gated upstream).
+  std::vector<double> f(static_cast<std::size_t>(vocab));
+  double max_f = -std::numeric_limits<double>::infinity();
   for (int i = 0; i < vocab; ++i) {
-    f[static_cast<std::size_t>(i)] = __bfloat162float(logits[i]) /
-                                     cfg.temperature;
+    f[static_cast<std::size_t>(i)] =
+        static_cast<double>(__bfloat162float(logits[i])) /
+        static_cast<double>(cfg.temperature);
     max_f = std::max(max_f, f[static_cast<std::size_t>(i)]);
   }
   // The deterministic order used by both filters: value descending, tie ->
@@ -160,13 +173,11 @@ inline std::vector<float> effective_probabilities(const __nv_bfloat16* logits,
     std::sort(survivors.begin(), survivors.end(), by_value_then_id);
     double total = 0.0;
     for (int i : survivors)
-      total += std::exp(static_cast<double>(f[static_cast<std::size_t>(i)] -
-                                            max_f));
+      total += std::exp(f[static_cast<std::size_t>(i)] - max_f);
     double cum = 0.0;
     int cut = static_cast<int>(survivors.size()) - 1;
     for (std::size_t j = 0; j < survivors.size(); ++j) {
-      cum += std::exp(static_cast<double>(
-          f[static_cast<std::size_t>(survivors[j])] - max_f));
+      cum += std::exp(f[static_cast<std::size_t>(survivors[j])] - max_f);
       if (cum >= static_cast<double>(cfg.top_p) * total ||
           j + 1 == survivors.size()) {
         cut = static_cast<int>(j);
@@ -181,14 +192,12 @@ inline std::vector<float> effective_probabilities(const __nv_bfloat16* logits,
   double norm = 0.0;
   for (int i = 0; i < vocab; ++i)
     if (keep[static_cast<std::size_t>(i)])
-      norm += std::exp(static_cast<double>(f[static_cast<std::size_t>(i)] -
-                                           max_f));
+      norm += std::exp(f[static_cast<std::size_t>(i)] - max_f);
   for (int i = 0; i < vocab; ++i)
     if (keep[static_cast<std::size_t>(i)])
       p[static_cast<std::size_t>(i)] =
-          static_cast<float>(std::exp(
-              static_cast<double>(f[static_cast<std::size_t>(i)] - max_f)) /
-                             norm);
+          static_cast<float>(
+              std::exp(f[static_cast<std::size_t>(i)] - max_f) / norm);
   return p;
 }
 
@@ -196,6 +205,13 @@ inline std::vector<float> effective_probabilities(const __nv_bfloat16* logits,
 // delegates to the frozen argmax_bf16 and consumes ZERO RNG. Sampling mode
 // consumes exactly ONE rng draw (u in [0,1)) per call. Deterministic for
 // fixed (logits, cfg, rng state).
+//
+// RETURN CONTRACT: for vocab >= 1 and finite logits the result is ALWAYS in
+// [0, vocab) — the double pipeline (see effective_probabilities) guarantees
+// at least one strictly positive probability, so the cumulative walk always
+// finds a hit or falls back to the last survivor. The only -1 is the
+// documented precondition failure (vocab <= 0 / null logits); callers
+// (generator) additionally range-check defensively.
 inline int sample_token(const __nv_bfloat16* logits, int vocab,
                         const SamplingConfig& cfg, SplitMix64* rng) {
   if (vocab <= 0 || logits == nullptr) return -1;
@@ -211,7 +227,10 @@ inline int sample_token(const __nv_bfloat16* logits, int vocab,
       if (u < cum) return i;
     }
   }
-  return last_kept;  // rounding gap at the very end -> last survivor
+  // Rounding gap at the very end -> last survivor (guaranteed >= 0 for
+  // vocab >= 1 by the numerical contract; the argmax fallback is a
+  // defensive last resort that can only fire on a logic bug).
+  return last_kept >= 0 ? last_kept : argmax_bf16(logits, vocab);
 }
 
 // One request's sampler: the config + its per-request RNG. Construct one per

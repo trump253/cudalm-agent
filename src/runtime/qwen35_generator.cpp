@@ -79,13 +79,26 @@ GenerationResult Qwen35Generator::generate_impl(
 
   // Host logits scratch (reused each step) for the CPU token pick + observer.
   std::vector<__nv_bfloat16> h_logits(static_cast<std::size_t>(vocab));
-  auto read_logits = [&]() -> int {
+  // Reads the current device logits to the host and picks the next token.
+  // Defensive range check: the sampler's contract is [0, vocab) for vocab
+  // >= 1; if a logic bug ever produced anything else (e.g. -1), it must
+  // NEVER reach forward_token — fail loud instead.
+  auto read_logits = [&](int* out_token) -> bool {
     CUDA_CHECK(cudaMemcpyAsync(h_logits.data(), model_.logits(),
                                static_cast<std::size_t>(vocab) *
                                    sizeof(__nv_bfloat16),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    return sampler.sample(h_logits.data(), vocab);
+    const int t = sampler.sample(h_logits.data(), vocab);
+    if (t < 0 || t >= vocab) {
+      result.ok = false;
+      result.error = "internal error: sampler returned token id " +
+                     std::to_string(t) + " outside [0, " +
+                     std::to_string(vocab) + ")";
+      return false;
+    }
+    *out_token = t;
+    return true;
   };
 
   // ---- fresh reset (single request; each generate() starts clean) ---------
@@ -110,7 +123,8 @@ GenerationResult Qwen35Generator::generate_impl(
   }
 
   // ---- prefill-last logits predict the first generated token (position N) --
-  int next = read_logits();
+  int next = -1;
+  if (!read_logits(&next)) return result;
 
   GreedyStopController stop{eos_token_id, max_new_tokens, N, max_seq};
   for (int step = 0; step < max_new_tokens; ++step) {
@@ -133,7 +147,7 @@ GenerationResult Qwen35Generator::generate_impl(
     // Continue: forward the token + read the next candidate.
     model_.forward_token(next, stop.position_of(step), stream);
     result.forward_count++;
-    next = read_logits();
+    if (!read_logits(&next)) return result;
   }
   result.stop_reason = StopReason::MaxNewTokens;
   return result;

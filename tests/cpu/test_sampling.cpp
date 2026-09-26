@@ -14,6 +14,8 @@
 //   * extreme / all-negative      : max-subtracted softmax stays finite
 //   * exact ties                  : deterministic tiebreaks end to end
 //   * single remaining candidate  : top_k == 1 -> deterministic argmax
+//   * extreme temperatures        : FLT_MIN / denorm_min / FLT_MAX stay a
+//                                   legal distribution (double pipeline)
 
 #include "../../tests/common/check.h"
 #include "cudalm/greedy.h"
@@ -23,6 +25,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -488,6 +491,103 @@ int test_single_candidate() {
   return 0;
 }
 
+// 12) EXTREME TEMPERATURES (regression: the float-scaled pipeline overflowed
+//     here — logit / denorm_min -> inf, then inf - max -> NaN, all
+//     probabilities NaN, sample_token returned -1). The scaled/max/exp chain
+//     now runs in double: for EVERY legal finite positive temperature a
+//     finite bf16 logit vector must yield a legal distribution (all p
+//     finite, sum ~= 1) and a sample_token result in [0, vocab).
+int test_extreme_temperatures() {
+  const std::vector<float> pos = {200.0f, 100.0f, -200.0f};      // bf16-exact
+  const std::vector<float> neg = {-200.0f, -100.0f, 200.0f};     // bf16-exact
+  const std::vector<float> tie = {200.0f, 200.0f, -200.0f};      // bf16-exact
+  {
+    // T = smallest NORMAL float: scaled ~1.7e40 (float: inf; double: fine).
+    const std::vector<__nv_bfloat16> l = bf(pos);
+    SamplingConfig c;
+    c.temperature = std::numeric_limits<float>::min();
+    const std::vector<float> p = effective_probabilities(l.data(), 3, c);
+    for (int i = 0; i < 3; ++i) CHECK(std::isfinite(p[i]));
+    CHECK(p[0] == 1.0f);
+    CHECK(p[1] == 0.0f);
+    CHECK(p[2] == 0.0f);
+    double sum = 0.0;
+    for (float x : p) sum += x;
+    CHECK(close_rel(sum, 1.0, 1e-6));
+    for (std::uint64_t s = 0; s < 16; ++s) {
+      SplitMix64 rng(s);
+      const int t = sample_token(l.data(), 3, c, &rng);
+      CHECK(t >= 0 && t < 3);
+      CHECK_EQ(t, 0);
+    }
+  }
+  {
+    // T = smallest DENORMAL float (denorm_min ~1.4e-45): scaled ~1.4e47 —
+    // far outside float, inside double. Negative-leading extreme logits.
+    const std::vector<__nv_bfloat16> l = bf(neg);
+    SamplingConfig c;
+    c.temperature = std::numeric_limits<float>::denorm_min();
+    const std::vector<float> p = effective_probabilities(l.data(), 3, c);
+    for (int i = 0; i < 3; ++i) CHECK(std::isfinite(p[i]));
+    CHECK(p[0] == 0.0f);
+    CHECK(p[1] == 0.0f);
+    CHECK(p[2] == 1.0f);
+    double sum = 0.0;
+    for (float x : p) sum += x;
+    CHECK(close_rel(sum, 1.0, 1e-6));
+    for (std::uint64_t s = 0; s < 16; ++s) {
+      SplitMix64 rng(s);
+      const int t = sample_token(l.data(), 3, c, &rng);
+      CHECK(t >= 0 && t < 3);
+      CHECK_EQ(t, 2);
+    }
+  }
+  {
+    // T = denorm_min on a TIED maximum: p = {0.5, 0.5, 0}; every sample
+    // stays in {0,1} for every seed.
+    const std::vector<__nv_bfloat16> l = bf(tie);
+    SamplingConfig c;
+    c.temperature = std::numeric_limits<float>::denorm_min();
+    const std::vector<float> p = effective_probabilities(l.data(), 3, c);
+    for (int i = 0; i < 3; ++i) CHECK(std::isfinite(p[i]));
+    CHECK(close_rel(p[0], 0.5, 1e-6));
+    CHECK(close_rel(p[1], 0.5, 1e-6));
+    CHECK(p[2] == 0.0f);
+    double sum = 0.0;
+    for (float x : p) sum += x;
+    CHECK(close_rel(sum, 1.0, 1e-6));
+    for (std::uint64_t s = 0; s < 16; ++s) {
+      SplitMix64 rng(s);
+      const int t = sample_token(l.data(), 3, c, &rng);
+      CHECK(t >= 0 && t < 3);
+      CHECK(t == 0 || t == 1);
+    }
+  }
+  {
+    // T = largest finite float (FLT_MAX): scaled ~5.9e-37 -> effectively
+    // uniform; still a legal distribution (all finite, sum ~= 1, in range).
+    const std::vector<__nv_bfloat16> l = bf(pos);
+    SamplingConfig c;
+    c.temperature = std::numeric_limits<float>::max();
+    const std::vector<float> p = effective_probabilities(l.data(), 3, c);
+    for (int i = 0; i < 3; ++i) CHECK(std::isfinite(p[i]));
+    CHECK(close_rel(p[0], 1.0 / 3.0, 1e-6));
+    CHECK(close_rel(p[1], 1.0 / 3.0, 1e-6));
+    CHECK(close_rel(p[2], 1.0 / 3.0, 1e-6));
+    double sum = 0.0;
+    for (float x : p) sum += x;
+    CHECK(close_rel(sum, 1.0, 1e-6));
+    for (std::uint64_t s = 0; s < 16; ++s) {
+      SplitMix64 rng(s);
+      const int t = sample_token(l.data(), 3, c, &rng);
+      CHECK(t >= 0 && t < 3);
+    }
+  }
+  std::printf("  [ok] extreme temperatures (FLT_MIN / denorm_min / FLT_MAX: "
+              "finite p, sum ~= 1, sample in [0, vocab))\n");
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -504,6 +604,7 @@ int main() {
   rc |= test_extreme_logits();
   rc |= test_exact_ties();
   rc |= test_single_candidate();
+  rc |= test_extreme_temperatures();
   if (rc != 0) {
     std::fprintf(stderr, "test_sampling: FAIL\n");
     return rc;

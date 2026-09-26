@@ -5,6 +5,7 @@
 
 #include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <limits>
 
@@ -20,7 +21,8 @@ const char* generate_cli_usage() {
       "  --tokenizer <path>        the tokenizer file (CUDLMTK1); required\n"
       "  --prompt <text>           the raw UTF-8 prompt; required\n"
       "  --max-new-tokens <N>      maximum tokens to generate (default 64)\n"
-      "  --temperature <float>     sampling temperature (finite; <=0 = greedy)\n"
+      "  --temperature <float>     sampling temperature (finite,\n"
+      "                            representable float; <=0 = greedy)\n"
       "  --top-k <N>               keep only the best k candidates (default 0\n"
       "                            = disabled; larger than the vocab clamps)\n"
       "  --top-p <float>           keep the smallest set of top candidates\n"
@@ -46,6 +48,25 @@ bool parse_float(const char* s, float* out) {
   const double v = std::strtod(s, &end);
   if (end == s || *end != '\0') return false;
   *out = static_cast<float>(v);
+  return true;
+}
+
+// Full-consumption --temperature parse with float-range guarantees: the TEXT
+// must round to a representable float. Overflow to inf and underflow to ZERO
+// are usage errors — a silent 0 would silently switch to greedy, and a
+// silent inf is a different (invalid) config. The explicit "0" / "-0" text
+// is the documented greedy spelling and stays legal; denormal floats (down
+// to denorm_min) are legal values.
+bool parse_temperature(const char* s, float* out) {
+  if (s == nullptr || *s == '\0') return false;
+  char* end = nullptr;
+  const double v = std::strtod(s, &end);
+  if (end == s || *end != '\0') return false;
+  if (!std::isfinite(v)) return false;
+  const float f = static_cast<float>(v);
+  if (!std::isfinite(f)) return false;        // overflow -> inf
+  if (f == 0.0f && v != 0.0) return false;    // underflow to zero (no silent greedy)
+  *out = f;
   return true;
 }
 
@@ -114,8 +135,9 @@ bool parse_generate_cli_args(int argc, char* const* argv,
     } else if (a == "--temperature") {
       v = need_value(i, "--temperature");
       if (!v) return false;
-      if (!parse_float(v, &o.temperature))
-        return fail("--temperature must be a finite number");
+      if (!parse_temperature(v, &o.temperature))
+        return fail("--temperature must be a finite, representable float "
+                    "(the text overflows to inf or underflows to zero)");
       o.sampling_flag_given = true;
       o.temperature_given = true;
     } else if (a == "--top-k") {
@@ -163,6 +185,15 @@ bool parse_generate_cli_args(int argc, char* const* argv,
     return fail("missing required argument --prompt");
 
   *out = o;
+  return true;
+}
+
+bool write_generated_text(const std::string& text, std::FILE* out) {
+  if (out == nullptr) return false;
+  if (!text.empty() &&
+      std::fwrite(text.data(), 1, text.size(), out) != text.size())
+    return false;  // short write
+  if (std::fputc('\n', out) != '\n') return false;
   return true;
 }
 

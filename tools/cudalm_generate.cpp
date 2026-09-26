@@ -98,9 +98,19 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // The generated text (and nothing else) on stdout.
-  std::fputs(r.generated_text.c_str(), stdout);
-  std::fputc('\n', stdout);
-  if (std::fflush(stdout) != 0) return 1;
+  // The generated text (and nothing else) on stdout — binary-safe /
+  // length-aware (embedded NUL bytes are written in full).
+  if (!write_generated_text(r.generated_text, stdout)) {
+    std::fprintf(stderr,
+                 "cudalm-generate: failed to write the generated text to "
+                 "stdout\n");
+    return 1;
+  }
+  if (std::fflush(stdout) != 0) {
+    std::fprintf(stderr,
+                 "cudalm-generate: failed to write the generated text to "
+                 "stdout\n");
+    return 1;
+  }
   return 0;
 }

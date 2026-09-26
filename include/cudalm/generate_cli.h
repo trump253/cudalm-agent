@@ -33,6 +33,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 #include "cudalm/sampling.h"
@@ -78,5 +79,14 @@ const char* generate_cli_usage();
 // left in a partial/undefined state (do not use it).
 bool parse_generate_cli_args(int argc, char* const* argv,
                              GenerateCliOptions* out, std::string* error);
+
+// Binary-safe, length-aware stdout payload: writes the generated text as
+// its EXACT byte sequence (std::string::data + size — embedded NUL bytes,
+// which the native decode can legitimately produce, are NOT truncated; a
+// fputs/c_str()-style write would stop at the first NUL) plus the single
+// trailing newline of the CLI contract. Returns false on a short write
+// (the executable maps that to a runtime failure, exit 1). stdout carries
+// ONLY this payload; errors go to stderr.
+bool write_generated_text(const std::string& text, std::FILE* out);
 
 }  // namespace cudalm
