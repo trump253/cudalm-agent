@@ -70,7 +70,12 @@ cudalm_add_test(test_state_pool_formulas test_state_pool_formulas
 # per-request SAMPLING RNG isolation (A(seed 42) interleaved == A alone;
 # same prompt + same seed => identical streams regardless of
 # interleaving), fatal Status (Failed + retire exactly once, the
-# iteration's remaining snapshot ids still advance).
+# iteration's remaining snapshot ids still advance; a FAILED forward is
+# not committed: forward_count + prefill_pos exclude it — prompt
+# {50,99} with 50 ok/99 failing -> forward_count 1, prefill_pos 1, NOT
+# 2; run() failure isolation: a request that fatals during run() does
+# not stop the other live requests — they run to completion and run()
+# returns the first error).
 cudalm_add_test(test_qwen35_scheduler test_qwen35_scheduler
                 cpu/test_qwen35_scheduler.cpp)
 

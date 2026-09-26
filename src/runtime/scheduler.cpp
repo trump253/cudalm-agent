@@ -176,7 +176,9 @@ Status Scheduler::advance_one(Request& r) {
   int token;
   if (prefill) {
     token = r.prompt[static_cast<std::size_t>(r.prefill_pos)];
-    r.prefill_pos++;  // the forward is about to cover this position
+    // Do NOT advance prefill_pos yet: it counts SUCCESSFULLY forwarded
+    // prompt tokens, so the increment happens only after the forward
+    // below succeeds (a failed forward leaves prefill_pos unchanged).
   } else {
     // Decode only starts after the first generated token exists (it was
     // sampled from the prefill-last forward); an empty `generated` here
@@ -193,11 +195,17 @@ Status Scheduler::advance_one(Request& r) {
   Status s = fwd_.forward_token(token, r.sequence_id, mgr_, stream_);
   if (!s.ok) {
     // Fatal Status: terminal exactly once (Failed) + retire exactly once.
-    // The request is never advanced again.
+    // The request is never advanced again. The failed forward is NOT
+    // committed: prefill_pos (prefill) and forward_count are unchanged
+    // (e.g. prompt {50, 99} with 50 ok / 99 failing -> forward_count = 1,
+    // prefill_pos = 1, NOT 2).
     r.status = RequestStatus::Failed;
     r.finish_reason = FinishReason::Failed;
     finish(r, RequestStatus::Failed, FinishReason::Failed);
     return s;
+  }
+  if (prefill) {
+    r.prefill_pos++;  // the forward succeeded: commit the progress
   }
   r.forward_count++;
   if (r.status == RequestStatus::Waiting) {
@@ -268,10 +276,15 @@ Status Scheduler::step() {
 }
 
 Status Scheduler::run() {
-  // Deterministic bound: request i forwards at most
-  // prompt_i.size() + max_new_tokens_i - 1 tokens, one per iteration it
-  // is live in, so after the SUM of those bounds every request is
-  // terminal. Exceeding it is an internal invariant violation.
+  // Failure isolation (pinned contract): run until EVERY request is
+  // terminal. A failing step does NOT stop the other live requests: the
+  // failed request is terminal (Failed + retired) and is never advanced
+  // again, while the remaining requests keep advancing in the following
+  // iterations; run() returns the FIRST error encountered (or ok).
+  // Termination: each live request either succeeds one forward per
+  // iteration (bounded by prompt.size() + max_new_tokens - 1) or becomes
+  // terminal on a failed forward — so the loop always ends.
+  // Deterministic bound: the SUM of the per-request bounds.
   std::uint64_t bound = 0;
   for (const auto& kv : requests_) {
     const Request& r = kv.second;
@@ -281,6 +294,7 @@ Status Scheduler::run() {
     bound += static_cast<std::uint64_t>(r.prompt.size()) +
              static_cast<std::uint64_t>(std::max(1, r.max_new_tokens)) - 1;
   }
+  Status first_error;
   for (std::uint64_t i = 0;; ++i) {
     bool any_live = false;
     for (const auto& kv : requests_) {
@@ -290,15 +304,15 @@ Status Scheduler::run() {
       }
     }
     if (!any_live) {
-      return Status::ok_status();
+      return first_error;  // ok when nothing failed, else the first error
     }
     if (i > bound) {
       scheduler_fatal("run() did not converge", 0,
                       "iteration bound exceeded (logic bug)");
     }
     Status s = step();
-    if (!s.ok) {
-      return s;
+    if (!s.ok && first_error.ok) {
+      first_error = s;  // record + CONTINUE (the other requests proceed)
     }
   }
 }

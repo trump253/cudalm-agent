@@ -152,9 +152,13 @@ class Scheduler {
   // still advance; the first error is returned.
   Status step();
 
-  // Run step() until every request is terminal (deterministic; bounded —
+  // Run step() until EVERY request is terminal (deterministic; bounded —
   // fails loud if the bound is exceeded, which cannot happen for a
-  // correctly advancing forwarder).
+  // correctly advancing forwarder). FAILURE ISOLATION (pinned): a failing
+  // step does NOT stop the other live requests — the failed request is
+  // terminal (Failed + retired) and is never advanced again, while the
+  // remaining requests keep advancing in the following iterations; the
+  // first error encountered (or ok) is returned.
   Status run();
 
   // Inspect (nullptr if unknown). Terminal requests remain inspectable.

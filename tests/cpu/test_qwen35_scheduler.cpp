@@ -690,18 +690,27 @@ int test_sampling_isolation() {
 }
 
 // ---- 9. fatal Status -> Failed + retire, iteration continues ---------------
+// ---- 9. fatal Status: failed-prefill progress + run() isolation ---------
 int test_fatal_status() {
   std::fprintf(stderr, "[fatal-status]\n");
   Qwen35Config cfg = small_config();
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreate(&stream));
-  FakeForwarder fwd;
+
+  // (a) HARD GATE: run() failure isolation — a request that fatals during
+  // run() must NOT stop the other live requests: A -> Failed + retired,
+  // B keeps advancing across later iterations until it finishes, and
+  // run() returns the FIRST error. The failed forward is NOT committed
+  // to the progress: forward_count and prefill_pos exclude it (prompt
+  // {50, 99} with 50 ok / 99 failing -> forward_count = 1, prefill_pos
+  // = 1, NOT 2), and the sequence is retired exactly once.
   {
+    FakeForwarder fwd;
     Qwen35StateManager mgr(cfg, 2, 8, 4, stream);
     Scheduler sched(fwd, mgr, stream);
     RequestId a = 0, b = 0;
     Scheduler::Spec sa;
-    sa.prompt = {50, 99};  // A: the 2nd prompt token faults
+    sa.prompt = {50, 99};  // A: the 2nd prompt token faults inside run()
     sa.max_new_tokens = 2;
     sa.sampling = SamplingConfig::greedy();
     Scheduler::Spec sb;
@@ -711,34 +720,81 @@ int test_fatal_status() {
     CHECK(sched.admit(sa, &a).ok);
     CHECK(sched.admit(sb, &b).ok);
     fwd.fail_token = 99;
-    // Step 1: A p0 ok, B p0 ok.
+    Status s = sched.run();
+    CHECK(!s.ok);  // the first error is reported...
+    CHECK_EQ(sched.get(a)->status, RequestStatus::Failed);
+    CHECK_EQ(sched.get(a)->finish_reason, FinishReason::Failed);
+    CHECK_EQ(sched.get(a)->forward_count, 1);  // ... but the failed
+                                               // forward is NOT counted
+    CHECK_EQ(sched.get(a)->prefill_pos, 1);    // ... nor committed to the
+                                               // progress (NOT 2)
+    // ... while B was never stopped: it ran to completion afterwards.
+    CHECK_EQ(sched.get(b)->status, RequestStatus::Finished);
+    CHECK_EQ(sched.get(b)->finish_reason, FinishReason::MaxNewTokens);
+    CHECK_EQ(sched.get(b)->forward_count, expected_forwards(2, 2));
+    CHECK_EQ(sched.num_live(), 0);
+    CHECK_EQ(mgr.num_live_sequences(), 0);  // both sequences retired exactly
+                                            // once (A on failure, B on finish)
+    // Stale (failed) request is never advanced again; cancel is the
+    // idempotent no-op (already terminal).
+    CHECK(sched.cancel(a).ok);
+    CHECK_EQ(sched.get(a)->status, RequestStatus::Failed);
+    CHECK_EQ(sched.get(a)->forward_count, 1);
+    CHECK_EQ(sched.get(a)->prefill_pos, 1);
+  }
+
+  // (b) step-level pins: the SAME failure observed one step at a time —
+  // the failed forward is not committed (prefill_pos stays 1), and the
+  // remaining snapshot ids of the FAILING step still advance (B does its
+  // p1 in the very step where A's p1 faults).
+  {
+    FakeForwarder fwd;
+    Qwen35StateManager mgr(cfg, 2, 8, 4, stream);
+    Scheduler sched(fwd, mgr, stream);
+    RequestId a = 0, b = 0;
+    Scheduler::Spec sa;
+    sa.prompt = {50, 99};
+    sa.max_new_tokens = 2;
+    sa.sampling = SamplingConfig::greedy();
+    Scheduler::Spec sb;
+    sb.prompt = {60, 61};
+    sb.max_new_tokens = 2;
+    sb.sampling = SamplingConfig::greedy();
+    CHECK(sched.admit(sa, &a).ok);
+    CHECK(sched.admit(sb, &b).ok);
+    fwd.fail_token = 99;
+    // Step 1: A p0 (50) ok, B p0 ok — both commit progress.
     CHECK(sched.step().ok);
     CHECK_EQ(sched.get(a)->forward_count, 1);
-    // Step 2: A p1 (token 99) FAILS -> A Failed + retired; B p1 still
-    // advances (the remaining snapshot ids continue); step() reports the
-    // first error.
+    CHECK_EQ(sched.get(a)->prefill_pos, 1);
+    CHECK_EQ(sched.get(b)->forward_count, 1);
+    CHECK_EQ(sched.get(b)->prefill_pos, 1);
+    // Step 2: A p1 (99) FAILS -> A Failed + retired, prefill_pos stays 1
+    // (the failed token is NOT committed); B p1 STILL advances in this
+    // same step (the remaining snapshot ids continue); step() reports
+    // the first error.
     Status s = sched.step();
     CHECK(!s.ok);
     CHECK_EQ(sched.get(a)->status, RequestStatus::Failed);
     CHECK_EQ(sched.get(a)->finish_reason, FinishReason::Failed);
-    CHECK_EQ(sched.get(a)->forward_count, 1);  // the failed forward doesn't count
+    CHECK_EQ(sched.get(a)->forward_count, 1);  // failed forward not counted
+    CHECK_EQ(sched.get(a)->prefill_pos, 1);    // failed token not committed
     CHECK_EQ(sched.get(b)->forward_count, 2);  // B unaffected by A's failure
+    CHECK_EQ(sched.get(b)->prefill_pos, 2);
     CHECK_EQ(mgr.num_live_sequences(), 1);  // A retired, B live
-    // A is never advanced again; B completes.
+    // Step 3: only B advances (A is terminal); B decodes g0 and finishes.
     fwd.fail_token = -1;
-    CHECK(sched.run().ok);
-    CHECK_EQ(sched.get(a)->status, RequestStatus::Failed);  // unchanged
-    CHECK_EQ(sched.get(a)->forward_count, 1);
+    CHECK(sched.step().ok);
     CHECK_EQ(sched.get(b)->status, RequestStatus::Finished);
+    CHECK_EQ(sched.get(b)->forward_count, expected_forwards(2, 2));
+    CHECK_EQ(sched.get(a)->status, RequestStatus::Failed);  // stale: untouched
+    CHECK_EQ(sched.get(a)->forward_count, 1);
+    CHECK_EQ(sched.get(a)->prefill_pos, 1);
     CHECK_EQ(mgr.num_live_sequences(), 0);
-    // Cancel after failure: idempotent ok (already terminal).
-    CHECK(sched.cancel(a).ok);
-    CHECK_EQ(sched.get(a)->status, RequestStatus::Failed);
   }
   CUDA_CHECK(cudaStreamDestroy(stream));
   return 0;
 }
-
 
 int main() {
   int rc = 0;
@@ -759,6 +815,7 @@ int main() {
       "test_qwen35_scheduler: PASS (lifecycle + monotonic RequestId + "
       "transactional admission + FIFO/round-robin snapshot + "
       "prefill/decode coexistence + EOS/max_new_tokens + cancel/retire + "
-      "per-request sampling RNG isolation + fatal Status)\n");
+      "per-request sampling RNG isolation + fatal Status (failed forward "
+      "not committed to progress + run() failure isolation))\n");
   return 0;
 }
