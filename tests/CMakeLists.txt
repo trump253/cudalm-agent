@@ -37,6 +37,24 @@ cudalm_add_test(test_sampling test_sampling cpu/test_sampling.cpp)
 cudalm_add_test(test_generate_cli_args test_generate_cli_args
                 cpu/test_generate_cli_args.cpp)
 
+# v0.5 Phase A: hybrid state-manager foundations (CPU metadata gates).
+#   * test_fixed_id_pool: the shared allocator core — unique live ids,
+#     LIFO reuse, OOM, double-free/invalid rejection, fixed-seed stress,
+#     exact accounting.
+#   * test_kv_block_table: logical block table vs a fake page source —
+#     position decomposition boundary matrix, minimal prefix growth,
+#     one page per block, TRANSACTIONAL OOM rollback (no leaked page),
+#     bounds, clear, LIFO reuse identity.
+#   * test_state_pool_formulas: ALL pool sizing derives from the
+#     Qwen35Config hybrid schedule (0.8B: 6 full/18 linear; page/slot
+#     byte sizes for page_tokens 4/8/16) — no magic constants.
+cudalm_add_test(test_fixed_id_pool test_fixed_id_pool
+                cpu/test_fixed_id_pool.cpp)
+cudalm_add_test(test_kv_block_table test_kv_block_table
+                cpu/test_kv_block_table.cpp)
+cudalm_add_test(test_state_pool_formulas test_state_pool_formulas
+                cpu/test_state_pool_formulas.cpp)
+
 # --- CUDA tests ---------------------------------------------------------------
 cudalm_add_test(test_cuda_smoke test_cuda_smoke cuda/test_cuda_smoke.cpp)
 cudalm_add_test(test_elementwise_rmsnorm test_elementwise_rmsnorm cuda/test_elementwise_rmsnorm.cpp)
@@ -53,6 +71,14 @@ cudalm_add_test(test_qwen35_kernels test_qwen35_kernels cuda/test_qwen35_kernels
 cudalm_add_test(test_rope test_rope cuda/test_rope.cpp)
 cudalm_add_test(test_kv_cache test_kv_cache cuda/test_kv_cache.cpp)
 cudalm_add_test(test_attention test_attention cuda/test_attention.cpp)
+# v0.5 Phase A: hybrid state-manager DEVICE gate (no checkpoint): KV page
+# pool + Delta state pool allocator/OOM/stress, REAL on-device reuse
+# contamination (dirty pattern -> release -> reuse -> all zeros, conv+rec
+# and K+V across every layer), block table on the real pool, sequence
+# lifecycle (no aliasing, reset/retire, SequenceId monotone non-reuse),
+# and OOM transactional behavior (table/accounting unchanged on failure).
+cudalm_add_test(test_qwen35_state_manager test_qwen35_state_manager
+                cuda/test_qwen35_state_manager.cpp)
 
 # --- Cross-language weight-file tests (Python tools -> C++ loader) ------------
 # tools/convert_weights.py (torch, offline) emits data/block_v01.cudalm into
