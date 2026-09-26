@@ -117,6 +117,13 @@ add_executable(tool_qwen35_tokenizer_dump
                tools/dump_qwen35_tokenizer.cpp)
 target_link_libraries(tool_qwen35_tokenizer_dump PRIVATE cudalm)
 
+# --------------------------------------------------------------------------
+# User-facing CLI (v0.4 Phase C): raw UTF-8 prompt -> generated text.
+# Single request, serial, no streaming / chat template / batching (docs §21).
+# --------------------------------------------------------------------------
+add_executable(cudalm-generate tools/cudalm_generate.cpp)
+target_link_libraries(cudalm-generate PRIVATE cudalm)
+
 add_subdirectory(tests)
 add_subdirectory(benchmarks)
 

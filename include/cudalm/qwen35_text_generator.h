@@ -1,4 +1,4 @@
-// CUDALM — Qwen3.5 text-level generation facade (v0.4 Phase B).
+// CUDALM — Qwen3.5 text-level generation facade (v0.4 Phase B + C).
 //
 // A THIN facade over the two already-gated components:
 //
@@ -11,13 +11,14 @@
 //                                      in the text, exactly like HF)
 //     -> TextGenerationResult
 //
-// Scope inherits Phase A verbatim: single request, GREEDY only (no sampling
-// / temperature / top-k / top-p / beam), serial prefill, no batching, no
-// streaming, no chat template, no KV/Graph optimization. This class adds NO
-// model state and NO generation logic — it only stitches the two gated
-// contracts together, so every byte of text in/out is covered by an existing
-// hard gate (tokenizer corpus vs pinned HF; generation goldens vs the
-// pinned-quantized oracle).
+// Scope inherits Phase A verbatim: single request, serial prefill, no
+// batching, no streaming, no chat template, no KV/Graph optimization.
+// Phase A = GREEDY only; Phase C adds a SamplingConfig overload that drives
+// the generator's sampling pick (cudalm/sampling.h). This class adds NO
+// model state and NO generation/sampling logic — it only stitches the two
+// gated contracts together, so every byte of text in/out is covered by an
+// existing hard gate (tokenizer corpus vs pinned HF; generation goldens vs
+// the pinned-quantized oracle).
 //
 // No special/control token string literals appear in this file or its
 // implementation: the EOS is carried by id (the tokenizer's artifact).
@@ -75,6 +76,15 @@ class Qwen35TextGenerator {
   // input-contract violation — Phase A contract).
   TextGenerationResult generate_text(const std::string& prompt_text,
                                      int max_new_tokens,
+                                     cudaStream_t stream) const;
+
+  // Phase C: the same three-stage stitch with a sampling config. A greedy
+  // config (temperature <= 0) is bit-for-bit the overload above; a sampling
+  // config runs the generator's per-request seeded sampler (the facade adds
+  // no sampling logic of its own).
+  TextGenerationResult generate_text(const std::string& prompt_text,
+                                     int max_new_tokens,
+                                     const SamplingConfig& sampling,
                                      cudaStream_t stream) const;
 
  private:

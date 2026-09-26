@@ -22,6 +22,15 @@ Status Qwen35TextGenerator::decode_ids(const std::vector<std::uint32_t>& ids,
 TextGenerationResult Qwen35TextGenerator::generate_text(
     const std::string& prompt_text, int max_new_tokens,
     cudaStream_t stream) const {
+  // The Phase A greedy API: bit-for-bit the sampling overload with the
+  // greedy config (temperature <= 0 -> the frozen argmax path).
+  return generate_text(prompt_text, max_new_tokens, SamplingConfig::greedy(),
+                       stream);
+}
+
+TextGenerationResult Qwen35TextGenerator::generate_text(
+    const std::string& prompt_text, int max_new_tokens,
+    const SamplingConfig& sampling, cudaStream_t stream) const {
   TextGenerationResult r;
 
   // 1) Native encode (fail loud on invalid UTF-8 / internal errors).
@@ -38,15 +47,15 @@ TextGenerationResult Qwen35TextGenerator::generate_text(
     return r;
   }
 
-  // 2) Greedy generation with the tokenizer's REAL pinned EOS (Phase A
-  //    contract: the generator validates eos / max_new / prompt ids and
-  //    never partially forwards on a contract violation).
+  // 2) Generation with the tokenizer's REAL pinned EOS (the generator
+  //    validates eos / max_new / prompt ids + the sampling config and never
+  //    partially forwards on a contract violation).
   const std::vector<int> prompt(r.prompt_token_ids.begin(),
                                 r.prompt_token_ids.end());
   Qwen35Generator gen(model_);
   const GenerationResult gr = gen.generate(
       prompt, max_new_tokens, static_cast<int>(tokenizer_.eos_token_id()),
-      stream);
+      stream, sampling);
   if (!gr.ok) {
     r.ok = false;
     r.error = gr.error;

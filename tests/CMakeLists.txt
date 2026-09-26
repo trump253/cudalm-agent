@@ -23,6 +23,20 @@ cudalm_add_test(test_qwen35_deltanet_config test_qwen35_deltanet_config
 cudalm_add_test(test_greedy_argmax test_greedy_argmax cpu/test_greedy_argmax.cpp)
 cudalm_add_test(test_greedy_stop test_greedy_stop cpu/test_greedy_stop.cpp)
 
+# v0.4 Phase C: CPU sampling (cudalm/sampling.h) — mathematically pinned
+# synthetic-logits correctness: greedy compatibility (frozen argmax),
+# temperature scaling (== softmax(logits/T)), top-k (ties -> lowest id,
+# >vocab clamps), top-p (minimal prefix, >=1 kept), k+p composition (fixed
+# order), seed reproducibility, different-seed streams, invalid config,
+# extreme/all-negative logits, exact ties, single remaining candidate.
+cudalm_add_test(test_sampling test_sampling cpu/test_sampling.cpp)
+
+# v0.4 Phase C: CLI argument parsing (cudalm/generate_cli.h) — CPU-only, no
+# model: --help, missing required args, unknown flags, bad numerics, mode
+# resolution (greedy default / sampling flags / --greedy exclusivity).
+cudalm_add_test(test_generate_cli_args test_generate_cli_args
+                cpu/test_generate_cli_args.cpp)
+
 # --- CUDA tests ---------------------------------------------------------------
 cudalm_add_test(test_cuda_smoke test_cuda_smoke cuda/test_cuda_smoke.cpp)
 cudalm_add_test(test_elementwise_rmsnorm test_elementwise_rmsnorm cuda/test_elementwise_rmsnorm.cpp)
@@ -422,6 +436,36 @@ if(CUDALM_PYTHON3)
                      ${CMAKE_SOURCE_DIR}
                      ${CMAKE_BINARY_DIR}/data/qwen35_textgen)
     set_tests_properties(test_qwen35_text_generation PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+    # --- v0.4 Phase C: sampling integration (real checkpoint) ---------------
+    # greedy EXACT (old API == greedy-config new API, ids/stop/forward),
+    # seed determinism (A(42) == A(42)), the request-level contamination gate
+    # A(42) -> B(123) -> A(42) at the id AND the text level (model-state reset
+    # + per-request sampler RNG reset), sampling sanity + invalid-config
+    # fail-loud. Self-skips (77) when the artifacts are absent.
+    add_executable(test_qwen35_sampling cuda/test_qwen35_sampling.cpp)
+    target_link_libraries(test_qwen35_sampling PRIVATE cudalm)
+    add_test(NAME test_qwen35_sampling
+             COMMAND test_qwen35_sampling
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk)
+    set_tests_properties(test_qwen35_sampling PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+    # --- v0.4 Phase C: `cudalm-generate` CLI smoke (the real binary) --------
+    # --help / usage errors (exit 2 + message) / bad model+tokenizer paths
+    # (exit 1 + message) / invalid sampling config (exit 2) / greedy path /
+    # sampling path with same-seed byte-identical stdout / UTF-8 (CJK) prompt.
+    add_executable(test_cudalm_generate_cli
+                   cuda/test_cudalm_generate_cli.cpp)
+    target_link_libraries(test_cudalm_generate_cli PRIVATE cudalm)
+    add_test(NAME test_cudalm_generate_cli
+             COMMAND test_cudalm_generate_cli
+                     $<TARGET_FILE:cudalm-generate>
+                     ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                     ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk)
+    set_tests_properties(test_cudalm_generate_cli PROPERTIES
       SKIP_RETURN_CODE 77 TIMEOUT 1800)
   else()
     message(STATUS "tool python lacks torch/safetensors/numpy: "

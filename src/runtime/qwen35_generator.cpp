@@ -1,13 +1,17 @@
-// CUDALM — Qwen3.5 generation runtime implementation (v0.4 Phase A).
+// CUDALM — Qwen3.5 generation runtime implementation (v0.4 Phase A + C).
 //
 // Drives the existing Qwen35Model accessors (reset_state / forward_token /
-// logits) to run a single-request, serial-prefill, greedy-decode generation.
-// No new CUDA kernel, no new model state — the model threads its OWN
-// persistent state across the serial steps.
+// logits) to run a single-request, serial-prefill generation. No new CUDA
+// kernel, no new model state — the model threads its OWN persistent state
+// across the serial steps. Phase C adds the sampling token pick (CPU-only,
+// per-request seeded; cudalm/sampling.h): a greedy config runs the FROZEN
+// Phase A argmax bit-for-bit (zero RNG), a sampling config runs the fixed
+// temperature -> top-k -> top-p -> normalize -> sample pipeline.
 
 #include "cudalm/qwen35_generator.h"
 
 #include <cuda_bf16.h>
+#include <string>
 
 #include "cudalm/cuda_check.h"
 #include "cudalm/qwen35_config.h"
@@ -17,6 +21,24 @@ namespace cudalm {
 GenerationResult Qwen35Generator::generate(
     const std::vector<int>& prompt_tokens, int max_new_tokens, int eos_token_id,
     cudaStream_t stream, const LogitsObserver* observer) {
+  // The Phase A greedy API: bit-for-bit the frozen path (greedy config ->
+  // the frozen argmax_bf16 pick, zero RNG consumption).
+  return generate_impl(prompt_tokens, max_new_tokens, eos_token_id, stream,
+                       SamplingConfig::greedy(), observer);
+}
+
+GenerationResult Qwen35Generator::generate(
+    const std::vector<int>& prompt_tokens, int max_new_tokens, int eos_token_id,
+    cudaStream_t stream, const SamplingConfig& sampling,
+    const LogitsObserver* observer) {
+  return generate_impl(prompt_tokens, max_new_tokens, eos_token_id, stream,
+                       sampling, observer);
+}
+
+GenerationResult Qwen35Generator::generate_impl(
+    const std::vector<int>& prompt_tokens, int max_new_tokens, int eos_token_id,
+    cudaStream_t stream, const SamplingConfig& sampling,
+    const LogitsObserver* observer) {
   GenerationResult result;
   const Qwen35Config& cfg = model_.config();
   const int vocab = cfg.vocab_size;
@@ -27,6 +49,11 @@ GenerationResult Qwen35Generator::generate(
     result.ok = false;
     result.error = msg;
   };
+  std::string serr;
+  if (!validate_sampling_config(sampling, &serr)) {
+    fail(serr.c_str());
+    return result;
+  }
   if (!model_.loaded()) { fail("model not loaded"); return result; }
   if (prompt_tokens.empty()) { fail("empty prompt"); return result; }
   if (max_new_tokens < 0) { fail("max_new_tokens < 0"); return result; }
@@ -44,7 +71,13 @@ GenerationResult Qwen35Generator::generate(
   result.prompt_count = N;
   result.ok = true;
 
-  // Host logits scratch (reused each step) for the CPU argmax + the observer.
+  // Per-request sampler (its SplitMix64 is seeded from `sampling.seed`; a
+  // new generate() constructs a new one, so RNG state never crosses
+  // requests). Greedy configs run the frozen argmax inside sampler.sample()
+  // without consuming the RNG.
+  Sampler sampler(sampling);
+
+  // Host logits scratch (reused each step) for the CPU token pick + observer.
   std::vector<__nv_bfloat16> h_logits(static_cast<std::size_t>(vocab));
   auto read_logits = [&]() -> int {
     CUDA_CHECK(cudaMemcpyAsync(h_logits.data(), model_.logits(),
@@ -52,7 +85,7 @@ GenerationResult Qwen35Generator::generate(
                                    sizeof(__nv_bfloat16),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    return argmax_bf16(h_logits.data(), vocab);
+    return sampler.sample(h_logits.data(), vocab);
   };
 
   // ---- fresh reset (single request; each generate() starts clean) ---------

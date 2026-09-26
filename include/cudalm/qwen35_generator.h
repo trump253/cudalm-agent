@@ -5,9 +5,10 @@
 // Qwen35Model — it drives the model's existing forward_token / logits /
 // reset_state accessors.
 //
-// Scope (v0.4 Phase A, docs §19):
+// Scope (v0.4 Phase A + C, docs §19/§21):
 //   * single request only (no batching / multi-request / scheduler);
-//   * greedy only (no sampling / temperature / top-k / top-p / beam);
+//   * greedy (Phase A — frozen, bit-for-bit) + minimal sampling (Phase C:
+//     temperature / top-k / top-p / seed; see cudalm/sampling.h);
 //   * SERIAL (token-by-token) prefill — a correctness-first baseline, NOT a
 //     batched/chunked prefill and NOT a performance claim;
 //   * the runtime threads the model's OWN persistent state (no golden state
@@ -37,6 +38,7 @@
 
 #include "cudalm/greedy.h"
 #include "cudalm/qwen35_model.h"
+#include "cudalm/sampling.h"
 
 namespace cudalm {
 
@@ -88,7 +90,35 @@ class Qwen35Generator {
                             cudaStream_t stream,
                             const LogitsObserver* observer = nullptr);
 
+  // Run a single generation request with a sampling config (v0.4 Phase C).
+  // Same prefill/decode semantics, input/capacity contract and result shape
+  // as the greedy overload above; the ONLY difference is the per-step token
+  // pick: a greedy config (temperature <= 0, e.g. SamplingConfig::greedy())
+  // runs the FROZEN Phase A argmax path bit-for-bit (zero RNG consumption),
+  // while a sampling config uses the fixed temperature -> top-k -> top-p ->
+  // normalize -> sample pipeline (cudalm/sampling.h) with a per-request
+  // SplitMix64 seeded by `sampling.seed`.
+  //
+  // Additional contract (fail loud, same style as the input contract):
+  // an INVALID sampling config (validate_sampling_config) -> ok == false +
+  // error set, NOTHING forwarded. EOS / max_new_tokens / max_seq_len stop
+  // semantics and the forward count are UNCHANGED by sampling.
+  GenerationResult generate(const std::vector<int>& prompt_tokens,
+                            int max_new_tokens, int eos_token_id,
+                            cudaStream_t stream,
+                            const SamplingConfig& sampling,
+                            const LogitsObserver* observer = nullptr);
+
  private:
+  // The shared request core (both public overloads drive it; the greedy
+  // overload passes SamplingConfig::greedy(), which is bit-for-bit the
+  // Phase A path).
+  GenerationResult generate_impl(const std::vector<int>& prompt_tokens,
+                                 int max_new_tokens, int eos_token_id,
+                                 cudaStream_t stream,
+                                 const SamplingConfig& sampling,
+                                 const LogitsObserver* observer);
+
   Qwen35Model& model_;
 };
 
