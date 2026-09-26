@@ -791,3 +791,119 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
    Phase B；无 paged-attention kernel / 无 external-state model
    forward / 无多序列执行 / 无 scheduler / 无 batching 类特性（见
    架构文档 §22.5）。待 external reviewer 签核。
+
+## CUDALM v0.5 Phase B（External Hybrid State 接入 + Paged KV Kernel）
+
+ - **承接**：v0.4 **DONE/FROZEN**（`V04_EVIDENCE_SHA = 5aba21fe…`，已
+   merge 进 main）+ v0.5 Phase A（state 控制面 + 设备 state 池，
+   分支 `v0.5-state-manager`）。Phase B 把 Phase A 的 external
+   hybrid state **接入 model** 并落地**真 paged KV kernel**（写 +
+   因果 decode attention，块表寻址在 kernel 内，**禁止先 gather 成
+   contiguous KV 再调旧 kernel**，无 KV 值 host roundtrip）。冻结的
+   v0.4 数学**零语义修改**：legacy `forward()` /
+   `forward_token()` / `Qwen35Generator` / CLI 行为不变，legacy
+   contiguous `Qwen35KvCache` 原样保留（`forwardImpl` 尾部仅多一个
+   `PagedStateRef* paged = nullptr` 分支参数；DeltaNet `forward()`
+   改为以层自持 state 委托同一 `forward_impl`，数学零修改）。
+ - **新增 runtime 代码（全部 CUDALM-native，无移植）**：
+   `include/cudalm/kernels/paged_kv.h` + `src/kernels/paged_kv.cu`
+   —— `qwen35_paged_kv_write_bf16`（把一个 token 的 `n_kv*head_dim`
+   K/V 元素写入块表指向 page 的 `(n*pt+off)*hd` 行；部分块 guard）
+   + `qwen35_paged_attention_decode_bf16`（对 `[0, position]` 全 KV
+   行做因果 decode attention，块表寻址；scores 每 (h,t) 内 d 升序
+   fp32 累加 / GQA `kh = h*n_kv/n_heads`、softmax 为冻结 kernel 的
+   1:1 镜像（3-pass、O(num_warps) smem、同一 reduction 树）、PV 每
+   (h,d) 内 t 升序 —— **op 序与冻结 contiguous kernel 逐一对齐 →
+   parity 要求 bit-identical 而非容差**；scratch =
+   `[scores2 | probs]` 各 `n_heads*(position+1)` bf16）。
+   **修改**：`qwen35_deltanet.{h,cpp}`（新增
+   `forward_with_state(position, x, ext_conv, ext_rec, stream)` +
+   `forward_impl`，state 指针外提，数学零修改）、
+   `qwen35_full_attention.{h,cpp}`（新增 `PagedStateRef` +
+   `forward_with_paged_state`，只替换 KV 写与 attention 读两个
+   stage）、`qwen35_model.{h,cpp}`（新增
+   `forward_token_with_state(token, seq_id, mgr, stream)` +
+   grow-only `block_table_scratch_`）、
+   `qwen35_kv_page_pool.h`（`page_stride_elems() = page_elems()`：
+   池布局 row-major `[n_full][num_pages][…]`，**同一 ordinal 相邻
+   page 物理相邻**，ordinal 间距 = capacity*page_elems —— Phase B
+   开发中曾因把 page_stride 误设为 ordinal 间距导致 "page p" 落到
+   ordinal (ord+p) 的 page 0，parity 门抓出后修正并固化，见架构
+   §23.2）、`qwen35_state_manager.h`（`kv_pool_mut()` /
+   `delta_pool_mut()` / `page_tokens()`）、`kv_block_table.h`
+   （`page_ids()` host 视图）。
+ - **设备块表策略**：每序列一张 `KvBlockTable`（Phase A，CPU
+   前缀表）；每 token forward 做一次**小 H2D `cudaMemcpyAsync`**
+   把当前前缀 `num_blocks` 个 page id 拷进 grow-only 设备 buffer
+   （`max_blocks()` int，永不重分配）——唯一跨 H/D 的每 token
+   元数据拷贝，stream-ordered；kernel 只读
+   `[0, position/page_tokens]` 前缀（page id 精确、无 stale 读；
+   旧尾部残留的大 id 永不被触及，独立门用 9999 sentinel 双证）。
+ - **OOM-before-mutation 契约（钉死）**：
+   `forward_token_with_state` 顺序 = 加载/token/lookup 检查 →
+   `position = rec->length` → `position >= max_seq_len` 检查 →
+   **`ensure_kv_capacity`（最先的 state 触点）** → 块表 H2D →
+   embedding → 24 层 external forward → final norm + LM head →
+   **`advance(+1)` 最后**。KV OOM / 未知-retire 序列 / 越界长度 /
+   非法 token 全部 Status fail-loud 且**零 mutation**（无 delta
+   变化、无 KV 变化、length 不变、无部分 forward；硬门以 48 项
+   state 前后 bit-identical + 4 项 accounting 不变钉死）。
+ - **新增测试（2 个，均 PASS；合成门无 checkpoint 依赖，parity 门
+   真实检查点）**：`test_paged_kv`（合成：写门 非平凡映射
+   {3,0,5,1,4,2}/{5,2,0,3,1,4} × position {0, pt-1, pt, pt+1}
+   物理行 EXACT + 未写行保持零 + stale sentinel；attention 门 16
+   组 (position × mapping) 对冻结 contiguous kernel BIT-IDENTICAL；
+   真实形状门 0.8B 真实维度 n_heads 16 / n_kv 8 / **head_dim 64**
+   （H1024/16）× pt=2 × 池布局（相邻 page + 两交错 ordinal）×
+   映射 {2,0,1} × T {2,3,4,5,6}（逐 token 跨页边界）
+   BIT-IDENTICAL）；`test_qwen35_state_parity`（真实
+   Qwen3.5-0.8B checkpoint，CLI 参数
+   `<full_model.cudalm> <checkpoint_dir> <python> <src_dir>`，
+   缺失时 exit 77 → ctest SKIP_RETURN_CODE 77 / TIMEOUT 1800：
+   A = legacy `reset_state` + 6 × `forward_token` vs B = 全新
+   manager（page_tokens 2、池 3 page 恰 6 token 容量、4 delta
+   slot）+ `create_sequence` + 6 × `forward_token_with_state`，
+   token 流 {1024, 2048, 3072, 15, 16, 17}（跨 pt=2 页边界、恰
+   填满池）；每 step embedding + 24 层 final + final norm +
+   全量 logits[248320] **bit-identical**（runtime-vs-runtime →
+   atol=0 / memcmp，无容差）；终态 18 × DeltaNet conv/rec +
+   6 × 全注意力**逻辑行 0..5 K/V**（external 侧经 host 块表从
+   物理 page device→host 逐行读；legacy 侧按
+   `[n_kv][max_seq][hd]` 的 `(n*max_seq+t)*hd` 逐行取）
+   **bit-identical**；第 7 token OOM → `!s.ok` + 48 项 state 前后
+   bit-identical + length/num_blocks/used_state_bytes/live_pages
+   不变；未知 id 999 与非法 token（vocab+7）fail-loud 且 length
+   不变；`reset_sequence` 后重放同 6 token → 每 step logits +
+   终态 48 项与首次 B 运行 bit-identical、length == 6）。
+ - **完整 regression（于本 evidence SHA，clean tree）**：完整
+   ctest **51/51 PASS、0 skipped**（含 v0.4 全部门面回归：
+   generation / sampling / tokenizer / CLI / 各 golden /
+   full-model forward 全绿；parity 门在 evidence 环境**真实运行**，
+   非 77 skip）；`scripts/check_no_torch.sh` **CLEAN**。
+ - **Sanitizer（于本 evidence SHA）**：v0.5 Phase B **引入新
+   kernel + 新 H2D 元数据 path**：`compute-sanitizer --tool
+   memcheck`（RTX 2080 Ti / CUDA 11.8）对 `test_paged_kv`：
+   **ERROR SUMMARY: 0 errors**；对 `test_qwen35_state_parity`
+   （真实 checkpoint 全流程，含块表 H2D + paged kernel + state
+   capture 的 device→host 拷贝）：**ERROR SUMMARY: 0 errors**。
+ - **evidence 绑定**：`V05B_EVIDENCE_SHA =
+   79d1ac523e4d96a91e75c33b389487ceb37eb2fa`（clean tree、
+   HEAD == SHA；完整 ctest 51/51 PASS 0 skipped +
+   check_no_torch CLEAN + 两个新测试的 compute-sanitizer memcheck
+   各 0 错误，均于该 SHA）。**失效声明（未删除历史）**：Phase B
+   functional commit 修改了 `src/runtime/`、`include/`、`tests/`
+   与 functional CMake，按失效规则：**`V05A_EVIDENCE_SHA =
+   2319a261543e1af75f544a6a57592b0193074312`（及其更早绑定
+   `866a2e46142f2a3a77deddf72809081eb58b47a1`）失效**；
+   **`V04_EVIDENCE_SHA = 5aba21fe…` 同规则失效** —— 其全部门面
+   回归已在本 SHA 的 51/51 内重跑全绿。Phase A 的池/manager 代码
+   本身未被 Phase B 修改（仅新增 API 与 pool stride 修正），但
+   证据绑定按规则整体失效、须以本 SHA 为准。失效规则延续：此后
+   任何 `src/` / `include/` / `tools/` / `tests/` / functional
+   CMake 修改 → 本 evidence 失效必须重跑；仅 docs/evidence
+   修改不失效。
+ - **边界（明说）**：Phase B **不** merge 进 main、**不**自启
+   Phase C；无 双序列交错硬门 / scheduler / admission / continuous
+   batching / batched decode / chunked prefill / streaming /
+   PagedAttention perf / CUDA Graph / NCU / fusion / HTTP-OpenAI
+   server（见架构文档 §23.4）。待 external reviewer 签核。
