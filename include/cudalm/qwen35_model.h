@@ -123,12 +123,22 @@ class Qwen35Model {
   //   embedding -> 24 layers (external state) -> final RMSNorm -> LM head
   //   sequence.length += 1
   //
-  // FAIL LOUD (Status, no partial effect): unknown/retired sequence id;
-  // invalid token_id; length >= max_seq_len; KV page OOM. The KV OOM check
-  // (ensure_kv_capacity) runs BEFORE any model-state mutation — on OOM no
-  // DeltaNet state, no KV page, and the sequence length are changed, and
-  // no layer forward ran. (The frozen legacy forward_token's
-  // precondition-abort contract is unchanged and separate.)
+  // COMPATIBILITY GATES (checked FIRST, before ANY state mutation — no KV
+  // allocation, no Delta mutation, length unchanged, no layer forward):
+  //   * mgr.config() == config(): a manager built for a different model
+  //     config would address pools with the wrong layout -> Status error;
+  //   * stream == mgr.kv_pool().stream() && stream ==
+  //     mgr.delta_pool().stream(): Phase A/B single-stream contract (v0.5
+  //     is single-stream, correctness-first; no cross-stream event
+  //     machinery) -> Status error on any other stream.
+  //
+  // FAIL LOUD (Status, no partial effect): config/stream mismatch;
+  // unknown/retired sequence id; invalid token_id; length >= max_seq_len;
+  // KV page OOM. The KV OOM check (ensure_kv_capacity) runs BEFORE any
+  // model-state mutation — on OOM no DeltaNet state, no KV page, and the
+  // sequence length are changed, and no layer forward ran. (The frozen
+  // legacy forward_token's precondition-abort contract is unchanged and
+  // separate.)
   Status forward_token_with_state(int token_id, SequenceId seq_id,
                                   Qwen35StateManager& mgr,
                                   cudaStream_t stream);

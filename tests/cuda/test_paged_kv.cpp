@@ -27,6 +27,7 @@
 #include "cudalm/device_buffer.h"
 #include "cudalm/kernels/paged_kv.h"
 #include "cudalm/kernels/qwen35_kernels.h"
+#include "cudalm/qwen35_config.h"
 
 #include <cstdio>
 #include <cstring>
@@ -285,34 +286,43 @@ int test_paged_attention_parity() {
 }
 
 // ---------------------------------------------------------------------------
-// Real-model-shape scenario: the exact Qwen3.5-0.8B full-attention dims
-// (n_heads 16, n_kv 8, head_dim 64) with the small page_tokens = 2 used by
-// the Phase B parity gate, TWO interleaved layer ordinals in ONE page array
-// (the Phase-A pool layout: row-major [n_full][num_pages][n_kv][pt][hd],
-// i.e. the pages of one ordinal are ADJACENT with stride
-// n_kv*pt*hd, and ordinals are num_pages*n_kv*pt*hd apart), a
-// non-trivial mapping
-// {2,0,1}, and the boundary positions 1,2,3,4,5 (every position crosses a
-// page boundary at pt=2 from position 2 on). Same gates: paged KV write
-// physical rows EXACT; paged attention BIT-IDENTICAL to the frozen
-// contiguous kernel; stale sentinels in the block table.
+// Real-model-shape scenario: the REAL Qwen3.5-0.8B full-attention
+// dimensions read straight from the frozen Qwen35Config::qwen35_08b()
+// (n_heads 8, n_kv_heads 2, head_dim 256 — pinned by CHECK, no hand-
+// written constants) combined with a 2-ordinal MINIATURE pool-layout
+// fixture in ONE page array (the Phase-A pool layout: row-major
+// [n_full][num_pages][n_kv][page_tokens][head_dim], i.e. the pages of one
+// ordinal are ADJACENT with stride page_elems = n_kv*page_tokens*head_dim,
+// and ordinals are num_pages*page_elems apart), the small page_tokens = 2
+// used by the Phase B parity gate, a non-trivial mapping {2,0,1}, and the
+// boundary positions 1,2,3,4,5 (every position crosses a page boundary at
+// pt=2 from position 2 on). Same gates: paged attention BIT-IDENTICAL to
+// the frozen contiguous kernel; stale sentinels in the block table. The
+// full 6-ordinal real-checkpoint path is covered by
+// test_qwen35_state_parity.
 // ---------------------------------------------------------------------------
-const int kRealNkv = 8;
-const int kRealNheads = 16;
-const int kRealHd = 64;  // 0.8B: hidden 1024 / 16 heads
 const int kRealPt = 2;
 const int kRealNumPages = 3;
-const int kRealNfull = 2;
+const int kRealNfull = 2;  // miniature pool-layout fixture (2 ordinals)
 const int kRealMaxSeq = 12;  // 6 blocks at pt=2
 
 int test_real_shape_parity() {
+  // Real Qwen3.5-0.8B attention dimensions from the frozen config.
+  const Qwen35Config real = Qwen35Config::qwen35_08b();
+  CHECK_EQ(real.n_heads, 8);
+  CHECK_EQ(real.n_kv_heads, 2);
+  CHECK_EQ(real.head_dim, 256);
+  const int n_heads = real.n_heads;
+  const int n_kv = real.n_kv_heads;
+  const int hd = real.head_dim;
+
   cudaStream_t s;
   CUDA_CHECK(cudaStreamCreate(&s));
   {
     const int mapA[3] = {2, 0, 1};
     const int kMaxT = 6;
     const std::size_t page_elems =
-        static_cast<std::size_t>(kRealNkv) * kRealPt * kRealHd;
+        static_cast<std::size_t>(n_kv) * kRealPt * hd;
     // True pool layout: pages of one ordinal are adjacent (stride
     // page_elems); ordinals are kRealNumPages * page_elems apart.
     const std::size_t page_stride = page_elems;
@@ -322,39 +332,36 @@ int test_real_shape_parity() {
     DeviceBuffer k, v, kc, vc, q, out_p, out_c, scratch_p, scratch_c, bt;
     k.allocate(per_ord * 2, s);
     v.allocate(per_ord * 2, s);
-    kc.allocate(static_cast<std::size_t>(kRealNkv) * kRealMaxSeq *
-                    kRealHd * 2,
-                s);
-    vc.allocate(static_cast<std::size_t>(kRealNkv) * kRealMaxSeq *
-                    kRealHd * 2,
-                s);
-    q.allocate(static_cast<std::size_t>(kRealNheads) * kRealHd * 2, s);
-    out_p.allocate(static_cast<std::size_t>(kRealNheads) * kRealHd * 2, s);
-    out_c.allocate(static_cast<std::size_t>(kRealNheads) * kRealHd * 2, s);
+    kc.allocate(static_cast<std::size_t>(n_kv) * kRealMaxSeq * hd * 2, s);
+    vc.allocate(static_cast<std::size_t>(n_kv) * kRealMaxSeq * hd * 2, s);
+    q.allocate(static_cast<std::size_t>(n_heads) * hd * 2, s);
+    out_p.allocate(static_cast<std::size_t>(n_heads) * hd * 2, s);
+    out_c.allocate(static_cast<std::size_t>(n_heads) * hd * 2, s);
     scratch_p.allocate(
-        static_cast<std::size_t>(2) * kRealNheads * kRealMaxSeq * 2, s);
+        static_cast<std::size_t>(2) * n_heads * kRealMaxSeq * 2, s);
     scratch_c.allocate(
-        static_cast<std::size_t>(2) * kRealNheads * kRealMaxSeq * 2, s);
+        static_cast<std::size_t>(2) * n_heads * kRealMaxSeq * 2, s);
     bt.allocate(sizeof(int) * 8, s);
 
     // Host scratch reused for every seed (avoids repeated large host
     // allocations).
     std::vector<__nv_bfloat16> kh(per_ord, __float2bfloat16_rn(0.0f));
     std::vector<__nv_bfloat16> vh(per_ord, __float2bfloat16_rn(0.0f));
-    // Seed one LAYER ORDINAL (ordinal 0 — base k.data()) with logical rows
-    // [0..T) under the pool layout; every other row stays exactly zero.
+    // Seed one LAYER ORDINAL (ordinal 0 — base k.data()) of the miniature
+    // 2-ordinal fixture with logical rows [0..T) under the pool layout;
+    // every other row stays exactly zero.
     auto seed = [&](const int* map, int T, std::size_t ord_base) {
       for (int t = 0; t < T; ++t) {
         const int page = map[t / kRealPt];
         const int off = t % kRealPt;
-        for (int n = 0; n < kRealNkv; ++n)
-          for (int d = 0; d < kRealHd; ++d) {
+        for (int n = 0; n < n_kv; ++n)
+          for (int d = 0; d < hd; ++d) {
             const std::size_t idx = ord_base +
                                     static_cast<std::size_t>(page) *
                                         page_stride +
                                     (static_cast<std::size_t>(n) * kRealPt +
                                      off) *
-                                        kRealHd +
+                                        hd +
                                     d;
             kh[idx] = syn(t, n, d);
             vh[idx] = syn(t + 1000, n, d);
@@ -366,12 +373,12 @@ int test_real_shape_parity() {
                                  cudaMemcpyHostToDevice, s));
     };
 
-    // Deterministic q for the 16 query heads.
+    // Deterministic q for all query heads.
     std::vector<__nv_bfloat16> qh(
-        static_cast<std::size_t>(kRealNheads) * kRealHd);
-    for (int h = 0; h < kRealNheads; ++h)
-      for (int d = 0; d < kRealHd; ++d)
-        qh[static_cast<std::size_t>(h) * kRealHd + d] =
+        static_cast<std::size_t>(n_heads) * hd);
+    for (int h = 0; h < n_heads; ++h)
+      for (int d = 0; d < hd; ++d)
+        qh[static_cast<std::size_t>(h) * hd + d] =
             __float2bfloat16_rn(
                 (static_cast<float>((h * 53 + d * 11) % 89) - 44.0f) / 7.0f);
     CUDA_CHECK(cudaMemcpyAsync(q.data(), qh.data(), qh.size() * 2,
@@ -380,18 +387,17 @@ int test_real_shape_parity() {
     // Contiguous reference cache for all logical rows up to kMaxT (the
     // kernels read only [0..position]).
     {
-      std::vector<__nv_bfloat16> kh(static_cast<std::size_t>(kRealNkv) *
-                                        kRealMaxSeq * kRealHd,
+      std::vector<__nv_bfloat16> kh(static_cast<std::size_t>(n_kv) *
+                                        kRealMaxSeq * hd,
                                     __float2bfloat16_rn(0.0f));
-      std::vector<__nv_bfloat16> vh(static_cast<std::size_t>(kRealNkv) *
-                                        kRealMaxSeq * kRealHd,
+      std::vector<__nv_bfloat16> vh(static_cast<std::size_t>(n_kv) *
+                                        kRealMaxSeq * hd,
                                     __float2bfloat16_rn(0.0f));
       for (int t = 0; t < kMaxT; ++t)
-        for (int n = 0; n < kRealNkv; ++n)
-          for (int d = 0; d < kRealHd; ++d) {
+        for (int n = 0; n < n_kv; ++n)
+          for (int d = 0; d < hd; ++d) {
             const std::size_t idx =
-                (static_cast<std::size_t>(n) * kRealMaxSeq + t) * kRealHd +
-                d;
+                (static_cast<std::size_t>(n) * kRealMaxSeq + t) * hd + d;
             kh[idx] = syn(t, n, d);
             vh[idx] = syn(t + 1000, n, d);
           }
@@ -415,26 +421,23 @@ int test_real_shape_parity() {
       kernels::qwen35_attention_decode_bf16(
           q.data<__nv_bfloat16>(), kc.data<__nv_bfloat16>(),
           vc.data<__nv_bfloat16>(), position, out_c.data<__nv_bfloat16>(),
-          kRealNheads, kRealNkv, kRealHd, kRealMaxSeq,
-          scratch_c.data<__nv_bfloat16>(), s);
+          n_heads, n_kv, hd, kRealMaxSeq, scratch_c.data<__nv_bfloat16>(), s);
       kernels::qwen35_paged_attention_decode_bf16(
           q.data<__nv_bfloat16>(), k.data<__nv_bfloat16>(),
           v.data<__nv_bfloat16>(), static_cast<int*>(bt.data()), position,
-          kRealPt, out_p.data<__nv_bfloat16>(), kRealNheads, kRealNkv,
-          kRealHd, page_stride, scratch_p.data<__nv_bfloat16>(), s);
+          kRealPt, out_p.data<__nv_bfloat16>(), n_heads, n_kv, hd,
+          page_stride, scratch_p.data<__nv_bfloat16>(), s);
       CUDA_CHECK(cudaStreamSynchronize(s));
-      const std::vector<__nv_bfloat16> oc = d2h(
-          out_c.data<__nv_bfloat16>(),
-          static_cast<std::size_t>(kRealNheads) * kRealHd, s);
-      const std::vector<__nv_bfloat16> op = d2h(
-          out_p.data<__nv_bfloat16>(),
-          static_cast<std::size_t>(kRealNheads) * kRealHd, s);
+      const std::vector<__nv_bfloat16> oc = d2h(out_c.data<__nv_bfloat16>(),
+                                                static_cast<std::size_t>(n_heads) * hd, s);
+      const std::vector<__nv_bfloat16> op = d2h(out_p.data<__nv_bfloat16>(),
+                                                static_cast<std::size_t>(n_heads) * hd, s);
       CHECK(bits_equal(op, oc));  // BIT-IDENTICAL
       ++checked;
     }
-    std::printf("  [ok] real-shape (16/8/64, pt=2, pool layout, "
-                "map {2,0,1}) attention BIT-IDENTICAL: %d cases\n",
-                checked);
+    std::printf("  [ok] real-shape (%d/%d/%d, pt=2, 2-ordinal pool "
+                "fixture, map {2,0,1}) attention BIT-IDENTICAL: %d cases\n",
+                n_heads, n_kv, hd, checked);
   }
   CUDA_CHECK(cudaStreamDestroy(s));
   return 0;

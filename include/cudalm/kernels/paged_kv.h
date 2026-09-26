@@ -14,10 +14,15 @@
 //   row(n,t) = pages[page * page_stride + (n * page_tokens + offset) * head_dim]
 //
 // where `page_stride` (in bf16 elements) is the distance between two
-// consecutive pages of the SAME layer: `n_kv_heads*page_tokens*head_dim`
-// when one layer's pages are stored adjacently (standalone tests), and
-// `num_pages * n_kv_heads * page_tokens * head_dim` for the Phase-A pool
-// layout (pages of one layer are strided by the whole page array).
+// consecutive pages of the SAME layer ordinal. In the Phase-A pool layout
+// (row-major [n_full][num_pages][n_kv_heads][page_tokens][head_dim]) the
+// pages of one ordinal are ADJACENT, so it is EXACTLY
+// `n_kv_heads*page_tokens*head_dim` (== Qwen35KvPagePool::page_elems() ==
+// Qwen35KvPagePool::page_stride_elems()); ordinals are
+// `num_pages * n_kv_heads * page_tokens * head_dim` apart, and a call
+// selects its ordinal by passing `k_page(ord, 0)` as the page-array base.
+// The ordinal stride is NOT the kernel page_stride (passing it as one
+// would land "page p" in ordinal (ord+p)'s page 0).
 //
 // So physical pages may be completely non-contiguous while the attention
 // still reads tokens 0..position in LOGICAL order. There is NO host-side

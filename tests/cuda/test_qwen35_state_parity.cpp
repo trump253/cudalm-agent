@@ -21,6 +21,11 @@
 // paged_kv.h) — any non-zero difference is a real bug.
 //
 // Plus the Phase B lifecycle gates:
+//   * COMPATIBILITY GATES: a manager built for a DIFFERENT config (n_kv
+//     heads 4 vs 2) is rejected before ANY mutation (no KV page, no Delta
+//     mutation, length unchanged); a forward on a DIFFERENT CUDA stream
+//     (v0.5 single-stream contract) is rejected the same way — all 48
+//     state items bit-identical + accounting unchanged;
 //   * OOM-BEFORE-MUTATION: with a 3-page pool (6 tokens at pt=2 exhaust it),
 //     the 7th forward_token_with_state fails with a Status OOM and NOTHING
 //     changed: length, block-table num_blocks, pool used/free, every
@@ -480,6 +485,69 @@ int main(int argc, char** argv) {
   }
 
   // -------------------------------------------------------------------
+  // COMPATIBILITY GATES (before ANY state mutation): a manager whose
+  // CONFIG or whose STREAM does not match the model is rejected fail-loud
+  // with ZERO mutation — no KV allocation, no Delta mutation, length
+  // unchanged, no layer forward.
+  // -------------------------------------------------------------------
+  {
+    // ---- mismatched manager config -> rejected before mutation ---------
+    {
+      Qwen35Config bad_cfg = cfg;
+      bad_cfg.n_kv_heads = 4;  // the loaded model config is 2 -> mismatch
+      Qwen35StateManager bad_mgr(bad_cfg, kPageTokens, kPoolPages,
+                                 /*delta_capacity_slots=*/4, stream);
+      SequenceId bad_sid = 0;
+      s = bad_mgr.create_sequence(&bad_sid);
+      CHECK(s.ok);
+      const std::size_t pre_used = bad_mgr.used_state_bytes();
+      const std::vector<int> pre_live = bad_mgr.kv_pool().live_pages();
+      const int pre_delta_slots = bad_mgr.delta_pool().used_slots();
+
+      s = model.forward_token_with_state(kTokens[0], bad_sid, bad_mgr,
+                                         stream);
+      CHECK(!s.ok);
+      std::fprintf(stderr, "  [ok] config-mismatched manager rejected: %s\n",
+                   s.message.c_str());
+
+      // Zero mutation on the mismatched manager: no KV page allocated, no
+      // Delta slot consumed by the forward, length unchanged.
+      CHECK_EQ(bad_mgr.used_state_bytes(), pre_used);
+      CHECK(bad_mgr.kv_pool().live_pages() == pre_live);
+      CHECK_EQ(bad_mgr.kv_pool().used_pages(), 0);
+      CHECK_EQ(bad_mgr.delta_pool().used_slots(), pre_delta_slots);
+      CHECK_EQ(bad_mgr.lookup(bad_sid)->length, 0);
+    }
+    // ---- mismatched CUDA stream -> rejected before mutation ------------
+    {
+      cudaStream_t other = nullptr;
+      CUDA_CHECK(cudaStreamCreate(&other));
+      StateSnap pre;
+      CHECK_EQ(capture_state_external(mgr, *rec, cfg, kN, stream, &pre), 0);
+      const int pre_len = rec->length;
+      const int pre_blocks = rec->block_table.num_blocks();
+      const std::size_t pre_used = mgr.used_state_bytes();
+      const std::vector<int> pre_live = mgr.kv_pool().live_pages();
+
+      s = model.forward_token_with_state(kTokens[0], sid, mgr, other);
+      CHECK(!s.ok);
+      std::fprintf(stderr, "  [ok] stream-mismatched forward rejected: %s\n",
+                   s.message.c_str());
+
+      // Zero mutation on the (config-matching) manager: all 48 state items
+      // bit-identical + accounting unchanged.
+      StateSnap post;
+      CHECK_EQ(capture_state_external(mgr, *rec, cfg, kN, stream, &post), 0);
+      rc |= cmp_state("gate.no-change", pre, post, kN, cfg);
+      CHECK_EQ(rec->length, pre_len);
+      CHECK_EQ(rec->block_table.num_blocks(), pre_blocks);
+      CHECK_EQ(mgr.used_state_bytes(), pre_used);
+      CHECK(mgr.kv_pool().live_pages() == pre_live);
+      CUDA_CHECK(cudaStreamDestroy(other));
+    }
+  }
+
+  // -------------------------------------------------------------------
   // RESET PARITY: reset_sequence() + SAME 6 tokens == first external run.
   // -------------------------------------------------------------------
   {
@@ -536,6 +604,6 @@ int main(int argc, char** argv) {
   }
   std::fprintf(stderr, "test_qwen35_state_parity: PASS (legacy == external "
                        "bit-identical: 6 steps x outputs + hybrid state + "
-                       "OOM-before-mutation + reset parity)\n");
+                       "compat gates + OOM-before-mutation + reset parity)\n");
   return 0;
 }

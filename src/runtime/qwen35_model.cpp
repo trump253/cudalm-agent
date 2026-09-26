@@ -186,6 +186,24 @@ Status Qwen35Model::forward_token_with_state(int token_id, SequenceId seq_id,
     return Status::error("Qwen35Model::forward_token_with_state: token_id " +
                          std::to_string(token_id) + " out of range [0, " +
                          std::to_string(cfg_.vocab_size) + ")");
+  // COMPATIBILITY GATE (before ANY state mutation — no KV allocation, no
+  // Delta mutation, length unchanged, no layer forward): the manager's
+  // config must be EXACTLY the model's config. A mismatched manager would
+  // address pool pages / delta slots with the wrong layout, so it is
+  // rejected fail-loud up front.
+  if (!(mgr.config() == cfg_))
+    return Status::error(
+        "Qwen35Model::forward_token_with_state: manager config does not "
+        "match the model config");
+  // SINGLE-STREAM CONTRACT (Phase A/B; v0.5 is single-stream,
+  // correctness-first — no cross-stream event machinery): every pool
+  // access happens on the pools' streams, so the caller's stream must be
+  // exactly the KV pool's and the Delta pool's stream.
+  if (stream != mgr.kv_pool().stream() || stream != mgr.delta_pool().stream())
+    return Status::error(
+        "Qwen35Model::forward_token_with_state: stream mismatch — v0.5 "
+        "is single-stream; the forward stream must equal the manager "
+        "pool streams");
   const SequenceState* rec = mgr.lookup(seq_id);
   if (rec == nullptr)
     return Status::error(

@@ -35,9 +35,11 @@ __device__ inline void paged_row(int t, int page_tokens,
 }
 
 // Element offset of row (kv head n, logical token page `page` at offset
-// `off`) from the layer's page-storage base: pages are `page_stride` bf16
-// elements apart (adjacent pages: n_kv*pt*hd; the Phase-A pool layout:
-// num_pages * n_kv * pt * hd).
+// `off`) from the layer's page-storage base: pages of one ordinal are
+// `page_stride` bf16 elements apart. In the Phase-A pool layout that is
+// exactly n_kv*pt*hd (pages of one ordinal adjacent; ordinals are
+// capacity_pages*n_kv*pt*hd apart and selected via the k_page(ord, 0)
+// base) — the ordinal stride is NOT the page_stride.
 __device__ inline std::size_t paged_row_offset(int page, int off, int n,
                                                int page_tokens, int head_dim,
                                                std::size_t page_stride) {
@@ -199,8 +201,9 @@ __global__ void qwen35_paged_attention_pv_kernel(
     acc += __bfloat162float(ph[t]) * __bfloat162float(vrow[d]);
   }
   // The frozen contiguous PV kernel has NO bounds guard (its grid is
-  // n_heads*head_dim / 128, exact at the runtime shape 16*256); this
-  // ceiling-rounded grid must guard the partial tail block.
+  // n_heads*head_dim / 128, exact at the real 0.8B runtime shape
+  // 8 heads * 256 head_dim); this ceiling-rounded grid must guard the
+  // partial tail block.
   if (idx < total) out[idx] = __float2bfloat16_rn(acc);
 }
 
