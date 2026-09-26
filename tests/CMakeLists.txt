@@ -55,6 +55,25 @@ cudalm_add_test(test_kv_block_table test_kv_block_table
 cudalm_add_test(test_state_pool_formulas test_state_pool_formulas
                 cpu/test_state_pool_formulas.cpp)
 
+# v0.6 Phase A: request scheduler / control-plane gate (CPU test: NO
+# checkpoint, NO model — a deterministic fake forwarder over the REAL
+# Qwen35StateManager pools). Gates: request lifecycle (Waiting/Running/
+# terminal records stay inspectable), monotonic never-reused RequestId,
+# TRANSACTIONAL admission (capacity exhaustion + input validation: no
+# leaked sequence, no half-request, no consumed RequestId; re-admission
+# after retire/cancel), deterministic FIFO/round-robin iteration with
+# snapshot semantics (admission order == RequestId order == iteration
+# order; a request admitted between iterations joins the NEXT one),
+# prefill/decode coexistence, EOS / max_new_tokens completion (exact
+# generated stream + forward count N + m - 1), cancel + retire (idempotent
+# re-cancel ok, unknown id fail-loud, stale request never advances),
+# per-request SAMPLING RNG isolation (A(seed 42) interleaved == A alone;
+# same prompt + same seed => identical streams regardless of
+# interleaving), fatal Status (Failed + retire exactly once, the
+# iteration's remaining snapshot ids still advance).
+cudalm_add_test(test_qwen35_scheduler test_qwen35_scheduler
+                cpu/test_qwen35_scheduler.cpp)
+
 # --- CUDA tests ---------------------------------------------------------------
 cudalm_add_test(test_cuda_smoke test_cuda_smoke cuda/test_cuda_smoke.cpp)
 cudalm_add_test(test_elementwise_rmsnorm test_elementwise_rmsnorm cuda/test_elementwise_rmsnorm.cpp)
@@ -154,6 +173,35 @@ add_test(NAME test_qwen35_state_interleave
                  ${CUDALM_TOOL_PYTHON3}
                  ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_qwen35_state_interleave PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# v0.6 Phase A: scheduler INTEGRATION hard gate (real checkpoint) — the
+# Phase A sign-off test. Scheduler semantics == independent execution:
+# A (3-tok prompt, max_new 3, seed 42) + B (7-tok prompt, max_new 2, seed
+# 123) admitted, 2 iterations, then C (2-tok prompt, max_new 3, seed 7)
+# admitted DYNAMICALLY, run to completion (deterministic FIFO/round-robin;
+# one single-sequence forward_token_with_state per advance, single model +
+# single stream — NO batched CUDA compute in Phase A). Gates: per request
+# A/B/C the generated token IDs, the FULL logits[248320] that produced each
+# generated token, the forward count, and the finish reason are EXACT vs
+# INDEPENDENT fresh-manager references (direct forwards, not the
+# scheduler); B's FULL hybrid state at length 4 (before A finishes) and
+# length 5 (after A's finish + retire) == B-alone reference states
+# (isolation: another request's finish/retire changes nothing in a
+# still-live request's state); SAMPLING ISOLATION (same prompt + same seed
+# => identical streams: X alone == Y alone == X+Y interleaved).
+# Self-skips (77) when the checkpoint is absent; the Phase A evidence
+# environment MUST actually run it.
+add_executable(test_qwen35_scheduler_integration
+               cuda/test_qwen35_scheduler_integration.cpp)
+target_link_libraries(test_qwen35_scheduler_integration PRIVATE cudalm)
+add_test(NAME test_qwen35_scheduler_integration
+         COMMAND test_qwen35_scheduler_integration
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_scheduler_integration PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 if(CUDALM_PYTHON3)
