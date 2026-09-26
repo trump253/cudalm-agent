@@ -302,3 +302,6 @@ HEAD == SHA）执行；失效规则：此后任何 `src/`/`include/`/`tools/`/
  docs/evidence 修改——文档 + benchmark 证据记录——不失效）。细节见
  `docs/qwen35_architecture.md` §21.6 与
 `docs/provenance.md`（v0.4 Phase C）。
+
+**sign-off**：external reviewer 判 PASS —— v0.4 正式 **DONE /
+FROZEN**，`v0.4-generation` 已 merge 进 main。

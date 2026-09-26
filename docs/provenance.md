@@ -664,5 +664,11 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
    benchmark 证据记录；例如 `b7fb4b1`、`bfd01fa` 的性质就是
    docs/evidence-only，不是严格 docs-only）不失效（此时最终 HEAD ≠
    evidence SHA）。
- - **停止**：未 merge main；未宣布 v0.4 DONE/FROZEN —— 等待 external
-   reviewer 对 v0.4 最终 sign-off。
+ - **sign-off**：external reviewer 判 **PASS** —— v0.4 正式
+   **DONE / FROZEN**；`v0.4-generation` 已 merge 进 main（延续
+   v0.2 / v0.3 的里程碑模式）。v0.4 冻结范围：Qwen3.5-0.8B
+   single-request serial 生成核（greedy 为 Phase A 冻结路径）+
+   基础 sampling（temperature / top-k / top-p / seed）+ 原生
+   tokenizer prompt→text + `cudalm-generate` CLI；evidence 绑定
+   `V04_EVIDENCE_SHA = 5aba21fe0b351079850600f3f8fe7f55a77c8745`
+   （失效规则见上）。

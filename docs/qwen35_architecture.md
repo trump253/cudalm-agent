@@ -1575,6 +1575,10 @@ fp32 matmul）**逐层复合**：layer final 误差**总体随 depth 增大**（
  注明最终 HEAD 与 evidence SHA 不同）。若 Phase C 之后任何人修改了
  **冻结的 tokenizer 语义**（§18/§20），必须停止并报告，而不是继续。
 
+ **sign-off**：external reviewer 判 **PASS** —— v0.4 正式
+ **DONE / FROZEN**；`v0.4-generation` 已 merge 进 main（v0.5+ 再
+ 开新分支）。
+
  证据内容（于该 SHA，全部真实执行）：
  - **完整 ctest：45/45 PASS，0 failed，0 skipped**（含 Phase A/B 全部
    既有门：`test_qwen35_generation` greedy golden EXACT、
