@@ -2313,3 +2313,162 @@ SUMMARY: 0 errors**（原始日志：
 **Phase B = true batched GPU decode（correctness-first）；prefill 仍
 serial；单 stream；无吞吐声明。** 本阶段**不** merge 进 main、**不**自启
 Phase C —— 待 external reviewer 签核。
+
+---
+
+## 27. v0.6 Phase C：动态连续批处理（continuous batching）— v0.6 最终阶段
+
+**目标（明说）**：证明**真实 Qwen3.5-0.8B runtime** 能在**动态 request
+arrival / completion / cancellation / batch grow-shrink** 下**持续运行**，
+并保持**与每个 request 独立执行完全一致**。**Phase C 不开发任何新的 CUDA
+kernel** —— 冻结的 Phase A（serial prefill）+ Phase B（true batched decode）
+是**完全复用**的执行体；Phase C 只新增**控制面压测 + serving 指标 +
+benchmark + 真检查点动态硬门**。
+
+### 27.1 Serving metrics（可观测性，不影响正确性）
+
+`Scheduler::stats()` 返回 `SchedulerStats`（**只读观察**，读取绝不改状态；
+正确性语义由测试独立钉死）：
+
+- **request 生命周期**：`requests_admitted` / `requests_live` /
+  `requests_finished` / `requests_cancelled` / `requests_failed`。
+- **forward 计数**：`single_forward_calls`、`batch_forward_calls`、
+  `model_traversal_calls`（= single + batch，**一次 committed batch 算
+  一次 traversal**）、`batched_sequence_tokens`（各 committed batch 的 B
+  之和）、`logical_token_forwards`（= single×1 + batched_sequence_tokens，
+  **每前进一个 token 记 1**）。
+- **batch 形状**：`max_batch_size`、`avg_committed_decode_batch_size`、
+  `batch_size_trace`（每次 committed batch 的 B）、`decode_cohort_trace`
+  （**每个** decode cohort 的大小：size-1 single 记 1、committed batch 记
+  B；prefill 不是 decode cohort 不记）—— grow/shrink 的证据。
+
+**关键区分（钉死）**：`logical sequence-token forwards` **≠** `model
+traversal calls`。一次 committed batch（B=4）是 **4 个 logical
+token-forward 但 1 次 model traversal**（绝不把 batch(B=4) 错算成 1 个
+logical token，也不把它错算成 4 次 traversal）。指标在 **commit 点**记录
+（forward_batch 成功后 +B logical / +1 traversal；fallback 行按 size-1
+decode cohort 记）。
+
+### 27.2 动态连续批处理真检查点硬门
+（`tests/cuda/test_qwen35_continuous_batching.cpp`；真实
+Qwen/Qwen3.5-0.8B-Base；无 checkpoint 自 skip 77，evidence 环境**必须真实
+运行**）
+
+**四个 request**（不同 prompt 长度 2/5/3/4、不同 max_new、1 greedy + 3
+seeded）：A（2 tok, max_new 3, greedy）、B（5 tok, max_new 6, seed 100，
+**中途 cancel**）、C（3 tok, max_new 5, seed 200，**late**）、D（4 tok,
+max_new 3, seed 300，**更晚 / 资源复用**）。
+
+- **真正动态 arrival**（不是一次全 admit）：t0 admit A,B → 2 step → t2
+  admit C（A/B 运行中）→ A finish → t4 admit D（一次 departure 之后，复用
+  A 释放的资源）。C/D 都是在已有 request **运行时**加入；late request
+  **不进入 admission 前的旧 snapshot**（snapshot 语义）；RequestId **单调
+  不复用**（A=1, B=2, C=3, D=4）。
+- **真实 batch grow / shrink**（自然产生，**不重排 scheduler**）：
+  decode-cohort trace **{1,1,2,2,2,3,1}** —— GROW（1→2、2→3）+ SHRINK
+  （3→1）；`batch_forward_calls=4>0`、`max_batch_size=3`、
+  `batch_fallback_calls=0`（happy path）。**prefill 仍 serial；decode cohort
+  走 true batched GPU 路径**（`forward_batch_with_state`，heterogeneous
+  position/block table）。
+- **独立 reference parity**（fresh manager、**直接**
+  `forward_token_with_state` 循环、per-request Sampler —— **不走
+  scheduler**）：每个 request 的 generated token IDs、**每个 generated step
+  的 FULL logits[248320]**、forward_count、finish_reason **EXACT**。被
+  cancel 的 B：cancel **前**已产生的 prefix（5 token）与 B 的独立
+  reference **prefix EXACT**。证明：**某 request 的输出只取决于自己的
+  prompt/state/RNG**，与其它 request 何时加入/退出**无关**。
+- **Mid-flight cancellation**：B 在 live（prefill 完成、generated≥1）时被
+  cancel → `Cancelled` + sequence **retire 恰好一次**；此后**任何 iteration
+  不再执行 B**（B 不再出现在 decode cohort）；B 的 pre-cancel prefix
+  EXACT；cancel B **不改变 A/C/D 后续输出**（其全 parity 成立）。
+- **资源复用**：D 在 A finish（释放资源）后 late-admit → **D 复用 A 释放的
+  DELTA 槽**（pool 是 LIFO，直接观察到 `D.delta_slot == A.delta_slot`）；
+  A 的 stale SequenceId **仍无效**（`lookup == nullptr`）；live request
+  不变；**D 在 length 5 的 live hybrid state 与独立 fresh-D reference
+  BIT-IDENTICAL**（fresh-zero 逻辑态、**无 A 污染**）。
+
+### 27.3 组合控制面压测（CPU fake forwarder，无 checkpoint）
+（`tests/cpu/test_qwen35_scheduler_continuous_stress.cpp`）
+
+- **Part 1（动态集合中的 failure isolation）**：动态 arrival 的 request 集合
+  中**一个 request 的 forward 恒失败** → 该 request `Failed` + **retire
+  恰好一次**、失败 forward **不 commit**（forward_count 保持 0）、**永不再
+  执行**；**其他 live request 继续**到 `Finished`（forward_count 正确）；
+  `run()` 返回**第一个** error 且 step/run 语义**不退化**；最终资源
+  accounting **精确**（`num_live==0` 且 `mgr.num_live_sequences==0`）。
+- **Part 2（确定性 lifecycle stress，固定 seed，完全可复现，无无限/flaky
+  随机）**：**40 个 request**，固定 seed 驱动 admit / step / late admit /
+  finish / cancel / 继续；**每一步 / 每次 admit / 每次 cancel 后**检查
+  invariant：scheduler live count **==** StateManager live sequence count；
+  **terminal request 永不再次运行**（forward_count 在转 terminal 时冻结）；
+  **每个 live request 恰好拥有一个 live SequenceId**（lookup 非空、live
+  间 id 互异）；**最终 `num_live==0` 且 `mgr.num_live_sequences==0`**。
+
+### 27.4 可复现 benchmark
+（`benchmarks/bench_qwen35_continuous_batching.cpp`；**非 ctest**；真实
+checkpoint）
+
+**同一组 request workload**（四个 request，动态 arrival）对比两种执行：
+**A. independent / serial**（每个 request **单独** fresh manager 跑到
+max_new，逐个求和）vs **B. scheduler continuous batched**（动态 arrival 走
+scheduler，decode cohort 走 true batched）。两者做**相同的总工作量**（相同
+prompt/max_new/seed、四个全完成、timed run 无 cancel）。**正确 CUDA
+timing**：1 次 un-timed **warmup** + 3 次 measured run，每次 measured run
+前后**`cudaStreamSynchronize`** 括住、`steady_clock` 记 wall time。报告
+**GPU / CUDA / checkpoint / workload / warmup / measured runs** + 每 mode 的
+wall time / logical tokens/s / single·batch forward calls / avg·max decode
+batch size。**无性能通过阈值**、**不做 "X% speedup" 声明**（correctness-
+first 的 batch kernel 未调优，调优属 v0.7）；本环境 batched 即使不快也**不
+算失败**。（本环境实测：serial 0.134s / batched 0.118s，27 logical
+tokens；原始报告：`benchmarks/v06_continuous_batching.txt`。）
+
+### 27.5 Gates（全部 PASS）
+
+- `test_qwen35_continuous_batching`（真检查点动态硬门，见 27.2）。
+- `test_qwen35_scheduler_continuous_stress`（CPU 组合控制面压测，见 27.3）。
+- **所有 Phase A/B 门保持全绿**（scheduler、integration、
+  scheduler_batch、batched_decode、batch_fallback、batch_kernels）—— Phase
+  C **未退化**任何冻结契约（FIFO/snapshot、transactional admission、
+  per-request RNG、EOS/max_new、cancel 语义、failure isolation、
+  forward_count 语义、zero-mutation preflight、serial fallback、true
+  batched decode、heterogeneous position/state）。
+
+### 27.6 Evidence（于 `V06C_EVIDENCE_SHA =
+4e4f3693c676465e0fbf0d67f1708b74929a3a8b`，clean tree）
+
+（Phase C 修改了 `src/`、`include/`、`tests/` 与 benchmark CMake，按失效
+规则：**`V06B_EVIDENCE_SHA =
+21305eb48646d2e6e60fcca3862161f9e1`** 及其更早的 V06A/V05C 绑定对本 tree
+**失效**，历史保留；其全部门面回归已在本 SHA 的 60/60 内重跑全绿。）
+
+完整 ctest **60/60 PASS、0 failed、0 skipped**（新增
+`test_qwen35_continuous_batching` 与
+`test_qwen35_scheduler_continuous_stress` 在 evidence 环境真实运行，非 77
+skip；含 v0.4/v0.5/v0.6 Phase A/B 全部门面回归）；
+`scripts/check_no_torch.sh` **CLEAN**；
+`compute-sanitizer --tool memcheck` 对新的真实连续批处理门
+`test_qwen35_continuous_batching`（真实 checkpoint 全流程：动态 arrival、
+grow/shrink、mid-flight cancel、资源复用、逐行 FULL logits parity、hybrid
+state 比对）**PASS + ERROR SUMMARY: 0 errors**（原始日志：
+`benchmarks/sanitizer_qwen35_continuous_batching.txt`）；benchmark 可复现
+结果：`benchmarks/v06_continuous_batching.txt`。
+
+### 27.7 v0.6 最终能力与限制（明说）
+
+**v0.6 最终能力**：request 全生命周期（admit → prefill → decode →
+finish/cancel/fail → retire）；**动态 admission**（late request 不进入旧
+snapshot、RequestId 单调不复用）；**serial prefill**；**true batched
+decode**（heterogeneous position/state、per-row 与冻结单路径 bit-identical）；
+**batch grow / shrink**（真实连续批处理）；**per-request RNG 隔离**；
+**completion / cancel / failure isolation**（terminal 恰好一次、失败隔离、
+run/step 语义不退化）；**resource reclamation / reuse**（retire 释放、LIFO
+复用、fresh-zero 无污染）；**serving metrics**（logical ≠ traversal）；
+**独立 reference parity**（输出只取决于自己的 prompt/state/RNG）。
+
+**明确限制**：**单一 CUDA stream**；**prefill 仍 serial**（无
+chunked/batched prefill）；**无生产网络服务器 / OpenAI API / async
+networking**；**无 CUDA Graph**；**无 multi-stream / kernel fusion /
+FlashAttention / Tensor Core rewrite / NCU 优化 / 投机解码 / beam search /
+priority scheduler**；**v0.7 性能调优尚未开始**（Phase C 的 batch kernel
+为 correctness-first，**无吞吐/提速声明**）。本阶段**不** merge 进 main、
+**不**自启 v0.7 —— 待 external reviewer 签核。

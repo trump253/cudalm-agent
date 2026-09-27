@@ -1341,3 +1341,86 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
     （correctness-first）；prefill 仍 serial；单 stream；无吞吐声明。**
     本阶段**不** merge 进 main、**不**自启 Phase C —— 待 external reviewer
     签核。
+
+- **v0.6 Phase C 动态连续批处理（本 tree 的 v0.6 最终阶段）**
+  - **范围（明说）**：证明**真实 Qwen3.5-0.8B runtime** 能在**动态 request
+    arrival / completion / cancellation / batch grow-shrink** 下持续运行，
+    且与**每个 request 独立执行完全一致**；**不开发任何新的 CUDA kernel**
+    （冻结的 Phase A serial prefill + Phase B true batched decode 完全
+    复用）。
+  - **变更**：
+    - **serving metrics**（`include/cudalm/scheduler.h` +
+      `src/runtime/scheduler.cpp`，**只读观察、不影响正确性**）：
+      `SchedulerStats` + `stats()` —— 生命周期计数、
+      single/batch/traversal forward、`batched_sequence_tokens`、
+      `logical_token_forwards`（logical ≠ traversal：一次 committed batch
+      B 是 B 个 logical token-forward 但 1 次 traversal）、
+      `max/avg decode batch size`、`batch_size_trace`、
+      `decode_cohort_trace`（grow/shrink 证据）。
+    - **真检查点动态硬门**（`tests/cuda/test_qwen35_continuous_batching.cpp`
+      ）：四 request（不同 prompt 2/5/3/4、不同 max_new、1 greedy + 3
+      seeded）真正动态 arrival（A,B→C late→A finish→D 复用）；decode-cohort
+      trace **{1,1,2,2,2,3,1}**（grow 1→2→3、shrink 3→1）、
+      `max_batch_size=3`、`batch_forward_calls>0`、no fallback、prefill
+      serial；mid-flight cancel B（retire 恰好一次、prefix EXACT、不改变
+      A/C/D）；资源复用（D 复用 A 的 DELTA 槽、stale id 无效、D@len5
+      hybrid state 与 fresh-D reference BIT-IDENTICAL）；逐 request 的
+      generated IDs / 每生成步 FULL logits[248320] / forward_count /
+      finish_reason 与独立 reference **EXACT**。
+    - **组合控制面压测**（`tests/cpu/
+      test_qwen35_scheduler_continuous_stress.cpp`，CPU fake forwarder）：
+      Part 1 动态集合中一个 request 恒失败 → Failed+retire 一次、forward
+      不 commit、其他继续到 Finished、run() 返回第一个 error、最终
+      accounting 精确；Part 2 固定 seed、40 request 的**确定性** lifecycle
+      stress，每一步/admit/cancel 后检查 live-count 相等、terminal 永不再
+      运行、每个 live request 恰好一个 live SequenceId，最终
+      `num_live==0` 且 `mgr.live==0`。
+    - **可复现 benchmark**（`benchmarks/
+      bench_qwen35_continuous_batching.cpp`，非 ctest）：同一 workload
+      independent/serial vs scheduler continuous batched，warmup + 多次
+      measured run（`cudaStreamSynchronize` 括住），记录 GPU/CUDA/
+      checkpoint/workload 与 wall time / logical tokens/s / single·batch
+      forward calls / avg·max decode batch；**无性能通过阈值、无提速声明**。
+  - **Evidence（clean tree 于 `V06C_EVIDENCE_SHA =
+    4e4f3693c676465e0fbf0d67f1708b74929a3a8b`）**：
+    - 完整 ctest **60/60 PASS、0 failed、0 skipped**（新增
+      `test_qwen35_continuous_batching` 与
+      `test_qwen35_scheduler_continuous_stress` 真实运行，非 skip；含
+      v0.4/v0.5/v0.6 Phase A/B 全部门面回归）。
+    - `scripts/check_no_torch.sh` **CLEAN**（`include/`+`src/` 无
+      torch/pybind/py 符号）。
+    - `compute-sanitizer --tool memcheck` 对新的真实连续批处理门
+      `test_qwen35_continuous_batching`（真实 checkpoint 全流程：动态
+      arrival、grow/shrink、mid-flight cancel、资源复用、逐行 FULL logits
+      parity、hybrid state 比对）**PASS + ERROR SUMMARY: 0 errors**（原始
+      日志：`benchmarks/sanitizer_qwen35_continuous_batching.txt`）。
+    - benchmark 可复现结果：`benchmarks/v06_continuous_batching.txt`（本
+      环境：serial 0.134s / batched 0.118s、27 logical tokens、
+      max_batch=3、avg batch 2.67；**无提速声明**）。
+  - **evidence 绑定**：`V06C_EVIDENCE_SHA =
+    4e4f3693c676465e0fbf0d67f1708b74929a3a8b`（clean tree、HEAD == SHA；
+    完整 ctest 60/60 + check_no_torch CLEAN + 真实连续批处理门
+    compute-sanitizer memcheck 0 错误 + benchmark，均于该 SHA）。**失效
+    声明（未删除历史）**：Phase C 修改了 `src/`、`include/`、`tests/` 与
+    benchmark CMake，按失效规则：**`V06B_EVIDENCE_SHA =
+    21305eb48646d2e6e60fcca386239a862161f9e1`**（及其更早的
+    `31b3ad2c3122465c3a43eee8c2b49f68f029a7a7`、**V06A_EVIDENCE_SHA =
+    928d0a772f698bcc22e55a6d2ff1a19f48e0f037**、首版 `459ff12f...`、
+    **V05C_EVIDENCE_SHA = 1054b69c4f72f3f0238361d5b5e5f5ab8463489c** 等全部
+    更早绑定）对本 tree **失效**（SHA 与历史保留）—— 其全部门面回归已在本
+    SHA 的 60/60 内重跑全绿（v0.5 的 merge 状态与历史 SHA 不变，仅
+    evidence 绑定按规则推进）。失效规则延续：此后任何 `src/` / `include/`
+    / `tools/` / `tests/` / functional CMake 修改 → 本 evidence 失效必须
+    重跑；仅 docs/evidence 修改不失效。
+  - **v0.6 最终能力与限制（明说）**：request 全生命周期、动态 admission、
+    serial prefill、true batched decode（heterogeneous、per-row
+    bit-identical）、batch grow/shrink（真实连续批处理）、per-request RNG
+    隔离、completion/cancel/failure isolation、resource reclamation/reuse
+    （LIFO、fresh-zero 无污染）、serving metrics（logical ≠ traversal）、
+    独立 reference parity（输出只取决于自己的 prompt/state/RNG）。**明确
+    限制**：单一 CUDA stream、prefill 仍 serial（无 chunked prefill）、无
+    生产网络服务器 / OpenAI API / async networking、无 CUDA Graph、无
+    multi-stream / fusion / FlashAttention / TC rewrite / NCU / 投机解码 /
+    beam search / priority scheduler；**v0.7 性能调优尚未开始**（Phase C
+    batch kernel 为 correctness-first，无吞吐/提速声明）。本阶段**不** merge
+    进 main、**不**自启 v0.7 —— 待 external reviewer 签核。

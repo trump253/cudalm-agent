@@ -1,0 +1,89 @@
+# compute-sanitizer --tool memcheck test_qwen35_continuous_batching (v0.6 Phase C evidence)
+# at V06C_EVIDENCE_SHA = 4e4f3693c676465e0fbf0d67f1708b74929a3a8b
+# command:
+#   /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck ./tests/test_qwen35_continuous_batching data/qwen35_08b_full.cudalm /root/models/Qwen3.5-0.8B-Base /root/py311/venv/bin/python3 /root/code/cudalm-agent --no-convert
+# date: 2026-09-27T06:17:50Z
+# =============================================================================
+========= COMPUTE-SANITIZER
+[continuous] model loaded: 24 layers, vocab 248320, page_tokens 2, pool pages 16, delta slots 4
+[reference] A   : 3 generated, 4 forwards, max_new_tokens
+[reference] B   : 6 generated, 10 forwards, max_new_tokens
+[reference] C   : 5 generated, 7 forwards, max_new_tokens
+[reference] D   : 3 generated, 6 forwards, max_new_tokens
+[batching] batch_forward_calls=4 single_forward_calls=17 max_batch_size=3 batch_fallback_calls=0
+[batching] batch_size_trace={2,2,2,3}
+[batching] decode_cohort_trace={1,1,2,2,2,3,1}
+[metrics] admitted=4 live=0 finished=3 cancelled=1 failed=0 | single=17 batch=4 traversals=21 logical=26 batched_tokens=9 max_batch=3 avg_batch=2.250
+[parity] A (greedy, finished)
+  A gen_logits[0][vocab]                         bit-identical (n=248320)
+  A gen_logits[1][vocab]                         bit-identical (n=248320)
+  A gen_logits[2][vocab]                         bit-identical (n=248320)
+[parity] B (seed 100, CANCELLED mid-flight)
+  B gen_logits[0][vocab]                         bit-identical (n=248320)
+  B gen_logits[1][vocab]                         bit-identical (n=248320)
+  B gen_logits[2][vocab]                         bit-identical (n=248320)
+  B gen_logits[3][vocab]                         bit-identical (n=248320)
+  B gen_logits[4][vocab]                         bit-identical (n=248320)
+[parity] C (seed 200, late admission, finished)
+  C gen_logits[0][vocab]                         bit-identical (n=248320)
+  C gen_logits[1][vocab]                         bit-identical (n=248320)
+  C gen_logits[2][vocab]                         bit-identical (n=248320)
+  C gen_logits[3][vocab]                         bit-identical (n=248320)
+  C gen_logits[4][vocab]                         bit-identical (n=248320)
+[parity] D (seed 300, latest, resource reuse)
+  D gen_logits[0][vocab]                         bit-identical (n=248320)
+  D gen_logits[1][vocab]                         bit-identical (n=248320)
+  D gen_logits[2][vocab]                         bit-identical (n=248320)
+[parity] D@len5 (reused slot 0) vs fresh-D ref
+  D@len5 (reused slot) vs fresh-D reference L0 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L0 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L1 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L1 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L2 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L2 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L3 kv.K[0..4] bit-identical (n=2560)
+  D@len5 (reused slot) vs fresh-D reference L3 kv.V[0..4] bit-identical (n=2560)
+  D@len5 (reused slot) vs fresh-D reference L4 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L4 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L5 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L5 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L6 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L6 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L7 kv.K[0..4] bit-identical (n=2560)
+  D@len5 (reused slot) vs fresh-D reference L7 kv.V[0..4] bit-identical (n=2560)
+  D@len5 (reused slot) vs fresh-D reference L8 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L8 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L9 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L9 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L10 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L10 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L11 kv.K[0..4] bit-identical (n=2560)
+  D@len5 (reused slot) vs fresh-D reference L11 kv.V[0..4] bit-identical (n=2560)
+  D@len5 (reused slot) vs fresh-D reference L12 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L12 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L13 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L13 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L14 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L14 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L15 kv.K[0..4] bit-identical (n=2560)
+  D@len5 (reused slot) vs fresh-D reference L15 kv.V[0..4] bit-identical (n=2560)
+  D@len5 (reused slot) vs fresh-D reference L16 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L16 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L17 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L17 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L18 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L18 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L19 kv.K[0..4] bit-identical (n=2560)
+  D@len5 (reused slot) vs fresh-D reference L19 kv.V[0..4] bit-identical (n=2560)
+  D@len5 (reused slot) vs fresh-D reference L20 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L20 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L21 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L21 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L22 delta.conv bit-identical (n=18432)
+  D@len5 (reused slot) vs fresh-D reference L22 delta.rec bit-identical (n=262144)
+  D@len5 (reused slot) vs fresh-D reference L23 kv.K[0..4] bit-identical (n=2560)
+  D@len5 (reused slot) vs fresh-D reference L23 kv.V[0..4] bit-identical (n=2560)
+[ok] A/B/C/D dynamic run == independent references (B prefix-exact vs cancelled); true batched decode grow/shrink; D reuses A's freed delta slot with fresh-zero final state
+test_qwen35_continuous_batching: PASS (A/B/C/D dynamic arrival completes/cancels/reuses under true batched decode: decode-cohort trace {1,1,2,2,2,3,1} grows and shrinks, max_batch_size=3, batch_forward_calls>0; A/C/D generated IDs + per-step FULL logits + forward count + finish reason EXACT vs independent references, cancelled B prefix EXACT; D reuses A's freed delta slot (fresh-zero final state); serving metrics sane)
+========= ERROR SUMMARY: 0 errors
+# test exit code: 0
