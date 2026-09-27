@@ -1,0 +1,101 @@
+# =============================================================================
+# CUDALM v0.7 Phase B — canonical E2E, FINAL production state (direct frozen R4),
+# raw per-run samples
+# V07B_FINAL_FUNCTIONAL evidence (tag: final) at exact SHA: bde72f4389c524b0b7b522804a5d0340d9f6ace2
+# tree state: tracked tree CLEAN at generation (no modified/deleted tracked
+#             files; untracked = evidence outputs of this run)
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
+# checkpoint: /root/models/Qwen3.5-0.8B-Base
+# model: build/data/qwen35_08b_full.cudalm
+# workload: canonical (4 requests; prompts 2/5/3/4 tok; max_new 3/6/5/3; 1 greedy
+#           + 3 seeded; dynamic arrival A,B -> C -> D; 27 logical tokens/run;
+#           22 traversals/run); single stream, serial prefill, true batched decode
+# schedule: 5 independent invocations x (2 warmup + 10 measured), --mode batched
+#           (each invocation = fresh process; per-run wall times below are the
+#           raw samples, steady_clock, each bracketed by cudaStreamSynchronize)
+# command (per invocation):
+#   cd build && ./benchmarks/bench_qwen35_continuous_batching \
+#     data/qwen35_08b_full.cudalm /root/models/Qwen3.5-0.8B-Base /root/py311/venv/bin/python3 \
+#     /root/code/cudalm-agent --no-convert <report> --measured-runs 10 --warmup-runs 2 --mode batched
+# date: 2026-09-27T15:29:33Z
+# =============================================================================
+
+== invocation 1 (raw per-run wall times, seconds) ==
+run 1: batched=0.109188s
+run 2: batched=0.108610s
+run 3: batched=0.114972s
+run 4: batched=0.109364s
+run 5: batched=0.108953s
+run 6: batched=0.109132s
+run 7: batched=0.113310s
+run 8: batched=0.108844s
+run 9: batched=0.109078s
+run 10: batched=0.109286s
+  summary:     wall_time_s mean:   0.110074
+  summary:     wall_time_s median: 0.109160
+  summary:     wall_time_s min:    0.108610
+  summary:     wall_time_s max:    0.114972
+
+== invocation 2 (raw per-run wall times, seconds) ==
+run 1: batched=0.108658s
+run 2: batched=0.109079s
+run 3: batched=0.108616s
+run 4: batched=0.108642s
+run 5: batched=0.113809s
+run 6: batched=0.108236s
+run 7: batched=0.108319s
+run 8: batched=0.114354s
+run 9: batched=0.108352s
+run 10: batched=0.108988s
+  summary:     wall_time_s mean:   0.109705
+  summary:     wall_time_s median: 0.108650
+  summary:     wall_time_s min:    0.108236
+  summary:     wall_time_s max:    0.114354
+
+== invocation 3 (raw per-run wall times, seconds) ==
+run 1: batched=0.109501s
+run 2: batched=0.109274s
+run 3: batched=0.109043s
+run 4: batched=0.111513s
+run 5: batched=0.114745s
+run 6: batched=0.111662s
+run 7: batched=0.112509s
+run 8: batched=0.114916s
+run 9: batched=0.111936s
+run 10: batched=0.109496s
+  summary:     wall_time_s mean:   0.111459
+  summary:     wall_time_s median: 0.111587
+  summary:     wall_time_s min:    0.109043
+  summary:     wall_time_s max:    0.114916
+
+== invocation 4 (raw per-run wall times, seconds) ==
+run 1: batched=0.108484s
+run 2: batched=0.109411s
+run 3: batched=0.109477s
+run 4: batched=0.109118s
+run 5: batched=0.112846s
+run 6: batched=0.108603s
+run 7: batched=0.109193s
+run 8: batched=0.112748s
+run 9: batched=0.109056s
+run 10: batched=0.109513s
+  summary:     wall_time_s mean:   0.109845
+  summary:     wall_time_s median: 0.109302
+  summary:     wall_time_s min:    0.108484
+  summary:     wall_time_s max:    0.112846
+
+== invocation 5 (raw per-run wall times, seconds) ==
+run 1: batched=0.108649s
+run 2: batched=0.109297s
+run 3: batched=0.109989s
+run 4: batched=0.108112s
+run 5: batched=0.115176s
+run 6: batched=0.112717s
+run 7: batched=0.110263s
+run 8: batched=0.109852s
+run 9: batched=0.114101s
+run 10: batched=0.108938s
+  summary:     wall_time_s mean:   0.110709
+  summary:     wall_time_s median: 0.109920
+  summary:     wall_time_s min:    0.108112
+  summary:     wall_time_s max:    0.115176
