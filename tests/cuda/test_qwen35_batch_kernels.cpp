@@ -22,7 +22,9 @@
 //                                            qwen35_deltanet_gbeta_bf16
 //                          batch_deltanet_delta_rule_fp32     vs
 //                                            qwen35_deltanet_delta_rule_fp32
-//                          (per-row Delta slots, in-place state update)
+//                          (per-row Delta slots, in-place state update,
+//                          NON-contiguous NON-identity slot mapping
+//                          {2, 0, 4} over a 5-slot pool)
 //
 // Deterministic synthetic inputs (no checkpoint, no Python): the parity is
 // a pure function of the (identical) per-row inputs, so any divergence is a
@@ -171,7 +173,7 @@ int test_bf16_gemv() {
 int test_deltanet() {
   cudaStream_t st = nullptr;
   CUDA_CHECK(cudaStreamCreate(&st));
-  const int B = 2;
+  const int B = 3;
   const int conv_dim = 96, n_heads = 16, hd = 128, eps = 1e-6f;
   // The conv / gbeta / delta-rule kernels are independent; we drive them with
   // per-row tensors (conv_dim is the conv's channel count; the delta rule
@@ -181,11 +183,16 @@ int test_deltanet() {
       static_cast<std::size_t>(conv_dim) * 3;
   const std::size_t rec_per =
       static_cast<std::size_t>(n_heads) * hd * hd;
-  // Initial conv state: 2 slots (slot b for row b).
-  std::vector<__nv_bfloat16> conv0(2 * conv_state_per);
+  // NON-contiguous, NON-identity slot mapping over a 5-slot pool: row b
+  // uses slot sl[b] = {2, 0, 4} (the batch kernel indexes each row's state
+  // by its OWN slot, exactly like the model's per-sequence delta_slot).
+  const int NSLOT = 5;
+  const int sl[B] = {2, 0, 4};
+  // Initial conv state: 5 slots (only slots 0, 2, 4 are used).
+  std::vector<__nv_bfloat16> conv0(static_cast<std::size_t>(NSLOT) * conv_state_per);
   for (auto& v : conv0) v = __float2bfloat16_rn(rng.next());
-  // Initial rec state: 2 slots.
-  std::vector<float> rec0(2 * rec_per);
+  // Initial rec state: 5 slots.
+  std::vector<float> rec0(static_cast<std::size_t>(NSLOT) * rec_per);
   for (auto& v : rec0) v = 0.01f * rng.next();
   // new_mixed [B][conv_dim], conv_w [conv_dim][4].
   std::vector<__nv_bfloat16> mixed(static_cast<std::size_t>(B) * conv_dim),
@@ -215,23 +222,22 @@ int test_deltanet() {
 
   // ---- conv (per-row slot) ----
   {
-    dconv.allocate(2 * conv_state_per * 2, st);
+    dconv.allocate(static_cast<std::size_t>(NSLOT) * conv_state_per * 2, st);
     dmixed.allocate(mixed.size() * 2, st);
     dconvw.allocate(convw.size() * 2, st);
     dconv_out.allocate(static_cast<std::size_t>(B) * conv_dim * 2, st);
     dconv_silu.allocate(static_cast<std::size_t>(B) * conv_dim * 2, st);
-    dslots.allocate(2 * 4, st);
-    scon.allocate(2 * conv_state_per * 2, st);  // 2 slots (row b's slot)
+    dslots.allocate(static_cast<std::size_t>(B) * 4, st);
+    scon.allocate(static_cast<std::size_t>(NSLOT) * conv_state_per * 2, st);
     sco.allocate(conv_dim * 2, st);
     scs.allocate(conv_dim * 2, st);
-    std::vector<int> sl = {0, 1};
     CUDA_CHECK(cudaMemcpyAsync(dconv.data(), conv0.data(),
                                conv0.size() * 2, cudaMemcpyHostToDevice, st));
     CUDA_CHECK(cudaMemcpyAsync(dmixed.data(), mixed.data(),
                                mixed.size() * 2, cudaMemcpyHostToDevice, st));
     CUDA_CHECK(cudaMemcpyAsync(dconvw.data(), convw.data(),
                                convw.size() * 2, cudaMemcpyHostToDevice, st));
-    CUDA_CHECK(cudaMemcpyAsync(dslots.data(), sl.data(), 8,
+    CUDA_CHECK(cudaMemcpyAsync(dslots.data(), sl, B * 4,
                                cudaMemcpyHostToDevice, st));
     kernels::batch_deltanet_conv_decode_bf16(dconv.data<__nv_bfloat16>(),
                                              dslots.data<int>(),
@@ -242,10 +248,11 @@ int test_deltanet() {
                                              conv_dim, B, st);
     for (int b = 0; b < B; ++b) {
       CUDA_CHECK(cudaMemcpyAsync(scon.data(), conv0.data(),
-                                 2 * conv_state_per * 2, cudaMemcpyHostToDevice,
+                                 conv0.size() * 2, cudaMemcpyHostToDevice,
                                  st));
       kernels::qwen35_deltanet_conv_decode_bf16(
-          scon.data<__nv_bfloat16>() + static_cast<std::size_t>(b) * conv_state_per,
+          scon.data<__nv_bfloat16>() +
+              static_cast<std::size_t>(sl[b]) * conv_state_per,
           dmixed.data<__nv_bfloat16>() + static_cast<std::size_t>(b) * conv_dim,
           dconvw.data<__nv_bfloat16>(), sco.data<__nv_bfloat16>(),
           scs.data<__nv_bfloat16>(), conv_dim, st);
@@ -260,11 +267,12 @@ int test_deltanet() {
                         static_cast<std::size_t>(b) * conv_dim,
                 scs.data<__nv_bfloat16>(), static_cast<std::size_t>(conv_dim),
                 st);
-      std::snprintf(nm, sizeof(nm), "DELTA.conv row%d state", b);
+      std::snprintf(nm, sizeof(nm), "DELTA.conv row%d state (slot %d)", b,
+                    sl[b]);
       rc |= cmp(nm, dconv.data<__nv_bfloat16>() +
-                        static_cast<std::size_t>(b) * conv_state_per,
+                        static_cast<std::size_t>(sl[b]) * conv_state_per,
                 scon.data<__nv_bfloat16>() +
-                    static_cast<std::size_t>(b) * conv_state_per,
+                    static_cast<std::size_t>(sl[b]) * conv_state_per,
                 conv_state_per, st);
     }
   }
@@ -315,7 +323,7 @@ int test_deltanet() {
     dq.allocate(qh.size() * 2, st);
     dk.allocate(kh.size() * 2, st);
     dv.allocate(vh.size() * 2, st);
-    drec.allocate(2 * rec_per * 4, st);
+    drec.allocate(static_cast<std::size_t>(NSLOT) * rec_per * 4, st);
     dcore.allocate(static_cast<std::size_t>(B) * n_heads * hd * 2, st);
     score.allocate(n_heads * hd * 2, st);
     srec.allocate(rec_per * 4, st);
@@ -328,7 +336,7 @@ int test_deltanet() {
                                cudaMemcpyHostToDevice, st));
     CUDA_CHECK(cudaMemcpyAsync(drec.data(), rec0.data(), rec0.size() * 4,
                                cudaMemcpyHostToDevice, st));
-    // dslots already holds {0,1}.
+    // dslots already holds the non-contiguous mapping sl = {2,0,4}.
     kernels::batch_deltanet_delta_rule_fp32(dq.data<__nv_bfloat16>(),
                                             dk.data<__nv_bfloat16>(),
                                             dv.data<__nv_bfloat16>(),
@@ -340,8 +348,8 @@ int test_deltanet() {
                                             n_heads, hd, eps, B, st);
     for (int b = 0; b < B; ++b) {
       CUDA_CHECK(cudaMemcpyAsync(srec.data(),
-                                 rec0.data() + static_cast<std::size_t>(b) *
-                                                    rec_per,
+                                 rec0.data() +
+                                     static_cast<std::size_t>(sl[b]) * rec_per,
                                  rec_per * 4, cudaMemcpyHostToDevice, st));
       kernels::qwen35_deltanet_delta_rule_fp32(
           dq.data<__nv_bfloat16>() +
@@ -360,8 +368,9 @@ int test_deltanet() {
                         static_cast<std::size_t>(b) * n_heads * hd,
                 score.data<__nv_bfloat16>(),
                 static_cast<std::size_t>(n_heads) * hd, st);
-      std::snprintf(nm, sizeof(nm), "DELTA.rule row%d state", b);
-      rc |= cmp(nm, drec.data<float>() + static_cast<std::size_t>(b) * rec_per,
+      std::snprintf(nm, sizeof(nm), "DELTA.rule row%d state (slot %d)", b,
+                    sl[b]);
+      rc |= cmp(nm, drec.data<float>() + static_cast<std::size_t>(sl[b]) * rec_per,
                 srec.data<float>(), rec_per, st);
     }
   }

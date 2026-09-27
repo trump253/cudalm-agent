@@ -251,6 +251,26 @@ add_test(NAME test_qwen35_scheduler_batch
 set_tests_properties(test_qwen35_scheduler_batch PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+# v0.6 Phase B: ZERO-MUTATION batch preflight + SERIAL FALLBACK
+# real-checkpoint gate. Aggregate KV capacity shortfall (pool 3 pages,
+# two length-2 sequences, 1 page free, batch needs 2): the FAILED
+# forward_batch_with_state leaves length / block tables / KV pool
+# accounting / Delta state / logical KV exactly unchanged (no partial
+# allocation); the scheduler then falls back to the frozen serial path
+# (batch_fallback_calls == 1, batch_forward_calls == 0): row A advances
+# bit-identically to an independent direct-serial reference, row B's
+# serial forward fails (Failed + retired once, forward NOT committed).
+add_executable(test_qwen35_batch_fallback cuda/test_qwen35_batch_fallback.cpp)
+target_link_libraries(test_qwen35_batch_fallback PRIVATE cudalm)
+add_test(NAME test_qwen35_batch_fallback
+         COMMAND test_qwen35_batch_fallback
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_batch_fallback PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 if(CUDALM_PYTHON3)
   set(CUDALM_CROSSLANG_WEIGHTS ${CMAKE_BINARY_DIR}/data/block_v01.cudalm)
 

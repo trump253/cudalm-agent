@@ -132,6 +132,63 @@ std::vector<int> expected_greedy(FakeForwarder* fwd, int n, int m) {
   return out;
 }
 
+// Batch-capable CPU fake for the Phase B batch-LOGITS-FAILURE gate:
+// `forward_batch` SUCCEEDS (a committed batch forward), but
+// `logits_batch_to_host` returns a Status error (fault injection). Pins
+// the pinned commit order: forward_batch success -> per row forward_count++
+// / Waiting->Running -> logits_batch_to_host; a failed logits retrieval
+// therefore leaves forward_count INCLUDING the committed batch forward,
+// with every cohort row Failed + retired exactly once (the same semantics
+// as the frozen advance_one() path for a logits_to_host failure).
+class FakeBatchForwarder : public SequenceForwarder {
+ public:
+  int vocab = 1024;  // must match small_config().vocab_size
+  bool fail_batch_logits = true;  // fault injection
+  mutable int batch_calls = 0;
+  mutable int batch_logits_calls = 0;
+  std::vector<std::pair<SequenceId, int>> log;  // (sid, token) call order
+
+  Status forward_token(int token_id, SequenceId sequence_id,
+                       Qwen35StateManager& /*mgr*/,
+                       cudaStream_t /*stream*/) override {
+    log.push_back({sequence_id, token_id});
+    return Status::ok_status();
+  }
+
+  Status logits_to_host(std::vector<__nv_bfloat16>* out,
+                        cudaStream_t /*stream*/) const override {
+    // Deterministic: all -1 except token 7 = 10.0 (greedy picks 7).
+    out->assign(static_cast<std::size_t>(vocab), __float2bfloat16(-1.0f));
+    (*out)[7] = __float2bfloat16(10.0f);
+    return Status::ok_status();
+  }
+
+  int vocab_size() const override { return vocab; }
+
+  bool supports_batch() const override { return true; }
+
+  Status forward_batch(const int* token_ids, const SequenceId* sids, int B,
+                       Qwen35StateManager& /*mgr*/,
+                       cudaStream_t /*stream*/) override {
+    ++batch_calls;
+    for (int b = 0; b < B; ++b) log.push_back({sids[b], token_ids[b]});
+    return Status::ok_status();
+  }
+
+  Status logits_batch_to_host(std::vector<__nv_bfloat16>* out, int B,
+                              cudaStream_t /*stream*/) const override {
+    ++batch_logits_calls;
+    if (fail_batch_logits) {
+      return Status::error("fake batch logits fault (injected)");
+    }
+    out->resize(static_cast<std::size_t>(B) * static_cast<std::size_t>(vocab));
+    for (auto& v : *out) v = __float2bfloat16(-1.0f);
+    for (int b = 0; b < B; ++b)
+      (*out)[static_cast<std::size_t>(b) * vocab + 7] = __float2bfloat16(10.0f);
+    return Status::ok_status();
+  }
+};
+
 // Expected total forwards for a completed request (v0.4 semantics):
 // N prefill forwards + (m - 1) decode forwards.
 int expected_forwards(int n, int m) { return n + m - 1; }
@@ -796,6 +853,80 @@ int test_fatal_status() {
   return 0;
 }
 
+// ---- 10. Phase B: batch LOGITS failure — the committed batch forward is
+// ----     counted (forward_count++ BEFORE the logits D2H), all rows
+// ----     Failed + retired exactly once.
+int test_batch_logits_failure() {
+  std::fprintf(stderr, "[batch-logits-failure]\n");
+  Qwen35Config cfg = small_config();
+  cudaStream_t stream = nullptr;
+  CUDA_CHECK(cudaStreamCreate(&stream));
+  {
+    FakeBatchForwarder fwd;  // forward_batch ok, logits_batch_to_host faults
+    Qwen35StateManager mgr(cfg, 2, 8, 4, stream);
+    Scheduler sched(fwd, mgr, stream);
+    RequestId a = 0, b = 0;
+    Scheduler::Spec sa;
+    sa.prompt = {10, 11};
+    sa.max_new_tokens = 2;
+    sa.sampling = SamplingConfig::greedy();
+    Scheduler::Spec sb;
+    sb.prompt = {20, 21};
+    sb.max_new_tokens = 2;
+    sb.sampling = SamplingConfig::greedy();
+    CHECK(sched.admit(sa, &a).ok);
+    CHECK(sched.admit(sb, &b).ok);
+
+    // Step 1: A p0, B p0 — serial prefill (the batch path is decode-only).
+    CHECK(sched.step().ok);
+    CHECK_EQ(sched.get(a)->forward_count, 1);
+    CHECK_EQ(sched.get(b)->forward_count, 1);
+    // Step 2: A p1 (samples g0), B p1 (samples g0) -> both decode-ready.
+    CHECK(sched.step().ok);
+    CHECK_EQ(sched.get(a)->forward_count, 2);
+    CHECK_EQ(sched.get(b)->forward_count, 2);
+    CHECK_EQ(static_cast<int>(sched.get(a)->generated.size()), 1);
+    CHECK_EQ(static_cast<int>(sched.get(b)->generated.size()), 1);
+    CHECK_EQ(fwd.batch_calls, 0);  // no batch issued yet (prefill is serial)
+
+    // Step 3: cohort [A,B] (both decode-ready, size 2) -> ONE forward_batch
+    // SUCCEEDS -> per row forward_count++ / Waiting->Running -> then
+    // logits_batch_to_host FAILS (injected) -> EVERY row Failed + retired.
+    Status s = sched.step();
+    CHECK(!s.ok);  // the error is the injected logits-retrieval fault
+    CHECK_EQ(fwd.batch_calls, 1);  // exactly ONE batch forward (not 2 single)
+    CHECK_EQ(fwd.batch_logits_calls, 1);  // the failing logits retrieval
+    CHECK_EQ(sched.batch_forward_calls(), 1);
+    CHECK_EQ(sched.batch_fallback_calls(), 0);  // NOT a preflight fallback
+                                                // (the forward SUCCEEDED;
+                                                // only the copy failed)
+    CHECK_EQ(sched.single_forward_calls(), 4);  // only the 4 prefill forwards
+    // The committed batch forward IS counted: 2 prefill + 1 batch decode =
+    // 3 (NOT 2 — the old bug dropped the committed forward on D2H failure).
+    CHECK_EQ(sched.get(a)->forward_count, 3);
+    CHECK_EQ(sched.get(b)->forward_count, 3);
+    // Every cohort row: Failed (terminal exactly once) + retired exactly
+    // once; the failed copy produced no generated token (only g0 exists).
+    CHECK_EQ(sched.get(a)->status, RequestStatus::Failed);
+    CHECK_EQ(sched.get(a)->finish_reason, FinishReason::Failed);
+    CHECK_EQ(sched.get(b)->status, RequestStatus::Failed);
+    CHECK_EQ(sched.get(b)->finish_reason, FinishReason::Failed);
+    CHECK_EQ(static_cast<int>(sched.get(a)->generated.size()), 1);
+    CHECK_EQ(static_cast<int>(sched.get(b)->generated.size()), 1);
+    // Nothing live anywhere (scheduler view + state manager view).
+    CHECK_EQ(sched.num_live(), 0);
+    CHECK_EQ(mgr.num_live_sequences(), 0);
+    // A later step is a no-op: stale (failed) rows never advance again, no
+    // further batch attempts.
+    CHECK(sched.step().ok);
+    CHECK_EQ(sched.get(a)->forward_count, 3);
+    CHECK_EQ(sched.get(b)->forward_count, 3);
+    CHECK_EQ(fwd.batch_calls, 1);
+  }
+  CUDA_CHECK(cudaStreamDestroy(stream));
+  return 0;
+}
+
 int main() {
   int rc = 0;
   rc |= test_lifecycle();
@@ -807,6 +938,7 @@ int main() {
   rc |= test_cancel_retire();
   rc |= test_sampling_isolation();
   rc |= test_fatal_status();
+  rc |= test_batch_logits_failure();
   if (rc != 0) {
     std::fprintf(stderr, "test_qwen35_scheduler: FAIL\n");
     return rc;
@@ -816,6 +948,8 @@ int main() {
       "transactional admission + FIFO/round-robin snapshot + "
       "prefill/decode coexistence + EOS/max_new_tokens + cancel/retire + "
       "per-request sampling RNG isolation + fatal Status (failed forward "
-      "not committed to progress + run() failure isolation))\n");
+      "not committed to progress + run() failure isolation) + Phase B "
+      "batch-logits-failure (committed batch forward counted in "
+      "forward_count, cohort rows Failed + retired exactly once))\n");
   return 0;
 }

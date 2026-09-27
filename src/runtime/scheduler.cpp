@@ -390,6 +390,25 @@ void Scheduler::advance_batch_run(const std::vector<RequestId>& runnable,
     max_batch_size_ = static_cast<int>(B);
   }
 
+  // The batch forward SUCCEEDED: commit each row's progress NOW — BEFORE
+  // the logits D2H — exactly the frozen advance_one() order (forward ok ->
+  // forward_count++ / Waiting->Running -> logits_to_host). If the logits
+  // retrieval fails below, forward_count already INCLUDES this successful
+  // batch forward (a copy failure AFTER a committed forward — same as the
+  // single path's logits_to_host failure, which also leaves forward_count
+  // counting the committed forward).
+  for (std::size_t k = i; k < j; ++k) {
+    auto it = requests_.find(runnable[k]);
+    if (it == requests_.end() || is_terminal(it->second.status)) {
+      continue;
+    }
+    Request& r = it->second;
+    r.forward_count++;
+    if (r.status == RequestStatus::Waiting) {
+      r.status = RequestStatus::Running;
+    }
+  }
+
   // ONE D2H of the whole [B][vocab] logits, then per-row sampling with
   // each request's OWN Sampler (v0.4 per-request RNG isolation — the
   // sampling call order is the cohort order, as in Phase A).
@@ -397,7 +416,9 @@ void Scheduler::advance_batch_run(const std::vector<RequestId>& runnable,
   Status ls = fwd_.logits_batch_to_host(&logits, static_cast<int>(B), stream_);
   if (!ls.ok) {
     // A logits D2H failure is fatal for the whole cohort (Phase A
-    // semantics for a logits_to_host failure: mark Failed + retire).
+    // semantics for a logits_to_host failure: mark Failed + retire exactly
+    // once). forward_count already INCLUDES the successful batch forward
+    // committed above.
     for (std::size_t k = i; k < j; ++k) {
       auto it = requests_.find(runnable[k]);
       if (it == requests_.end() || is_terminal(it->second.status)) {
@@ -421,10 +442,8 @@ void Scheduler::advance_batch_run(const std::vector<RequestId>& runnable,
       continue;
     }
     Request& r = it->second;
-    r.forward_count++;
-    if (r.status == RequestStatus::Waiting) {
-      r.status = RequestStatus::Running;
-    }
+    // (forward_count / Waiting->Running were committed above, right after
+    // the successful forward_batch — never after the logits D2H.)
     const __nv_bfloat16* row =
         logits.data() +
         static_cast<std::size_t>(k) * static_cast<std::size_t>(V);

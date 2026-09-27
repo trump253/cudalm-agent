@@ -290,22 +290,29 @@ int cmp_row(const char* label, const RowOut& ref, const RowOut& act,
   return rc;
 }
 
-// Prefill `prompt` into a fresh sequence of `mgr` via the SERIAL single path
+// Prefill `prompt` into an EXISTING sequence via the SERIAL single path
 // (the Phase B contract: prefill is serial; the last prompt token produces
 // the decode-ready state).
-int prefill_serial(Qwen35Model& model, Qwen35StateManager& mgr,
-                   const std::vector<int>& prompt, SequenceId* sid,
-                   cudaStream_t stream) {
-  Status s = mgr.create_sequence(sid);
-  if (!s.ok) return 1;
+int prefill_existing(Qwen35Model& model, Qwen35StateManager& mgr,
+                     const std::vector<int>& prompt, SequenceId sid,
+                     cudaStream_t stream) {
   for (int tok : prompt) {
-    s = model.forward_token_with_state(tok, *sid, mgr, stream);
+    Status s = model.forward_token_with_state(tok, sid, mgr, stream);
     if (!s.ok) {
       std::fprintf(stderr, "  [prefill] %s\n", s.message.c_str());
       return 1;
     }
   }
   return 0;
+}
+
+// Prefill `prompt` into a FRESH sequence (created here).
+int prefill_serial(Qwen35Model& model, Qwen35StateManager& mgr,
+                   const std::vector<int>& prompt, SequenceId* sid,
+                   cudaStream_t stream) {
+  Status s = mgr.create_sequence(sid);
+  if (!s.ok) return 1;
+  return prefill_existing(model, mgr, prompt, *sid, stream);
 }
 
 }  // namespace
@@ -365,10 +372,24 @@ int main(int argc, char** argv) {
   // =========================================================================
   {
     Qwen35StateManager mgrB(cfg, kPageTokens, kPoolPages, kDeltaSlots, stream);
-    SequenceId sB[3];
-    CHECK_EQ(prefill_serial(model, mgrB, kPrompt0, &sB[0], stream), 0);
-    CHECK_EQ(prefill_serial(model, mgrB, kPrompt1, &sB[1], stream), 0);
-    CHECK_EQ(prefill_serial(model, mgrB, kPrompt2, &sB[2], stream), 0);
+    // NON-contiguous, NON-identity Delta slots for the batch rows: create 5
+    // sequences (the pool hands out slots 0..4 in order), retire the two
+    // odd ones, and batch the three survivors -> row slots {0, 2, 4}
+    // (NOT the identity 0,1,2). This proves the batch kernels index each
+    // row's Delta state by its OWN delta_slot, not by the row index.
+    SequenceId tmp[5];
+    for (int i = 0; i < 5; ++i) CHECK(mgrB.create_sequence(&tmp[i]).ok);
+    for (int i = 0; i < 5; ++i)
+      CHECK_EQ(mgrB.lookup(tmp[i])->delta_slot, i);  // identity handout
+    CHECK(mgrB.retire_sequence(tmp[1]).ok);
+    CHECK(mgrB.retire_sequence(tmp[3]).ok);
+    SequenceId sB[3] = {tmp[0], tmp[2], tmp[4]};
+    CHECK_EQ(mgrB.lookup(sB[0])->delta_slot, 0);
+    CHECK_EQ(mgrB.lookup(sB[1])->delta_slot, 2);
+    CHECK_EQ(mgrB.lookup(sB[2])->delta_slot, 4);
+    CHECK_EQ(prefill_existing(model, mgrB, kPrompt0, sB[0], stream), 0);
+    CHECK_EQ(prefill_existing(model, mgrB, kPrompt1, sB[1], stream), 0);
+    CHECK_EQ(prefill_existing(model, mgrB, kPrompt2, sB[2], stream), 0);
     const std::vector<int> kPrompt[3] = {kPrompt0, kPrompt1, kPrompt2};
 
     Qwen35StateManager mgrS0(cfg, kPageTokens, kPoolPages, kDeltaSlots, stream);
@@ -419,12 +440,18 @@ int main(int argc, char** argv) {
   }
 
   // =========================================================================
-  // Part 2: B = 1 (a batch of one is bit-identical to the single path).
+  // Part 2: B = 1 (a batch of one is bit-identical to the single path) on a
+  // NON-IDENTITY delta slot (row 0 -> slot 2: create 3, retire 2).
   // =========================================================================
   {
     Qwen35StateManager mgrB(cfg, kPageTokens, kPoolPages, kDeltaSlots, stream);
-    SequenceId sB;
-    CHECK_EQ(prefill_serial(model, mgrB, kPromptB1, &sB, stream), 0);
+    SequenceId tmpB[3];
+    for (int i = 0; i < 3; ++i) CHECK(mgrB.create_sequence(&tmpB[i]).ok);
+    CHECK(mgrB.retire_sequence(tmpB[0]).ok);
+    CHECK(mgrB.retire_sequence(tmpB[1]).ok);
+    SequenceId sB = tmpB[2];
+    CHECK_EQ(mgrB.lookup(sB)->delta_slot, 2);  // row 0 -> slot 2
+    CHECK_EQ(prefill_existing(model, mgrB, kPromptB1, sB, stream), 0);
     Qwen35StateManager mgrS(cfg, kPageTokens, kPoolPages, kDeltaSlots, stream);
     SequenceId sS;
     CHECK_EQ(prefill_serial(model, mgrS, kPromptB1, &sS, stream), 0);
