@@ -1,7 +1,8 @@
-# compute-sanitizer --tool memcheck test_qwen35_batched_decode (v0.6 Phase B evidence)
+# compute-sanitizer --tool memcheck test_qwen35_batched_decode (v0.6 Phase B reviewer-fix evidence)
+# at V06B_EVIDENCE_SHA = 21305eb48646d2e6e60fcca386239a862161f9e1
 # command:
 #   /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck ./tests/test_qwen35_batched_decode data/qwen35_08b_full.cudalm /root/models/Qwen3.5-0.8B-Base /root/py311/venv/bin/python3 /root/code/cudalm-agent --no-convert
-# date: 2026-09-26T19:01:22Z
+# date: 2026-09-27T05:05:48Z
 # =============================================================================
 ========= COMPUTE-SANITIZER
 [batched-decode] model loaded: 24 layers, vocab 248320, page_tokens 2, pool pages 24, delta slots 8

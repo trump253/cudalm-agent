@@ -2232,20 +2232,52 @@ kernel bit-identical。
   `max_batch_size`、`batch_fallback_calls`。
 - **采样**：一次 D2H 拿 logits `[B, vocab]`，然后**逐行**
   `request[b].sampler.sample(logits[b])`（per-request RNG 隔离）。
+- **batch 提交的 commit 顺序（钉死，reviewer fix）**：
+  `forward_batch` **成功** → 对 cohort 每个 request **立即**
+  `forward_count++` 且 `Waiting -> Running`（在 logits D2H **之前**，与
+  冻结 `advance_one()` 的顺序一致：forward ok → 计数 → logits）→
+  `logits_batch_to_host` → 逐行 sampling / finish。若 **logits retrieval
+  失败**：cohort 每行 `Failed` + retire **恰好一次**，且 `forward_count`
+  **必须包含刚才成功的 batch forward**（复制失败发生在已提交的 forward
+  之后 —— 同单路径 `logits_to_host` 失败的语义）。
 
 ### 26.6 Gates（全部 PASS，真实 Qwen3.5-0.8B-Base checkpoint）
 
 - **kernel-level 逐行 parity**（`tests/cuda/test_qwen35_batch_kernels.cpp`；
   CUDA、**无** checkpoint、合成 LCG 输入）：batched W4A16 GEMV / BF16 GEMV /
   paged KV write / paged attention / DeltaNet（conv·gbeta·delta）逐行
-  **BIT-IDENTICAL** 到冻结单 kernel。
+  **BIT-IDENTICAL** 到冻结单 kernel。Delta stateful 覆盖 **B=3、5-slot
+  池、非连续非 identity 行槽 {2, 0, 4}**（行 b 只按自己的 slot 索引
+  state）；paged KV / attention 覆盖**非连续 page 映射**（逐行 shuffled
+  block table、disjoint page 集）+ 异构 position。
 - **full-model 真检查点硬门**（`tests/cuda/test_qwen35_batched_decode.cpp`；
   无 checkpoint 自 skip 77，evidence 环境**必须真实运行**）：**B=3
   heterogeneous**（3/5/2-token prompt、`page_tokens=2` 强制 page 边界、
-  非连续 slot / page、不同 position）+ **B=1**，**两个 decode step**：每行
-  embedding / **24× layer-final** / final-norm / **FULL logits[248320]** /
-  最终 hybrid state（18× Delta conv·rec + 6× FA logical K/V）/ length 全部
-  **BIT-IDENTICAL** 到冻结单序列路径（equivalent state 起）。
+  不同 position；batch 行使用 pool 分配的**非连续 Delta 槽 {0, 2, 4}** ——
+  建 5 条 sequence 再 retire 2 条，槽由 `FixedIdPool` 顺序发放 + LIFO
+  回收真实产生）+ **B=1（非 identity 槽：row 0 → slot 2**，建 3 条
+  retire 2 条），**两个 decode step**：每行 embedding / **24× layer-final**
+  / final-norm / **FULL logits[248320]** / 最终 hybrid state（18× Delta
+  conv·rec + 6× FA logical K/V）/ length 全部 **BIT-IDENTICAL** 到冻结单
+  序列路径（equivalent state 起）。
+- **zero-mutation preflight + serial fallback 真检查点门**（`tests/cuda/
+  test_qwen35_batch_fallback.cpp`；reviewer fix 新增）：**聚合 KV 容量
+  不足**（pool 3 页、两条 length-2 sequence、1 页 free、batch 需要 2 页）：
+  * 直接 API：失败的 `forward_batch_with_state` 前后，length / block
+    tables / KV pool 计数（free/used/capacity/live pages）/ Delta state
+    （全部 18 个 conv + recurrent 槽）/ logical KV **逐字节不变**（无部分
+    分配）；
+  * scheduler：`batch_fallback_calls == 1`、`batch_forward_calls == 0`；
+    行 A 按冻结 Phase A serial 路径前进一步（state 与**独立 direct-serial
+    reference** BIT-IDENTICAL、token 流相同），pool delta **恰好** A 提交
+    的 1 页；行 B 的 serial forward 也失败（A 提交后 pool 耗尽）→ Failed +
+    retire 恰好一次、失败 forward **不计数**（forward_count 2 非 3）、零
+    突变（page + Delta 槽 release 后 all-zero）。
+- **batch-logits-failure CPU 硬门**（`tests/cpu/test_qwen35_scheduler.
+  cpp`；reviewer fix 新增；fake batch forwarder：`forward_batch` 成功 +
+  `logits_batch_to_host` 返回 Status error）：cohort 每行 `forward_count +1`
+  （**包含**已提交的 batch forward）、`Failed`、retire 恰好一次、
+  `num_live == 0`；`batch_forward_calls=1`、`batch_fallback_calls=0`。
 - **scheduler 真检查点 batch 门**（`tests/cuda/test_qwen35_scheduler_batch.
   cpp`）：三个**不同 prompt 长度**（3/5/2）的 request，max_new 钉死成 cohort
   先 **B=3** 后 A finish 收缩到 **B=2**：`batch_forward_calls=2`、
@@ -2257,13 +2289,24 @@ kernel bit-identical。
 - Phase A 门 `test_qwen35_scheduler_integration` **保持全绿**。
 
 ### 26.7 Evidence（于 `V06B_EVIDENCE_SHA =
-31b3ad2c3122465c3a43eee8c2b49f68f029a7a7`，clean tree）
+21305eb48646d2e6e60fcca386239a862161f9e1`，clean tree）
 
-完整 ctest **57/57 PASS、0 failed、0 skipped**（三个新 gate 在 evidence
-环境真实运行，非 77 skip）；`scripts/check_no_torch.sh` **CLEAN**；
+（reviewer fix round：batch-logits-failure forward_count + 真实
+zero-mutation/fallback 门 + 非连续 Delta 槽；旧绑定
+`31b3ad2c3122465c3a43eee8c2b49f68f029a7a7` 按失效规则声明失效、历史
+保留。batched CUDA 主体未重构 —— 三个 fix 全部是 scheduler commit 顺序 +
+新增/扩展现有 gate。）
+
+完整 ctest **58/58 PASS、0 failed、0 skipped**（四个 Phase B CUDA gate +
+CPU batch-logits-failure 门在 evidence 环境真实运行，非 77 skip；含 Phase A
+全部门面回归）；`scripts/check_no_torch.sh` **CLEAN**；
 `compute-sanitizer --tool memcheck` 对 `test_qwen35_batched_decode`（真实
-checkpoint 全流程，B=3×2-step + B=1）**PASS + ERROR SUMMARY: 0
-errors**（原始日志：`benchmarks/sanitizer_qwen35_batched_decode.txt`）。
+checkpoint 全流程，B=3×2-step + B=1，非连续 Delta 槽）**PASS + ERROR
+SUMMARY: 0 errors**（原始日志：
+`benchmarks/sanitizer_qwen35_batched_decode.txt`）与新增的
+`test_qwen35_batch_fallback`（zero-mutation + serial fallback 全流程）
+**PASS + ERROR SUMMARY: 0 errors**（原始日志：
+`benchmarks/sanitizer_qwen35_batch_fallback.txt`）。
 
 ### 26.8 v0.6 边界 / 停（明说）
 

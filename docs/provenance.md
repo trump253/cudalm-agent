@@ -1262,16 +1262,21 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
     `single_forward_calls` / `max_batch_size` / `batch_fallback_calls`。
     采样：一次 D2H 拿 logits `[B,vocab]`，然后**逐行**
     `request[b].sampler.sample(logits[b])`（per-request RNG 隔离）。
-  - **新增测试（3 个，全部 PASS）**：
+  - **新增测试（4 个 CUDA + 1 个 CPU 门，全部 PASS）**：
     - `test_qwen35_batch_kernels`（**kernel-level 逐行 parity**；CUDA、
       **无** checkpoint、合成 LCG 输入）：batched W4A16 GEMV / BF16 GEMV /
       paged KV write / paged attention / DeltaNet（conv·gbeta·delta）逐行
-      **BIT-IDENTICAL** 到冻结单 kernel；
+      **BIT-IDENTICAL** 到冻结单 kernel。Delta stateful 覆盖 **B=3、5-slot
+      池、非连续非 identity 行槽 {2, 0, 4}**（reviewer fix：原为 B=2、
+      slot {0,1}）；paged KV / attention 覆盖非连续 page 映射（逐行
+      shuffled block table、disjoint page 集）+ 异构 position；
     - `test_qwen35_batched_decode`（**full-model 真检查点硬门**；真实
       Qwen3.5-0.8B-Base；无 checkpoint 自 skip 77，evidence 环境**必须真实
       运行**）：**B=3 heterogeneous**（3/5/2-token prompt、`page_tokens=2`
-      强制 page 边界、非连续 slot/page、不同 position）+ **B=1**，**两个
-      decode step**：每行 embedding / 24× layer-final / final-norm / FULL
+      强制 page 边界、不同 position；reviewer fix：batch 行改用 pool 分配
+      的**非连续 Delta 槽 {0, 2, 4}**（建 5 条 retire 2 条）——原为连续
+      {0,1,2}）+ **B=1（非 identity 槽：row 0 → slot 2）**，**两个 decode
+      step**：每行 embedding / 24× layer-final / final-norm / FULL
       logits[248320] / 最终 hybrid state（18× Delta conv·rec + 6× FA logical
       K/V）/ length 全部 **BIT-IDENTICAL** 到冻结单序列路径（equivalent
       state 起）；
@@ -1281,29 +1286,53 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
       `batch_fallback_calls=0`、forwarder 观测 cohort size 序列**恰好
       {3,2}**（B≥2 cohort 恰好一次 batch forward）；每 request generated
       IDs / 每生成步 FULL logits / forward count / finish reason / **最终
-      hybrid state** 与独立 fresh-manager reference **全部 EXACT**。
+      hybrid state** 与独立 fresh-manager reference **全部 EXACT**；
+    - `test_qwen35_batch_fallback`（**zero-mutation preflight + serial
+      fallback 真检查点门**；reviewer fix 新增）：**聚合 KV 容量不足**（pool
+      3 页、两条 length-2 sequence、1 页 free、batch 需要 2 页）：直接 API
+      失败的 `forward_batch_with_state` 前后 length / block tables / KV pool
+      计数（free/used/capacity/live pages）/ Delta state（全部 18 个 conv +
+      recurrent 槽）/ logical KV **逐字节不变**（无部分分配）；scheduler
+      同场景 `batch_fallback_calls==1`、`batch_forward_calls==0`，行 A 按
+      冻结 Phase A serial 路径前进一步（state 与独立 direct-serial
+      reference BIT-IDENTICAL + token 流相同），pool delta 恰好 A 提交的 1
+      页；行 B 的 serial forward 失败 → Failed + retire 恰好一次、失败
+      forward 不计数（forward_count 2 非 3）、零突变（page + Delta 槽
+      release 后 all-zero）；
+    - CPU 门 `test_qwen35_scheduler`（**batch-logits-failure**；reviewer fix
+      新增；fake batch forwarder：`forward_batch` 成功 +
+      `logits_batch_to_host` 返回 Status error）：cohort 每行
+      `forward_count +1`（**包含**已提交的 batch forward）、`Failed`、
+      retire 恰好一次、`num_live == 0`；`batch_forward_calls=1`、
+      `batch_fallback_calls=0`。
   - **完整 regression（于本 evidence SHA，clean tree）**：完整 ctest
-    **57/57 PASS、0 failed、0 skipped**（含 v0.4/v0.5/v0.6-Phase-A 全部
-    门面回归 + 三个新 gate + Phase A `test_qwen35_scheduler_integration`
-    保持全绿；三个新 gate 真实运行，非 77 skip）；`scripts/check_no_torch.sh`
-    **CLEAN**。
+    **58/58 PASS、0 failed、0 skipped**（含 v0.4/v0.5/v0.6-Phase-A 全部
+    门面回归 + 四个 Phase B CUDA gate + CPU batch-logits-failure 门 +
+    Phase A `test_qwen35_scheduler_integration` 保持全绿；新增 gate 真实
+    运行，非 77 skip）；`scripts/check_no_torch.sh` **CLEAN**。
   - **Sanitizer（于本 evidence SHA）**：Phase B 引入**真 batched GPU
     decode**（embedding gather / batched W4A16·BF16 GEMV / DeltaNet
     stateful / paged KV·attention / heterogeneous RoPE，在真实 forward 之上
-    B=3×2-step + B=1 全流程）：`compute-sanitizer --tool memcheck`（RTX
-    2080 Ti / CUDA 11.8）对 `test_qwen35_batched_decode`（真实 checkpoint
-    全流程）：**PASS + ERROR SUMMARY: 0 errors**（原始日志：
-    `benchmarks/sanitizer_qwen35_batched_decode.txt`）。
+    B=3×2-step + B=1 全流程，非连续 Delta 槽）：`compute-sanitizer --tool
+    memcheck`（RTX 2080 Ti / CUDA 11.8）对 `test_qwen35_batched_decode`
+    （真实 checkpoint 全流程）：**PASS + ERROR SUMMARY: 0 errors**（原始
+    日志：`benchmarks/sanitizer_qwen35_batched_decode.txt`）；reviewer fix
+    新增的 `test_qwen35_batch_fallback`（zero-mutation preflight + serial
+    fallback 全流程，含失败路径）：**PASS + ERROR SUMMARY: 0 errors**（原始
+    日志：`benchmarks/sanitizer_qwen35_batch_fallback.txt`）。
   - **evidence 绑定**：`V06B_EVIDENCE_SHA =
-    31b3ad2c3122465c3a43eee8c2b49f68f029a7a7`（clean tree、HEAD == SHA；
-    完整 ctest 57/57 PASS 0 skipped + check_no_torch CLEAN + full-model
-    batched decode 门 compute-sanitizer memcheck 0 错误，均于该 SHA）。
-    **失效声明（未删除历史）**：本 functional commit 修改了 `src/`、
-    `include/`、`tests/` 与测试 CMake，按失效规则：**`V06A_EVIDENCE_SHA =
+    21305eb48646d2e6e60fcca386239a862161f9e1`（clean tree、HEAD == SHA；
+    完整 ctest 58/58 PASS 0 skipped + check_no_torch CLEAN + full-model
+    batched decode 门与 fallback 门 compute-sanitizer memcheck 均 0 错误，
+    均于该 SHA）。**失效声明（未删除历史）**：本 reviewer-fix commit
+    修改了 `src/`、`tests/` 与测试 CMake，按失效规则：**本 round 之前的
+    Phase B 绑定 `31b3ad2c3122465c3a43eee8c2b49f68f029a7a7` 失效**（其
+    batch-logits-failure 计数 / fallback 覆盖 / slot 覆盖三处已被本 SHA
+    修正取代；SHA 与历史保留）。更早的 **`V06A_EVIDENCE_SHA =
     928d0a772f698bcc22e55a6d2ff1a19f48e0f037`**（及其更早的 Phase A 首版
     `459ff12f1a4d1365112d65f8863a4e5010710c11`）与 **`V05C_EVIDENCE_SHA =
     1054b69c4f72f3f0238361d5b5e5f5ab8463489c`**（及其更早的 V05B / V05A /
-    V04 绑定）对本 tree **失效** —— 其全部门面回归已在本 SHA 的 57/57 内
+    V04 绑定）对本 tree **失效** —— 其全部门面回归已在本 SHA 的 58/58 内
     重跑全绿（v0.5 的 merge 状态与历史 SHA 不变，仅 evidence 绑定按规则
     推进）。失效规则延续：此后任何 `src/` / `include/` / `tools/` /
     `tests/` / functional CMake 修改 → 本 evidence 失效必须重跑；仅
