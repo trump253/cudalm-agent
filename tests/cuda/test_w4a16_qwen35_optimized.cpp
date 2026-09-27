@@ -2,8 +2,10 @@
 //
 // The EXACT contract (v0.6 frozen gate, unchanged): every output of the
 // Phase-B variants (R=1/2/8 row tiles, B=1 and batch) and of the
-// PRODUCTION DISPATCHER must be BF16 BIT-IDENTICAL to the FROZEN v0.6
-// baseline (int4_gemv_bf16 / batch_int4_gemv_bf16) on the same input —
+// EXPERIMENTAL / measured dispatcher (benchmark/test/profiling
+// infrastructure — NOT a production entry point; the production runtime
+// calls the frozen baseline directly) must be BF16 BIT-IDENTICAL to the
+// FROZEN v0.6 baseline (int4_gemv_bf16 / batch_int4_gemv_bf16) on the same input —
 // for ALL production shapes of the Qwen3.5-0.8B W4A16 census
 // (benchmarks/profiling/v07b_w4a16_shape_census.txt), B = 1/2/3, and the
 // edge shapes / input classes:
@@ -18,9 +20,11 @@
 //
 // Contract checks (must not regress):
 //   * the alignment / K%128 / fallback / legal-shape contracts: variant
-//     launchers and the dispatcher never reject legal inputs; when the
-//     16B alignment contract is not met they fall back to the frozen path
-//     and stay bit-identical to the frozen entry point on the same input.
+//     launchers and the experimental dispatcher never reject legal inputs;
+//     when the 16B alignment contract is not met they fall back to the
+//     frozen path and stay bit-identical to the frozen entry point on the
+//     same input (the alignment fallback is checked with INDEPENDENT output
+//     buffers: frozen vs rowtile1, and frozen vs dispatcher).
 //   * frozen row-parity contract: every batch row b of the dispatcher and
 //     each variant is bit-identical to the frozen SINGLE call on row b.
 //
@@ -307,7 +311,7 @@ void check_dispatcher(cudaStream_t stream, const Shape& sh, const Fixture& fx,
     int4_gemv_bf16(dW.data<std::uint8_t>(), dS.data<__half>(),
                    dx.data<__nv_bfloat16>(), dyf.data<__nv_bfloat16>(), sh.N,
                    sh.K, stream);
-    int4_gemv_bf16_qwen35(dW.data<std::uint8_t>(), dS.data<__half>(),
+    int4_gemv_bf16_qwen35_experimental(dW.data<std::uint8_t>(), dS.data<__half>(),
                           dx.data<__nv_bfloat16>(), dyv.data<__nv_bfloat16>(),
                           sh.N, sh.K, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -344,7 +348,7 @@ void check_dispatcher(cudaStream_t stream, const Shape& sh, const Fixture& fx,
                                   dx.data<__nv_bfloat16>(),
                                   dyf.data<__nv_bfloat16>(), sh.N, sh.K, B,
                                   stream);
-    batch_int4_gemv_bf16_qwen35(dW.data<std::uint8_t>(), dS.data<__half>(),
+    batch_int4_gemv_bf16_qwen35_experimental(dW.data<std::uint8_t>(), dS.data<__half>(),
                                 dx.data<__nv_bfloat16>(),
                                 dyv.data<__nv_bfloat16>(), sh.N, sh.K, B,
                                 stream);
@@ -385,9 +389,11 @@ void check_alignment_fallback(cudaStream_t stream, const Shape& sh,
 
   DeviceBuffer dRaw(raw.size(), stream);
   DeviceBuffer dyf(static_cast<std::size_t>(sh.N) * sizeof(__nv_bfloat16),
-                   stream);
-  DeviceBuffer dyv(static_cast<std::size_t>(sh.N) * sizeof(__nv_bfloat16),
-                   stream);
+                   stream);  // frozen entry point (scalar path)
+  DeviceBuffer dyv1(static_cast<std::size_t>(sh.N) * sizeof(__nv_bfloat16),
+                    stream);  // R1 variant launcher (independent output)
+  DeviceBuffer dyv2(static_cast<std::size_t>(sh.N) * sizeof(__nv_bfloat16),
+                    stream);  // experimental dispatcher (independent output)
   dRaw.copy_from_host(raw.data(), raw.size(), stream);
 
   const std::uint8_t* dW = dRaw.data<std::uint8_t>();
@@ -397,22 +403,38 @@ void check_alignment_fallback(cudaStream_t stream, const Shape& sh,
       dRaw.data<__nv_bfloat16>() + (fx.W.size() + fx.S.size() * 2) / 2 + 8;
 
   int4_gemv_bf16(dW, dS, dx8, dyf.data<__nv_bfloat16>(), sh.N, sh.K, stream);
-  int4_gemv_bf16_rowtile1(dW, dS, dx8, dyv.data<__nv_bfloat16>(), sh.N,
+  int4_gemv_bf16_rowtile1(dW, dS, dx8, dyv1.data<__nv_bfloat16>(), sh.N,
                           sh.K, stream);
-  int4_gemv_bf16_qwen35(dW, dS, dx8, dyv.data<__nv_bfloat16>(), sh.N, sh.K,
-                        stream);
+  int4_gemv_bf16_qwen35_experimental(dW, dS, dx8, dyv2.data<__nv_bfloat16>(),
+                                     sh.N, sh.K, stream);
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  std::vector<__nv_bfloat16> rf(sh.N), rv(sh.N);
+  std::vector<__nv_bfloat16> rf(sh.N), rv1(sh.N), rv2(sh.N);
   CUDA_CHECK(cudaMemcpy(rf.data(), dyf.data(), rf.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(rv.data(), dyv.data(), rv.size() * sizeof(__nv_bfloat16),
+  CUDA_CHECK(cudaMemcpy(rv1.data(), dyv1.data(),
+                        rv1.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(rv2.data(), dyv2.data(),
+                        rv2.size() * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost));
+  // frozen vs rowtile1 (independent output, independent comparison)
   ++st->runs;
-  if (!bf16_bit_equal(rf.data(), rv.data(), sh.N)) {
+  if (!bf16_bit_equal(rf.data(), rv1.data(), sh.N)) {
     std::fprintf(stderr,
-                 "ALIGNED-FALLBACK MISMATCH dispatcher(r1) %s (N=%d,K=%d): "
+                 "ALIGNED-FALLBACK MISMATCH rowtile1 %s (N=%d,K=%d): "
                  "misaligned x must stay bit-identical via the frozen path\n",
+                 sh.name, sh.N, sh.K);
+    ++st->bit_fail;
+  }
+  // frozen vs experimental dispatcher (independent output, independent
+  // comparison)
+  ++st->runs;
+  if (!bf16_bit_equal(rf.data(), rv2.data(), sh.N)) {
+    std::fprintf(stderr,
+                 "ALIGNED-FALLBACK MISMATCH experimental dispatcher %s "
+                 "(N=%d,K=%d): misaligned x must stay bit-identical via the "
+                 "frozen path\n",
                  sh.name, sh.N, sh.K);
     ++st->bit_fail;
   }

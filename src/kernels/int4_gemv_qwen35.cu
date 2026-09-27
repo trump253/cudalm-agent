@@ -1,5 +1,12 @@
 // CUDALM — v0.7 Phase B: W4A16 GEMV adaptive-N-row-tile variants +
-// production dispatcher (Qwen3.5-0.8B serving shapes).
+// EXPERIMENTAL / measured dispatcher (Qwen3.5-0.8B serving shapes).
+//
+// STATUS: benchmark/test/profiling infrastructure. The production Qwen3.5
+// runtime calls the FROZEN R=4 baseline directly (int4_gemv_bf16 /
+// kernels::batch_int4_gemv_bf16). The measured-table candidate was
+// benchmarked at V07B_CANDIDATE_SHA and REJECTED for production (canonical
+// E2E improvement within noise; docs/v07_w4a16_optimization.md); the table
+// is retained so the candidate can be re-benchmarked/reproduced.
 //
 // STRUCTURE (identical to the frozen rowtile4 baseline — the ONLY change
 // is R, the number of output N rows per block):
@@ -314,7 +321,8 @@ void batch_int4_gemv_bf16_rowtile8(const std::uint8_t* weight,
 // path — the bit-compatible generic fallback (with its scalar fallback
 // for non-16B-aligned inputs).
 //
-// MEASURED ADAPTIVE TABLE — PRODUCTION CANDIDATE (V07B_CANDIDATE_SHA).
+// MEASURED ADAPTIVE TABLE (candidate, measured at V07B_CANDIDATE_SHA;
+// REJECTED for production — retained for reproducible candidate bench).
 //
 // The R choice is a STATIC measured-shape table (no runtime autotuning),
 // keyed on the Qwen3.5-0.8B production census (benchmarks/profiling/
@@ -336,10 +344,12 @@ void batch_int4_gemv_bf16_rowtile8(const std::uint8_t* weight,
 //         N=512,K=1024 && B==3     -> frozen R4 (R2 measured 0.94x)
 //         else                     -> frozen R4
 //
-// This candidate SHA carries the measured table through the production
-// runtime call sites for the full-model candidate benchmark. The final
-// production decision (E2E acceptance) is recorded in docs/
-// v07_w4a16_optimization.md.
+// FINAL STATE: the production runtime does NOT use this dispatcher (the
+// candidate was REJECTED after the exact-SHA E2E acceptance check: kernel
+// level -5.9% W4A16 time, E2E wall within noise — docs/
+// v07_w4a16_optimization.md). The measured table is retained so the
+// candidate can be re-benchmarked/reproduced (it is what
+// V07B_CANDIDATE_SHA ran in the full-model candidate benchmark).
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -373,12 +383,12 @@ int pick_rowtile_batch(int N, int K, int B) {
 
 }  // namespace
 
-void int4_gemv_bf16_qwen35(const std::uint8_t* weight, const __half* scales,
+void int4_gemv_bf16_qwen35_experimental(const std::uint8_t* weight, const __half* scales,
                            const __nv_bfloat16* x, __nv_bfloat16* y, int N,
                            int K, cudaStream_t stream) {
-  CUDALM_PRECONDITION(N >= 1, "int4_gemv_bf16_qwen35 requires N >= 1");
+  CUDALM_PRECONDITION(N >= 1, "int4_gemv_bf16_qwen35_experimental requires N >= 1");
   CUDALM_PRECONDITION(K > 0 && K % 128 == 0,
-                      "int4_gemv_bf16_qwen35 requires K % 128 == 0");
+                      "int4_gemv_bf16_qwen35_experimental requires K % 128 == 0");
   if (!vec_contract_ok(weight, x, K)) {
     int4_gemv_bf16(weight, scales, x, y, N, K, stream);  // frozen (scalar fb)
     return;
@@ -399,14 +409,14 @@ void int4_gemv_bf16_qwen35(const std::uint8_t* weight, const __half* scales,
   }
 }
 
-void batch_int4_gemv_bf16_qwen35(const std::uint8_t* weight,
+void batch_int4_gemv_bf16_qwen35_experimental(const std::uint8_t* weight,
                                  const __half* scales,
                                  const __nv_bfloat16* x, __nv_bfloat16* y,
                                  int N, int K, int B, cudaStream_t stream) {
-  CUDALM_PRECONDITION(N >= 1, "batch_int4_gemv_bf16_qwen35 requires N >= 1");
-  CUDALM_PRECONDITION(B >= 1, "batch_int4_gemv_bf16_qwen35 requires B >= 1");
+  CUDALM_PRECONDITION(N >= 1, "batch_int4_gemv_bf16_qwen35_experimental requires N >= 1");
+  CUDALM_PRECONDITION(B >= 1, "batch_int4_gemv_bf16_qwen35_experimental requires B >= 1");
   CUDALM_PRECONDITION(K > 0 && K % 128 == 0,
-                      "batch_int4_gemv_bf16_qwen35 requires K % 128 == 0");
+                      "batch_int4_gemv_bf16_qwen35_experimental requires K % 128 == 0");
   if (!vec_contract_ok(weight, x, K)) {
     kernels::batch_int4_gemv_bf16(weight, scales, x, y, N, K, B, stream);
     return;

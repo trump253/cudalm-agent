@@ -1,5 +1,13 @@
 // CUDALM — v0.7 Phase B: W4A16 GEMV adaptive-N-row-tile variants +
-// production dispatcher for the Qwen3.5-0.8B serving shapes.
+// EXPERIMENTAL / measured dispatcher for the Qwen3.5-0.8B serving shapes.
+//
+// STATUS: the experimental dispatcher is BENCHMARK / TEST / PROFILING
+// INFRASTRUCTURE only. The production Qwen3.5 runtime calls the FROZEN
+// R=4 baseline (int4_gemv_bf16 / kernels::batch_int4_gemv_bf16) directly;
+// the measured-table candidate was measured (see the candidate evidence)
+// and REJECTED for production because the canonical E2E improvement was
+// within noise. The measured table is retained here so the candidate
+// can be re-benchmarked/reproduced; it is NOT a production entry point.
 //
 // The frozen v0.6/v0.7A baseline (src/kernels/int4_gemv_bf16.cu
 // int4gemv_rowtile4_bf16_kernel, R=4 row tile, 128-thread block) is
@@ -20,12 +28,13 @@
 // B=1/2/3). The frozen row-parity contract (batch row b == frozen single
 // call on row b, bit-identical) is inherited by every variant.
 //
-// Dispatcher (int4_gemv_bf16_qwen35 / batch_int4_gemv_bf16_qwen35):
-// selects R per (N, K[, B]) from the measured-shape table in the .cu
-// (docs/v07_w4a16_optimization.md). NO runtime autotuning. Any legal shape
-// not in the table takes the frozen R=4 baseline path (bit-compatible
-// generic fallback, including the scalar fallback when the 16B alignment
-// contract is not met).
+// Experimental / measured dispatcher (int4_gemv_bf16_qwen35_experimental /
+// batch_int4_gemv_bf16_qwen35_experimental): selects R per (N, K[, B]) from
+// the measured-shape table in the .cu (docs/v07_w4a16_optimization.md). NO
+// runtime autotuning. Any legal shape not in the table takes the frozen R=4
+// baseline path (bit-compatible generic fallback, including the scalar
+// fallback when the 16B alignment contract is not met). NOT used by the
+// production runtime.
 #pragma once
 
 #include <cstdint>
@@ -74,16 +83,19 @@ void batch_int4_gemv_bf16_rowtile8(const std::uint8_t* weight,
                                    int N, int K, int B, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Production dispatcher (the ONLY entry point the Qwen3.5 runtime uses in
-// v0.7B). R is chosen from the measured-shape table (N, K[, B]); any
-// unrecognized legal shape falls back to the frozen R=4 baseline path.
+// EXPERIMENTAL / measured dispatcher (benchmark/test/profiling
+// infrastructure — NOT a production entry point). R is chosen from the
+// measured-shape table (N, K[, B]); any unrecognized legal shape falls back
+// to the frozen R=4 baseline path.
 // ---------------------------------------------------------------------------
-void int4_gemv_bf16_qwen35(const std::uint8_t* weight, const __half* scales,
-                           const __nv_bfloat16* x, __nv_bfloat16* y, int N,
-                           int K, cudaStream_t stream);
+void int4_gemv_bf16_qwen35_experimental(const std::uint8_t* weight,
+                                        const __half* scales,
+                                        const __nv_bfloat16* x,
+                                        __nv_bfloat16* y, int N, int K,
+                                        cudaStream_t stream);
 
-void batch_int4_gemv_bf16_qwen35(const std::uint8_t* weight,
-                                 const __half* scales,
+void batch_int4_gemv_bf16_qwen35_experimental(const std::uint8_t* weight,
+                                              const __half* scales,
                                  const __nv_bfloat16* x, __nv_bfloat16* y,
                                  int N, int K, int B, cudaStream_t stream);
 

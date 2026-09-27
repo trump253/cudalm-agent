@@ -21,7 +21,6 @@
 
 #include "cudalm/cuda_check.h"
 #include "cudalm/kernels/int4_gemv_bf16.h"
-#include "cudalm/kernels/int4_gemv_qwen35.h"  // v0.7B dispatcher (measured R)
 #include "cudalm/kernels/batch_decode.h"
 #include "cudalm/kernels/paged_kv.h"
 #include "cudalm/kernels/qwen35_kernels.h"
@@ -209,7 +208,7 @@ void Qwen35FullAttentionLayer::forwardImpl(int position,
 
   // 2) fused q_proj [q; gate] + split
   rec(events, 4, stream);
-  int4_gemv_bf16_qwen35(w_->q_proj.weight.data<std::uint8_t>(),
+  int4_gemv_bf16(w_->q_proj.weight.data<std::uint8_t>(),
                  w_->q_proj.scale.data<__half>(), rms1_.data<__nv_bfloat16>(),
                  q_gate_.data<__nv_bfloat16>(), w_->q_proj.N, w_->q_proj.K,
                  stream);
@@ -222,12 +221,12 @@ void Qwen35FullAttentionLayer::forwardImpl(int position,
 
   // 3) k / v projections (W4A16)
   rec(events, 8, stream);
-  int4_gemv_bf16_qwen35(w_->k_proj.weight.data<std::uint8_t>(),
+  int4_gemv_bf16(w_->k_proj.weight.data<std::uint8_t>(),
                  w_->k_proj.scale.data<__half>(), rms1_.data<__nv_bfloat16>(),
                  k_.data<__nv_bfloat16>(), w_->k_proj.N, w_->k_proj.K, stream);
   rec(events, 9, stream);
   rec(events, 10, stream);
-  int4_gemv_bf16_qwen35(w_->v_proj.weight.data<std::uint8_t>(),
+  int4_gemv_bf16(w_->v_proj.weight.data<std::uint8_t>(),
                  w_->v_proj.scale.data<__half>(), rms1_.data<__nv_bfloat16>(),
                  v_.data<__nv_bfloat16>(), w_->v_proj.N, w_->v_proj.K, stream);
   rec(events, 11, stream);
@@ -298,7 +297,7 @@ void Qwen35FullAttentionLayer::forwardImpl(int position,
 
   // 9) O projection + residual 1
   rec(events, 26, stream);
-  int4_gemv_bf16_qwen35(w_->o_proj.weight.data<std::uint8_t>(),
+  int4_gemv_bf16(w_->o_proj.weight.data<std::uint8_t>(),
                  w_->o_proj.scale.data<__half>(),
                  attn_gated_.data<__nv_bfloat16>(),
                  o_proj_.data<__nv_bfloat16>(), w_->o_proj.N, w_->o_proj.K,
@@ -320,13 +319,13 @@ void Qwen35FullAttentionLayer::forwardImpl(int position,
 
   // 11) gate / up (W4A16) + SiLU(gate) * up
   rec(events, 32, stream);
-  int4_gemv_bf16_qwen35(w_->gate_proj.weight.data<std::uint8_t>(),
+  int4_gemv_bf16(w_->gate_proj.weight.data<std::uint8_t>(),
                  w_->gate_proj.scale.data<__half>(),
                  rms2_.data<__nv_bfloat16>(), mlp_gate_.data<__nv_bfloat16>(),
                  w_->gate_proj.N, w_->gate_proj.K, stream);
   rec(events, 33, stream);
   rec(events, 34, stream);
-  int4_gemv_bf16_qwen35(w_->up_proj.weight.data<std::uint8_t>(),
+  int4_gemv_bf16(w_->up_proj.weight.data<std::uint8_t>(),
                  w_->up_proj.scale.data<__half>(),
                  rms2_.data<__nv_bfloat16>(), mlp_up_.data<__nv_bfloat16>(),
                  w_->up_proj.N, w_->up_proj.K, stream);
@@ -339,7 +338,7 @@ void Qwen35FullAttentionLayer::forwardImpl(int position,
 
   // 12) down (W4A16) + residual 2
   rec(events, 38, stream);
-  int4_gemv_bf16_qwen35(w_->down_proj.weight.data<std::uint8_t>(),
+  int4_gemv_bf16(w_->down_proj.weight.data<std::uint8_t>(),
                  w_->down_proj.scale.data<__half>(),
                  silu_mul_.data<__nv_bfloat16>(),
                  mlp_down_.data<__nv_bfloat16>(), w_->down_proj.N,
@@ -469,7 +468,7 @@ void Qwen35FullAttentionLayer::forward_batch_with_paged_state(
 
   // 2) fused q_proj [q; gate] (W4A16, batched) + split (frozen kernel;
   //    the [B][n_heads][2*hd] layout splits per (b,h) head row).
-  batch_int4_gemv_bf16_qwen35(w_->q_proj.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16(w_->q_proj.weight.data<std::uint8_t>(),
                        w_->q_proj.scale.data<__half>(),
                        b_rms1_.data<__nv_bfloat16>(),
                        b_q_gate_.data<__nv_bfloat16>(), w_->q_proj.N,
@@ -479,12 +478,12 @@ void Qwen35FullAttentionLayer::forward_batch_with_paged_state(
       b_att_gate_.data<__nv_bfloat16>(), B * n_heads, hd, stream);
 
   // 3) k / v projections (W4A16, batched).
-  batch_int4_gemv_bf16_qwen35(w_->k_proj.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16(w_->k_proj.weight.data<std::uint8_t>(),
                        w_->k_proj.scale.data<__half>(),
                        b_rms1_.data<__nv_bfloat16>(),
                        b_k_.data<__nv_bfloat16>(), w_->k_proj.N, w_->k_proj.K,
                        B, stream);
-  batch_int4_gemv_bf16_qwen35(w_->v_proj.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16(w_->v_proj.weight.data<std::uint8_t>(),
                        w_->v_proj.scale.data<__half>(),
                        b_rms1_.data<__nv_bfloat16>(),
                        b_v_.data<__nv_bfloat16>(), w_->v_proj.N, w_->v_proj.K,
@@ -527,7 +526,7 @@ void Qwen35FullAttentionLayer::forward_batch_with_paged_state(
       static_cast<std::size_t>(B) * n_heads * hd, stream);
 
   // 9) O projection (W4A16, batched) + residual 1 (frozen add, flat).
-  batch_int4_gemv_bf16_qwen35(w_->o_proj.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16(w_->o_proj.weight.data<std::uint8_t>(),
                        w_->o_proj.scale.data<__half>(),
                        b_attn_gated_.data<__nv_bfloat16>(),
                        b_o_proj_.data<__nv_bfloat16>(), w_->o_proj.N,
@@ -544,12 +543,12 @@ void Qwen35FullAttentionLayer::forward_batch_with_paged_state(
       b_rms2_.data<__nv_bfloat16>(), B, H, cfg_.eps, stream);
 
   // 11) gate / up (W4A16, batched) + silu_mul (frozen, flat).
-  batch_int4_gemv_bf16_qwen35(w_->gate_proj.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16(w_->gate_proj.weight.data<std::uint8_t>(),
                        w_->gate_proj.scale.data<__half>(),
                        b_rms2_.data<__nv_bfloat16>(),
                        b_mlp_gate_.data<__nv_bfloat16>(), w_->gate_proj.N,
                        w_->gate_proj.K, B, stream);
-  batch_int4_gemv_bf16_qwen35(w_->up_proj.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16(w_->up_proj.weight.data<std::uint8_t>(),
                        w_->up_proj.scale.data<__half>(),
                        b_rms2_.data<__nv_bfloat16>(),
                        b_mlp_up_.data<__nv_bfloat16>(), w_->up_proj.N,
@@ -560,7 +559,7 @@ void Qwen35FullAttentionLayer::forward_batch_with_paged_state(
       static_cast<std::size_t>(B) * inter, stream);
 
   // 12) down (W4A16, batched) + residual 2.
-  batch_int4_gemv_bf16_qwen35(w_->down_proj.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16(w_->down_proj.weight.data<std::uint8_t>(),
                        w_->down_proj.scale.data<__half>(),
                        b_silu_mul_.data<__nv_bfloat16>(),
                        b_mlp_down_.data<__nv_bfloat16>(), w_->down_proj.N,
