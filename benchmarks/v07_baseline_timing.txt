@@ -1,0 +1,93 @@
+# =============================================================================
+# CUDALM v0.7 Phase A profiling — canonical baseline timing (--mode both, 5 measured runs)
+# V07A evidence at exact SHA: 0a952879da6e6cbb26a4aca181e184f26d2a0eef
+# tree state: tracked tree CLEAN at generation (no modified/deleted
+#             tracked files; untracked = evidence outputs of this run)
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
+# checkpoint: /root/models/Qwen3.5-0.8B-Base
+# model: /root/code/cudalm-agent/build/data/qwen35_08b_full.cudalm
+# workload: 4 requests (prompts 2/5/3/4 tok; max_new 3/6/5/3;
+#           1 greedy + 3 seeded); dynamic arrival A,B -> C -> D;
+#           serial prefill, true batched decode, single stream
+# date: 2026-09-27T12:05:03Z
+# =============================================================================
+# command:
+#   cd /root/code/cudalm-agent/build && ./benchmarks/bench_qwen35_continuous_batching \
+#     data/qwen35_08b_full.cudalm /root/models/Qwen3.5-0.8B-Base /root/py311/venv/bin/python3 /root/code/cudalm-agent --no-convert \
+#     <tmp> --measured-runs 5 --mode both   (report prepended with this header)
+# ------------------------------------------------------------------------
+# CUDALM v0.6 Phase C — dynamic continuous-batching benchmark
+# (reproducible; correctness-first; NO performance pass threshold)
+
+environment:
+  gpu: NVIDIA GeForce RTX 2080 Ti
+  cuda_runtime: 11.8
+  cuda_driver: 12.8
+  checkpoint: /root/models/Qwen3.5-0.8B-Base
+  model: /root/code/cudalm-agent/build/data/qwen35_08b_full.cudalm
+  stream: single (prefill stays serial; decode cohort is batched)
+
+workload (SAME for both modes; all four complete, no cancellation in the timed run):
+  requests: 4 (A greedy; B/C/D seeded)
+  prompt_tokens: 14
+  generated_tokens: 17
+  logical_sequence_token_forwards: 27  (sum over requests of N + m - 1)
+  arrival: A,B first; C after 1 step; D after 2 steps (dynamic)
+timing:
+  warmup_runs (un-timed): 1
+  measured_runs: 5 (each bracketed by cudaStreamSynchronize; steady_clock wall)
+  mode selector (--mode): both (default; v0.6 behavior)
+
+results (per-run metrics are identical across measured runs for this fixed workload; wall time is summarized):
+
+  mode A — independent / SERIAL (each request alone, one at a time):
+    wall_time_s mean:   0.133140
+    wall_time_s median: 0.132032
+    wall_time_s min:    0.131350
+    wall_time_s max:    0.136306
+    logical_tokens: 27
+    logical_tokens_per_s (mean): 202.794345
+    single_forward_calls: 27
+    successful_single_forward_calls: 27
+    batch_forward_calls: 0
+    model_traversal_calls: 27
+    avg_decode_batch_size: 0
+    max_decode_batch_size: 0
+
+  mode B — SCHEDULER CONTINUOUS BATCHED (dynamic arrivals):
+    wall_time_s mean:   0.116368
+    wall_time_s median: 0.115541
+    wall_time_s min:    0.115458
+    wall_time_s max:    0.117940
+    logical_tokens: 27
+    logical_tokens_per_s (mean): 232.023528
+    single_forward_calls: 19
+    successful_single_forward_calls: 19
+    batch_forward_calls: 3
+    model_traversal_calls: 22
+    batched_sequence_tokens: 8
+    avg_decode_batch_size: 2.666667
+    max_decode_batch_size: 3
+
+profile_totals (this process: warmup + all measured runs, BOTH modes;
+ties the whole run to the Nsight Systems kernel-launch count):
+  serial_mode_traversals: 162
+  batched_mode_single_attempts: 114
+  batched_mode_successful_singles: 114
+  batched_mode_committed_batches: 18
+  batched_mode_traversals: 132
+  batched_mode_logical_tokens: 162
+  batched_mode_batched_tokens: 48
+  total_completed_traversals: 294
+
+notes:
+  * logical_sequence_token_forwards == model-traversal calls only in the SERIAL mode; in the batched mode a committed batch of B is B logical tokens but ONE traversal (so batched traversals < logical tokens).
+  * NO speedup claim is made: the correctness-first batch kernels are untuned (tuning is v0.7). A batched time >= serial time in THIS environment is NOT a failure.
+  * Numbers are for THIS environment / checkpoint / workload only; they are not a general performance conclusion.
+
+per-measured-run wall_time_s:
+  run 1: serial=0.131473s batched=0.115541s
+  run 2: serial=0.136306s batched=0.115475s
+  run 3: serial=0.131350s batched=0.115458s
+  run 4: serial=0.134538s batched=0.117423s
+  run 5: serial=0.132032s batched=0.117940s
