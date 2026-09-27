@@ -54,7 +54,7 @@
 //
 // Usage:
 //   bench_qwen35_continuous_batching <full_model.cudalm> <checkpoint_dir>
-//       <python> <src_dir> [out.txt] [--no-convert] [--measured-runs N]
+//       <python> <src_dir> [out.txt] [--no-convert] [--measured-runs N] [--warmup-runs N]
 //       [--mode both|serial|batched]
 // out.txt defaults to "-" (stdout). Self-skips (77) when the checkpoint is
 // absent.
@@ -259,7 +259,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: %s <full_model.cudalm> <checkpoint_dir> <python> "
                  "<src_dir> [out.txt] [--no-convert] [--measured-runs N] "
-                 "[--mode both|serial|batched]\n",
+                 "[--warmup-runs N] [--mode both|serial|batched]\n",
                  argv[0]);
     return 2;
   }
@@ -274,6 +274,10 @@ int main(int argc, char** argv) {
                                       // ONLY the number of timed repetitions
                                       // changes — the per-run execution is
                                       // identical)
+  int warmup_runs = kWarmupRuns;      // v0.7B tooling: --warmup-runs N
+                                       // (default keeps the v0.6/v0.7A
+                                       // behavior; ONLY the number of
+                                       // un-timed warmup repetitions changes)
   // v0.7 tooling (profiling-only mode selector): which workload(s) to run.
   //   both    (default) — v0.6 behavior, byte-for-byte
   //   serial  — mode A only (independent / serial, each request alone)
@@ -292,6 +296,12 @@ int main(int argc, char** argv) {
     } else if (a.rfind("--measured-runs=", 0) == 0) {
       measured_runs = std::atoi(a.c_str() + 16);
       if (measured_runs < 1) measured_runs = 1;
+    } else if (a == "--warmup-runs") {
+      if (i + 1 < argc) warmup_runs = std::atoi(argv[++i]);
+      if (warmup_runs < 0) warmup_runs = 0;
+    } else if (a.rfind("--warmup-runs=", 0) == 0) {
+      warmup_runs = std::atoi(a.c_str() + 14);
+      if (warmup_runs < 0) warmup_runs = 0;
     } else if (a == "--mode") {
       if (i + 1 < argc) mode = argv[++i];
     } else if (a.rfind("--mode=", 0) == 0) {
@@ -369,7 +379,7 @@ int main(int argc, char** argv) {
   } tot;
 
   // ---- warmup (un-timed): one run of each SELECTED mode --------------------
-  for (int w = 0; w < kWarmupRuns; ++w) {
+  for (int w = 0; w < warmup_runs; ++w) {
     if (run_serial_mode) {
       SerialMetrics sm;
       if (run_serial(model, cfg, ws, stream, &sm) != 0) return 1;
@@ -461,7 +471,7 @@ int main(int argc, char** argv) {
        "  (sum over requests of N + m - 1)");
   line("  arrival: A,B first; C after 1 step; D after 2 steps (dynamic)");
   line("timing:");
-  line("  warmup_runs (un-timed): " + std::to_string(kWarmupRuns));
+  line("  warmup_runs (un-timed): " + std::to_string(warmup_runs));
   line("  measured_runs: " + std::to_string(measured_runs) +
        " (each bracketed by cudaStreamSynchronize; steady_clock wall)");
   line("  mode selector (--mode): " + mode +

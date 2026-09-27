@@ -103,6 +103,14 @@ cudalm_add_test(test_int4_gemv test_int4_gemv cuda/test_int4_gemv.cpp)
 # Qwen3.5 kernel family (zero-centered RMSNorm, fused q/gate split, partial
 # rotate-half RoPE, bf16 KV write/decode attention, bf16 elementwise).
 cudalm_add_test(test_int4_gemv_bf16 test_int4_gemv_bf16 cuda/test_int4_gemv_bf16.cpp)
+# v0.7 Phase B: W4A16 adaptive-N-row-tile variants + production dispatcher —
+# BIT-EXACT kernel-level hard gate vs the frozen v0.6 rowtile4 baseline, all
+# production census shapes (N,K) x B=1/2/3 + edge shapes, multiple seeds,
+# zero/small/mixed-sign/boundary-INT4/zero-group-scale inputs, plus the
+# alignment/K%128/fallback/row-parity contracts. No checkpoint (pure kernel
+# parity vs the frozen entry points).
+cudalm_add_test(test_w4a16_qwen35_optimized test_w4a16_qwen35_optimized
+                cuda/test_w4a16_qwen35_optimized.cpp)
 # Plain BF16 GEMV (the tied-LM-head matmul, v0.3 Phase B) — standalone numeric
 # hard gate: vec4 (K%8==0, aligned) + scalar (K%8!=0 / misaligned) + zero-row,
 # vs a CPU FP32-accumulate -> BF16 RNE reference. No checkpoint needed.

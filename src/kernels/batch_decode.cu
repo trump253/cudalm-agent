@@ -658,6 +658,16 @@ void batch_int4_gemv_bf16(const std::uint8_t* weight, const __half* scale,
   CUDA_CHECK_LAUNCH();
 }
 
+// v0.7 Phase B: register-count query for the frozen batch R4 kernel
+// (microbench reporting; no behavior change).
+int batch_int4_gemv_bf16_rowtile4_regs() {
+  cudaFuncAttributes attr;
+  if (cudaFuncGetAttributes(&attr, batch_int4gemv_rowtile4_bf16_kernel) !=
+      cudaSuccess)
+    return -1;
+  return attr.numRegs;
+}
+
 void batch_bf16_gemv(const __nv_bfloat16* weight, const __nv_bfloat16* x,
                      __nv_bfloat16* y, int N, int K, int B,
                      cudaStream_t stream) {

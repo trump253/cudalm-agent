@@ -47,4 +47,8 @@ void int4_gemv_bf16(const std::uint8_t* weight, const __half* scales,
                     const __nv_bfloat16* x, __nv_bfloat16* y, int N, int K,
                     cudaStream_t stream);
 
+// v0.7 Phase B: register-count query for the frozen R4 kernel (microbench
+// reporting; no behavior change). -1 if unavailable.
+int int4_gemv_bf16_rowtile4_regs();
+
 }  // namespace cudalm

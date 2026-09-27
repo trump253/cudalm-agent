@@ -31,3 +31,10 @@ target_link_libraries(bench_qwen35_hybrid_microstack PRIVATE cudalm)
 #       <python> <src_dir> benchmarks/v06_continuous_batching.txt --no-convert
 add_executable(bench_qwen35_continuous_batching bench_qwen35_continuous_batching.cpp)
 target_link_libraries(bench_qwen35_continuous_batching PRIVATE cudalm)
+
+# v0.7 Phase B: dedicated W4A16 GEMV microbenchmark over the Qwen3.5-0.8B
+# production shape census (frozen R4 baseline vs R1/R2/R8 row-tile variants,
+# B=1/2/3, CUDA-event timing, weighted production score). Synthetic
+# deterministic fixtures — no checkpoint needed.
+add_executable(bench_w4a16_qwen35_shapes bench_w4a16_qwen35_shapes.cpp)
+target_link_libraries(bench_w4a16_qwen35_shapes PRIVATE cudalm)

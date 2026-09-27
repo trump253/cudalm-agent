@@ -364,10 +364,13 @@ B=3（`int4_batch_late`，12 launches，58 regs，grid = 3×B=1）：
 - **batch-size 效应（显式回答）**：**显著**。同一投影形状下 per-token 时间
   随 B 下降（大 grid 1536/3072/4608：17.3 → 14.5（B=2）→ 13.8（B=3）µs/
   token，**−16%/−21%**；896 系：12.3 → 9.8 → 8.5；512 系：7.9 → 6.3 →
-  5.5 µs/token）。机理（数据可见）：权重 INT4 流每 call 只读一次、B 个 token
-  共享 → per-token DRAM 流量下降（DRAM% 30→17.4→12.5），kernel 从 DRAM-
-  leaning 移向 SM-leaning（SM% 35→41→44.4），occupancy 微升（82.5→84.1），
-  regs 56→58。主 warp stall 三个 B 档一致（CTA barrier ~8~10 cyc，占 issue
+  5.5 µs/token）。机理（NCU 观察）：随着 B 增大，跨 batch-row 的 weight
+  cache reuse 增强——L2 hit 提高、effective DRAM traffic/token 下降（每个
+  batch-row block 仍独立发起逻辑 weight load，`blockIdx.y = b` 各读各的、
+  相邻 block 的 weight 请求命中同一 cache line；当前 kernel **没有**显式
+  single-load-and-share 的 weight cooperative scheme）→ per-token DRAM
+  流量下降（DRAM% 30→17.4→12.5），kernel 从 DRAM-leaning 移向
+  SM-leaning（SM% 35→41→44.4），occupancy 微升（82.5→84.1），regs 56→58。主 warp stall 三个 B 档一致（CTA barrier ~8~10 cyc，占 issue
   间隔 ~54%）→ 瓶颈结构不随 B 改变，只有**带宽利用/效率**随 B 改善。
 
 ### 6.2 `bf16_gemv_vec4_row` / `batch_bf16_gemv_vec4_row`（LM head，28.6%
@@ -387,8 +390,10 @@ Duration NCU replay **1.98~2.00 ms（B=2）/ 2.96 ms（B=3）**（nsys
 
 - **batch-size 效应（显式回答）**：**无（per-token 不变）**。per-token 时间
   B=1 914.3 → B=2 909.9 → B=3 909.3 µs/token（nsys），Duration 对 B
-  **严格线性**（B=2 = 1.99×、B=3 = 2.98× B=1）：kernel 已贴 DRAM roofline，
-  权重流每 call 只读一次且带宽饱和 → 加 token 不增加权重流量、也不加速，
+  **严格线性**（B=2 = 1.99×、B=3 = 2.98× B=1）：batch kernel 每个
+  (row, b) block 独立读取整行权重（`blockIdx.y = b`，无跨 batch-row 的
+  weight 共享），总 DRAM 流量随 B 线性增长，而 kernel 已贴 DRAM roofline
+  （510~517 GB/s、带宽饱和）→ Duration 随 B 严格线性扩展、per-token 不变，
   纯线性扩展。→ LM head 上**批处理不产生摊销收益**；唯一杠杆是减少权重
   字节数（P4 量化，需 reviewer 决策）。
 

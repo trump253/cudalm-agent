@@ -10,6 +10,7 @@
 
 #include "cudalm/cuda_check.h"
 #include "cudalm/kernels/int4_gemv_bf16.h"
+#include "cudalm/kernels/int4_gemv_qwen35.h"  // v0.7B dispatcher (measured R)
 #include "cudalm/kernels/batch_decode.h"
 #include "cudalm/kernels/qwen35_deltanet_kernels.h"
 #include "cudalm/kernels/qwen35_kernels.h"
@@ -163,19 +164,19 @@ void Qwen35DeltaNetLayer::forward_impl(int position,
       1, static_cast<int>(H), eps, stream);
 
   // 2) projections (W4A16)
-  int4_gemv_bf16(w_->in_proj_qkv.weight.data<std::uint8_t>(),
+  int4_gemv_bf16_qwen35(w_->in_proj_qkv.weight.data<std::uint8_t>(),
                  w_->in_proj_qkv.scale.data<__half>(),
                  rms1_.data<__nv_bfloat16>(), mixed_.data<__nv_bfloat16>(),
                  w_->in_proj_qkv.N, w_->in_proj_qkv.K, stream);
-  int4_gemv_bf16(w_->in_proj_z.weight.data<std::uint8_t>(),
+  int4_gemv_bf16_qwen35(w_->in_proj_z.weight.data<std::uint8_t>(),
                  w_->in_proj_z.scale.data<__half>(),
                  rms1_.data<__nv_bfloat16>(), z_.data<__nv_bfloat16>(),
                  w_->in_proj_z.N, w_->in_proj_z.K, stream);
-  int4_gemv_bf16(w_->in_proj_b.weight.data<std::uint8_t>(),
+  int4_gemv_bf16_qwen35(w_->in_proj_b.weight.data<std::uint8_t>(),
                  w_->in_proj_b.scale.data<__half>(),
                  rms1_.data<__nv_bfloat16>(), b_.data<__nv_bfloat16>(),
                  w_->in_proj_b.N, w_->in_proj_b.K, stream);
-  int4_gemv_bf16(w_->in_proj_a.weight.data<std::uint8_t>(),
+  int4_gemv_bf16_qwen35(w_->in_proj_a.weight.data<std::uint8_t>(),
                  w_->in_proj_a.scale.data<__half>(),
                  rms1_.data<__nv_bfloat16>(), a_.data<__nv_bfloat16>(),
                  w_->in_proj_a.N, w_->in_proj_a.K, stream);
@@ -220,7 +221,7 @@ void Qwen35DeltaNetLayer::forward_impl(int position,
       static_cast<int>(n_heads), static_cast<int>(hd), eps, stream);
 
   // 8) out_proj (W4A16) + residual 1
-  int4_gemv_bf16(w_->out_proj.weight.data<std::uint8_t>(),
+  int4_gemv_bf16_qwen35(w_->out_proj.weight.data<std::uint8_t>(),
                  w_->out_proj.scale.data<__half>(),
                  gated_.data<__nv_bfloat16>(), out_proj_.data<__nv_bfloat16>(),
                  w_->out_proj.N, w_->out_proj.K, stream);
@@ -235,11 +236,11 @@ void Qwen35DeltaNetLayer::forward_impl(int position,
       rms2_.data<__nv_bfloat16>(), 1, static_cast<int>(H), eps, stream);
 
   // 10) SwiGLU MLP (gate/up W4A16, silu*mul, down W4A16) + residual 2
-  int4_gemv_bf16(w_->gate_proj.weight.data<std::uint8_t>(),
+  int4_gemv_bf16_qwen35(w_->gate_proj.weight.data<std::uint8_t>(),
                  w_->gate_proj.scale.data<__half>(),
                  rms2_.data<__nv_bfloat16>(), mlp_gate_.data<__nv_bfloat16>(),
                  w_->gate_proj.N, w_->gate_proj.K, stream);
-  int4_gemv_bf16(w_->up_proj.weight.data<std::uint8_t>(),
+  int4_gemv_bf16_qwen35(w_->up_proj.weight.data<std::uint8_t>(),
                  w_->up_proj.scale.data<__half>(),
                  rms2_.data<__nv_bfloat16>(), mlp_up_.data<__nv_bfloat16>(),
                  w_->up_proj.N, w_->up_proj.K, stream);
@@ -247,7 +248,7 @@ void Qwen35DeltaNetLayer::forward_impl(int position,
                                 mlp_up_.data<__nv_bfloat16>(),
                                 silu_mul_.data<__nv_bfloat16>(), inter,
                                 stream);
-  int4_gemv_bf16(w_->down_proj.weight.data<std::uint8_t>(),
+  int4_gemv_bf16_qwen35(w_->down_proj.weight.data<std::uint8_t>(),
                  w_->down_proj.scale.data<__half>(),
                  silu_mul_.data<__nv_bfloat16>(),
                  mlp_down_.data<__nv_bfloat16>(), w_->down_proj.N,
@@ -326,20 +327,20 @@ void Qwen35DeltaNetLayer::forward_batch_with_state(
 
   // 2) projections (W4A16, batched GEMV — per row bit-identical to the
   //    frozen single-row int4_gemv_bf16).
-  batch_int4_gemv_bf16(w_->in_proj_qkv.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16_qwen35(w_->in_proj_qkv.weight.data<std::uint8_t>(),
                        w_->in_proj_qkv.scale.data<__half>(),
                        b_rms1_.data<__nv_bfloat16>(),
                        b_mixed_.data<__nv_bfloat16>(), w_->in_proj_qkv.N,
                        w_->in_proj_qkv.K, B, stream);
-  batch_int4_gemv_bf16(w_->in_proj_z.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16_qwen35(w_->in_proj_z.weight.data<std::uint8_t>(),
                        w_->in_proj_z.scale.data<__half>(),
                        b_rms1_.data<__nv_bfloat16>(), b_z_.data<__nv_bfloat16>(),
                        w_->in_proj_z.N, w_->in_proj_z.K, B, stream);
-  batch_int4_gemv_bf16(w_->in_proj_b.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16_qwen35(w_->in_proj_b.weight.data<std::uint8_t>(),
                        w_->in_proj_b.scale.data<__half>(),
                        b_rms1_.data<__nv_bfloat16>(), b_b_.data<__nv_bfloat16>(),
                        w_->in_proj_b.N, w_->in_proj_b.K, B, stream);
-  batch_int4_gemv_bf16(w_->in_proj_a.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16_qwen35(w_->in_proj_a.weight.data<std::uint8_t>(),
                        w_->in_proj_a.scale.data<__half>(),
                        b_rms1_.data<__nv_bfloat16>(), b_a_.data<__nv_bfloat16>(),
                        w_->in_proj_a.N, w_->in_proj_a.K, B, stream);
@@ -379,7 +380,7 @@ void Qwen35DeltaNetLayer::forward_batch_with_state(
       B * n_heads, cfg_.lin_value_head_dim, eps, stream);
 
   // 8) out_proj (W4A16, batched) + residual 1 (frozen add, flat [B][H]).
-  batch_int4_gemv_bf16(w_->out_proj.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16_qwen35(w_->out_proj.weight.data<std::uint8_t>(),
                        w_->out_proj.scale.data<__half>(),
                        b_gated_.data<__nv_bfloat16>(),
                        b_out_proj_.data<__nv_bfloat16>(), w_->out_proj.N,
@@ -396,12 +397,12 @@ void Qwen35DeltaNetLayer::forward_batch_with_state(
       b_rms2_.data<__nv_bfloat16>(), B, H, eps, stream);
 
   // 10) SwiGLU MLP + residual 2.
-  batch_int4_gemv_bf16(w_->gate_proj.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16_qwen35(w_->gate_proj.weight.data<std::uint8_t>(),
                        w_->gate_proj.scale.data<__half>(),
                        b_rms2_.data<__nv_bfloat16>(),
                        b_mlp_gate_.data<__nv_bfloat16>(), w_->gate_proj.N,
                        w_->gate_proj.K, B, stream);
-  batch_int4_gemv_bf16(w_->up_proj.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16_qwen35(w_->up_proj.weight.data<std::uint8_t>(),
                        w_->up_proj.scale.data<__half>(),
                        b_rms2_.data<__nv_bfloat16>(),
                        b_mlp_up_.data<__nv_bfloat16>(), w_->up_proj.N,
@@ -410,7 +411,7 @@ void Qwen35DeltaNetLayer::forward_batch_with_state(
                                 b_mlp_up_.data<__nv_bfloat16>(),
                                 b_silu_mul_.data<__nv_bfloat16>(),
                                 static_cast<std::size_t>(B) * inter, stream);
-  batch_int4_gemv_bf16(w_->down_proj.weight.data<std::uint8_t>(),
+  batch_int4_gemv_bf16_qwen35(w_->down_proj.weight.data<std::uint8_t>(),
                        w_->down_proj.scale.data<__half>(),
                        b_silu_mul_.data<__nv_bfloat16>(),
                        b_mlp_down_.data<__nv_bfloat16>(), w_->down_proj.N,
