@@ -1,8 +1,8 @@
 # compute-sanitizer --tool memcheck test_qwen35_continuous_batching (v0.6 Phase C evidence)
-# at NEW_V06C_EVIDENCE_SHA = 3bdca9ea8387514283689017ba2ffa13a96d5960
+# at NEW_V06C_EVIDENCE_SHA = eebb1b3fe6e275ac2280a16cbdaba2863ed94819
 # command:
 #   /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck ./tests/test_qwen35_continuous_batching data/qwen35_08b_full.cudalm /root/models/Qwen3.5-0.8B-Base /root/py311/venv/bin/python3 /root/code/cudalm-agent --no-convert
-# date: 2026-09-27T06:50:52Z
+# date: 2026-09-27T07:17:03Z
 # =============================================================================
 ========= COMPUTE-SANITIZER
 [continuous] model loaded: 24 layers, vocab 248320, page_tokens 2, pool pages 16, delta slots 4

@@ -2453,19 +2453,21 @@ tokens；原始报告：`benchmarks/v06_continuous_batching.txt`。）
   batched decode、heterogeneous position/state）。
 
 ### 27.6 Evidence（于 `V06C_EVIDENCE_SHA =
-3bdca9ea8387514283689017ba2ffa13a96d5960`，clean tree）
+eebb1b3fe6e275ac2280a16cbdaba2863ed94819`，clean tree）
 
-（reviewer fix round：serving metrics 的 attempt vs committed 语义
-（`single_forward_calls` = issued attempts、新增
+（reviewer fix rounds：serving metrics 的 attempt vs committed 语义
+（`single_forward_calls` = issued attempts、
 `successful_single_forward_calls` = successful/committed、
 `logical_token_forwards` 只计 committed、`model_traversal_calls` =
 **COMPLETED** traversals = successful singles + committed batch，**失败
-attempt 不算 traversal**）+ 失败路径 metric 门 + benchmark sampler guard
+attempt 不算 traversal** —— 第二轮修正）+ 失败路径 metric 门 +
+benchmark sampler guard
 fix + D-state claim cleanup（D live hybrid state @ length 5 == fresh-D
 reference @ length 5，非 final state）。
 Phase C 及其 fix 修改了 `src/`、`include/`、`tests/` 与 benchmark CMake，
 按失效规则：Phase C 首版
-`4e4f3693c676465e0fbf0d67f1708b74929a3a8b`、**`V06B_EVIDENCE_SHA =
+`4e4f3693c676465e0fbf0d67f1708b74929a3a8b`、第二轮
+`3bdca9ea8387514283689017ba2ffa13a96d5960`、**`V06B_EVIDENCE_SHA =
 21305eb48646d2e6e60fcca3862161f9e1`** 及其更早的 V06A/V05C 绑定对本 tree
 **失效**，历史保留；其全部门面回归已在本 SHA 的 60/60 内重跑全绿。）
 

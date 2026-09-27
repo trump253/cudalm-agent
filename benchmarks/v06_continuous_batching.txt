@@ -6,7 +6,7 @@ environment:
   cuda_runtime: 11.8
   cuda_driver: 12.8
   checkpoint: /root/models/Qwen3.5-0.8B-Base
-  model: data/qwen35_08b_full.cudalm
+  model: build/data/qwen35_08b_full.cudalm
   stream: single (prefill stays serial; decode cohort is batched)
 
 workload (SAME for both modes; all four complete, no cancellation in the timed run):
@@ -22,18 +22,18 @@ timing:
 results (mean of measured runs):
 
   mode A — independent / SERIAL (each request alone, one at a time):
-    wall_time_s: 0.135493
+    wall_time_s: 0.134070
     logical_tokens: 27
-    logical_tokens_per_s: 199.272360
+    logical_tokens_per_s: 201.387642
     single_forward_calls: 27
     batch_forward_calls: 0
     avg_decode_batch_size: 0
     max_decode_batch_size: 0
 
   mode B — SCHEDULER CONTINUOUS BATCHED (dynamic arrivals):
-    wall_time_s: 0.116492
+    wall_time_s: 0.116151
     logical_tokens: 27
-    logical_tokens_per_s: 231.775839
+    logical_tokens_per_s: 232.455672
     single_forward_calls: 19
     batch_forward_calls: 3
     model_traversal_calls: 22
@@ -47,6 +47,6 @@ notes:
   * Numbers are for THIS environment / checkpoint / workload only; they are not a general performance conclusion.
 
 per-measured-run wall_time_s:
-  run 1: serial=0.132118s batched=0.116081s
-  run 2: serial=0.137410s batched=0.116636s
-  run 3: serial=0.136951s batched=0.116759s
+  run 1: serial=0.132512s batched=0.116007s
+  run 2: serial=0.137979s batched=0.116973s
+  run 3: serial=0.131718s batched=0.115474s

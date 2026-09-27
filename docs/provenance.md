@@ -1391,7 +1391,7 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
       checkpoint/workload 与 wall time / logical tokens/s / single·batch
       forward calls / avg·max decode batch；**无性能通过阈值、无提速声明**。
   - **Evidence（clean tree 于 `V06C_EVIDENCE_SHA =
-    3bdca9ea8387514283689017ba2ffa13a96d5960`）**：
+    eebb1b3fe6e275ac2280a16cbdaba2863ed94819`）**：
     - 完整 ctest **60/60 PASS、0 failed、0 skipped**（新增
       `test_qwen35_continuous_batching` 与
       `test_qwen35_scheduler_continuous_stress` 真实运行，非 skip；含
@@ -1404,17 +1404,19 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
       parity、hybrid state 比对）**PASS + ERROR SUMMARY: 0 errors**（原始
       日志：`benchmarks/sanitizer_qwen35_continuous_batching.txt`）。
     - benchmark 可复现结果：`benchmarks/v06_continuous_batching.txt`（本
-      环境：serial 0.1355s / batched 0.1165s、27 logical tokens、
+      环境：serial 0.1341s / batched 0.1162s、27 logical tokens、
       max_batch=3、avg batch 2.67；**无提速声明**）。
   - **evidence 绑定**：`V06C_EVIDENCE_SHA =
-    3bdca9ea8387514283689017ba2ffa13a96d5960`（clean tree、HEAD == SHA；
+    eebb1b3fe6e275ac2280a16cbdaba2863ed94819`（clean tree、HEAD == SHA；
     完整 ctest 60/60 + check_no_torch CLEAN + 真实连续批处理门
     compute-sanitizer memcheck 0 错误 + benchmark，均于该 SHA）。**失效
-    声明（未删除历史）**：Phase C 及其 reviewer fix round（attempt vs
+    声明（未删除历史）**：Phase C 及其 reviewer fix rounds（attempt vs
     committed metrics + 失败路径 metric 门 + benchmark guard + D-state
-    claim）修改了 `src/`、`include/`、`tests/` 与 benchmark CMake，按失效
-    规则：Phase C 首版
-    `4e4f3693c676465e0fbf0d67f1708b74929a3a8b`、**`V06B_EVIDENCE_SHA =
+    claim + `model_traversal_calls` = COMPLETED traversals 第二轮修正）修改
+    了 `src/`、`include/`、`tests/` 与 benchmark CMake，按失效规则：
+    Phase C 首版
+    `4e4f3693c676465e0fbf0d67f1708b74929a3a8b`、第二轮
+    `3bdca9ea8387514283689017ba2ffa13a96d5960`、**`V06B_EVIDENCE_SHA =
     21305eb48646d2e6e60fcca386239a862161f9e1`**（及其更早的
     `31b3ad2c3122465c3a43eee8c2b49f68f029a7a7`、**V06A_EVIDENCE_SHA =
     928d0a772f698bcc22e55a6d2ff1a19f48e0f037**、首版 `459ff12f...`、
