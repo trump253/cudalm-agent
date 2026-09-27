@@ -165,7 +165,7 @@ int run_serial(Qwen35Model& model, const Qwen35Config& cfg,
       std::vector<__nv_bfloat16> logits =
           d2h(model.logits(), cfg.vocab_size, stream);
       const int tok = sampler.sample(logits.data(), cfg.vocab_size);
-      if (g < 0 || g >= cfg.vocab_size) return 1;
+      if (tok < 0 || tok >= cfg.vocab_size) return 1;
       if (g + 1 < w.max_new) {
         if (!model.forward_token_with_state(tok, sid, mgr, stream).ok) {
           return 1;

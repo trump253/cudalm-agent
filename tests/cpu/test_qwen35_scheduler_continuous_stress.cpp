@@ -231,11 +231,27 @@ int main() {
     CHECK_EQ(st.requests_failed, 1);
     CHECK_EQ(st.requests_finished, 3);
     CHECK_EQ(st.requests_live, 0);
+    // ---- attempt vs committed FAILURE-PATH gate -------------------------
+    // The failing request ISSUED exactly one single attempt (its first
+    // forward failed) but COMMITTED nothing: forward_count == 0 (checked
+    // above) and the failed attempt must NOT leak into the COMMITTED
+    // logical-token metric.
+    //   committed successful singles = good1 5 + good2 3 + good3 4 = 12
+    //   issued single attempts       = 12 + 1 (the failed one)   = 13
+    CHECK_EQ(st.single_forward_calls, 13);             // ISSUED (incl. failed)
+    CHECK_EQ(st.successful_single_forward_calls, 12);  // COMMITTED (ok only)
+    CHECK_EQ(st.logical_token_forwards, 12);           // failed attempt = ZERO
+    CHECK_EQ(st.model_traversal_calls, 13);            // failed attempt IS 1 traversal
+    CHECK_EQ(st.batch_forward_calls, 0);
+    CHECK_EQ(st.batched_sequence_tokens, 0);
     std::fprintf(stderr,
                  "[stress-part1] failure isolation in a dynamic set: bad "
-                 "request Failed+retired once (forward not committed), the "
-                 "other 3 continued to Finished; run() reported the first "
-                 "error; final num_live=0, mgr live=0\n");
+                 "request Failed+retired once (forward not committed, "
+                 "forward_count=0), the other 3 continued to Finished; "
+                 "run() reported the first error; final num_live=0, mgr "
+                 "live=0; attempt-vs-committed metrics: issued=13 "
+                 "successful=12 logical=12 traversals=13 (failed attempt "
+                 "not in committed logical)\n");
   }
 
   // =========================================================================

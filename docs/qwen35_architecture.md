@@ -2384,8 +2384,10 @@ max_new 3, seed 300，**更晚 / 资源复用**）。
 - **资源复用**：D 在 A finish（释放资源）后 late-admit → **D 复用 A 释放的
   DELTA 槽**（pool 是 LIFO，直接观察到 `D.delta_slot == A.delta_slot`）；
   A 的 stale SequenceId **仍无效**（`lookup == nullptr`）；live request
-  不变；**D 在 length 5 的 live hybrid state 与独立 fresh-D reference
-  BIT-IDENTICAL**（fresh-zero 逻辑态、**无 A 污染**）。
+  不变；**D live hybrid state @ length 5 == 独立 fresh-D reference
+  @ length 5**（BIT-IDENTICAL，fresh-zero 槽、**无 A 污染**；注意这是
+  length 5 处的 **live** 状态 —— D 之后仍执行一次 decode 才 retire，
+  **不是** final hybrid state）。
 
 ### 27.3 组合控制面压测（CPU fake forwarder，无 checkpoint）
 （`tests/cpu/test_qwen35_scheduler_continuous_stress.cpp`）

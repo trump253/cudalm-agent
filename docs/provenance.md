@@ -1363,8 +1363,10 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
       trace **{1,1,2,2,2,3,1}**（grow 1→2→3、shrink 3→1）、
       `max_batch_size=3`、`batch_forward_calls>0`、no fallback、prefill
       serial；mid-flight cancel B（retire 恰好一次、prefix EXACT、不改变
-      A/C/D）；资源复用（D 复用 A 的 DELTA 槽、stale id 无效、D@len5
-      hybrid state 与 fresh-D reference BIT-IDENTICAL）；逐 request 的
+      A/C/D）；资源复用（D 复用 A 的 DELTA 槽、stale id 无效、**D live
+      hybrid state @ length 5 == fresh-D reference @ length 5**（BIT-
+      IDENTICAL；注意这是 length 5 处的 live 状态 —— D 之后仍执行一次
+      decode 才 retire，**不是** final hybrid state））；逐 request 的
       generated IDs / 每生成步 FULL logits[248320] / forward_count /
       finish_reason 与独立 reference **EXACT**。
     - **组合控制面压测**（`tests/cpu/

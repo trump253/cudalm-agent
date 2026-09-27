@@ -171,12 +171,39 @@ class ModelForwarder : public SequenceForwarder {
 // these counters never gate or alter correctness; the control-plane
 // semantics are pinned by the tests independently of them).
 //
+// ATTEMPT vs COMMITTED semantics (pinned, unambiguous):
+//  * "issued attempt" = a forward call that was sent to the forwarder
+//    (counted BEFORE the call; a FAILED attempt still counts as an attempt
+//    and as a traversal — the model did run once).
+//  * "committed" = the forward SUCCEEDED and its progress was committed
+//    (a failed single forward commits NOTHING: no logical token, no
+//    Request.forward_count).
+//  * A batched forward is only ever COMMITTED (the preflight + the
+//    forward_batch call itself succeed before any batch counter moves; a
+//    preflight failure is NOT a batch attempt — the cohort falls back to
+//    the serial path, whose attempts are counted there).
+//
+// CONSEQUENT DEFINITIONS:
+//  * single_forward_calls        = ISSUED single attempts (incl. failed)
+//  * successful_single_forward_calls = COMMITTED (successful) single forwards
+//  * batch_forward_calls         = COMMITTED batched forwards (each = ONE model
+//                                  traversal, never B)
+//  * model_traversal_calls       = single_forward_calls + batch_forward_calls
+//                                  = ISSUED model traversals (a failed single
+//                                  attempt IS one traversal; a committed batch
+//                                  of B is ONE)
+//  * logical_token_forwards      = successful_single_forward_calls +
+//                                  batched_sequence_tokens = COMMITTED logical
+//                                  tokens (one per TOKEN advanced; a failed
+//                                  attempt contributes ZERO)
+//
 // KEY DISTINCTION (pinned): "logical sequence-token forwards" counts one
-// per TOKEN advanced (a single forward = 1 token; a committed batch of B
-// = B tokens). "model traversal calls" counts one per model traversal
-// (a single forward = 1 traversal; a committed batch of B = ONE traversal,
-// never B). A batch(B=4) is therefore 4 logical token-forwards but 1 model
-// traversal. Confusing the two is the exact error this struct disambiguates.
+// per TOKEN committed (a successful single forward = 1 token; a committed
+// batch of B = B tokens). "model traversal calls" counts one per model
+// traversal ISSUED (a single attempt = 1 traversal, failed or not; a
+// committed batch of B = ONE traversal, never B). A batch(B=4) is therefore
+// 4 logical token-forwards but 1 model traversal. Confusing the two is the
+// exact error this struct disambiguates.
 struct SchedulerStats {
   // ---- request lifecycle ----------------------------------------------------
   int requests_admitted = 0;   // total requests ever admitted (incl. terminal)
@@ -185,14 +212,18 @@ struct SchedulerStats {
   int requests_cancelled = 0;  // terminal Cancelled
   int requests_failed = 0;     // terminal Failed (fatal forward / logits)
 
-  // ---- forward accounting ---------------------------------------------------
-  int single_forward_calls = 0;   // single-sequence forwards issued
-  int batch_forward_calls = 0;    // committed batched forwards issued
-  int model_traversal_calls = 0;  // single + batch (ONE per traversal; a
-                                  // committed batch of B is ONE traversal)
+  // ---- forward accounting (attempt vs committed, see header above) ----------
+  int single_forward_calls = 0;            // ISSUED single attempts (incl. failed)
+  int successful_single_forward_calls = 0;  // COMMITTED (successful) single forwards
+  int batch_forward_calls = 0;             // COMMITTED batched forwards (ONE each)
+  int model_traversal_calls = 0;  // ISSUED traversals = single_forward_calls +
+                                  // batch_forward_calls (failed single attempt
+                                  // IS one traversal; committed batch = ONE)
   int batched_sequence_tokens = 0;  // sum of B over committed batch forwards
-  int logical_token_forwards = 0;   // single*1 + batched_sequence_tokens
-                                    // (one per TOKEN advanced)
+  int logical_token_forwards = 0;   // COMMITTED logical tokens =
+                                    // successful_single_forward_calls +
+                                    // batched_sequence_tokens (failed attempts
+                                    // contribute ZERO)
 
   // ---- batch shape ------------------------------------------------------------
   int max_batch_size = 0;  // largest committed decode cohort (0 if none)
@@ -259,9 +290,16 @@ class Scheduler {
   // decode cohort — a cohort of B costs EXACTLY ONE batch forward, not B
   // single forwards).
   int batch_forward_calls() const { return batch_forward_calls_; }
-  // Number of single forwards issued so far (Phase A path: prefill
-  // advances, size-1 cohorts, and every serial fallback).
+  // Number of single forwards ISSUED so far (Phase A path: prefill
+  // advances, size-1 cohorts, and every serial fallback) — includes FAILED
+  // attempts (the call was sent to the forwarder).
   int single_forward_calls() const { return single_forward_calls_; }
+  // Number of single forwards that SUCCEEDED (committed) — a failed attempt
+  // increments single_forward_calls() but NOT this counter (and commits no
+  // logical token / no Request.forward_count).
+  int successful_single_forward_calls() const {
+    return successful_single_forward_calls_;
+  }
   // Largest decode cohort (batch size) advanced so far (0 if none).
   int max_batch_size() const { return max_batch_size_; }
   // Number of batch attempts that FAILED preflight and fell back to the
@@ -321,9 +359,12 @@ class Scheduler {
   RequestId next_id_ = 1;
   // v0.6 Phase B instrumentation.
   int batch_forward_calls_ = 0;
-  int single_forward_calls_ = 0;
+  int single_forward_calls_ = 0;  // ISSUED single attempts (incl. failed)
   int max_batch_size_ = 0;
   int batch_fallback_calls_ = 0;
+  // v0.6 Phase C: COMMITTED (successful) single forwards — the failed
+  // attempt increments single_forward_calls_ but never this counter.
+  int successful_single_forward_calls_ = 0;
   // v0.6 Phase C serving-metric accumulators (observability only).
   int batched_sequence_tokens_ = 0;          // sum of B over committed batches
   std::vector<int> batch_size_trace_;        // B of each committed batch

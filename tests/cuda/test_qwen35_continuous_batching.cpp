@@ -44,10 +44,13 @@
 //     is cancelled later). D reuses A's freed DELTA SLOT (the pool is LIFO,
 //     so the most recently released slot is reacquired first — observed
 //     explicitly: D.delta_slot == A.delta_slot); A's stale SequenceId stays
-//     invalid (lookup nullptr); D's FINAL hybrid state (18x Delta conv/rec +
-//     6x logical K/V) is BIT-IDENTICAL to an independent fresh-D reference
-//     (fresh-zero logical state, no contamination from A's reused slot);
-//     live requests (B/C) are unchanged.
+//     invalid (lookup nullptr); D's LIVE hybrid state @ length 5 (18x Delta
+//     conv/rec + 6x logical K/V, captured while D is still live BEFORE its
+//     final decode) is BIT-IDENTICAL to the independent fresh-D reference's
+//     state @ length 5 (fresh-zero slot, no contamination from A's reused
+//     slot). This is a LIVE @ length-5 comparison, NOT a final-state
+//     comparison — D runs one more decode before it retires. Live requests
+//     (B/C) are unchanged.
 //
 //   * SERVING METRICS: the new SchedulerStats (observability only) is
 //     checked: admitted/finished/cancelled/failed counts, single vs batch
@@ -723,15 +726,24 @@ int main(int argc, char** argv) {
     CHECK_EQ(st.requests_cancelled, 1);  // B
     CHECK_EQ(st.requests_failed, 0);
     CHECK_EQ(st.requests_live, 0);
-    // model traversal = single + batch (a committed batch of B is ONE
-    // traversal); logical token-forwards = single*1 + sum(batch B).
+    // Attempt vs committed (happy path: NO failed forwards, so issued ==
+    // committed for singles). Exact contract:
+    //   issued singles = 17 (A 4 + B 9 + C 7 + D 6 forward counts)
+    //   committed singles = 17; committed batches = 4 (B = 2,2,2,3)
+    CHECK_EQ(st.single_forward_calls, 17);
+    CHECK_EQ(st.successful_single_forward_calls, 17);  // no failures
     CHECK_EQ(st.model_traversal_calls,
-             st.single_forward_calls + st.batch_forward_calls);
+             st.single_forward_calls + st.batch_forward_calls);  // = 21
+    CHECK_EQ(st.model_traversal_calls, 21);
+    // logical token-forwards = SUCCESSFUL singles*1 + sum(batch B) — a
+    // failed attempt (none here) would contribute ZERO, so the formula
+    // deliberately uses the COMMITTED counter.
     CHECK_EQ(st.logical_token_forwards,
-             st.single_forward_calls + st.batched_sequence_tokens);
+             st.successful_single_forward_calls + st.batched_sequence_tokens);
+    CHECK_EQ(st.logical_token_forwards, 26);
     CHECK_EQ(st.batched_sequence_tokens, 2 + 2 + 2 + 3);  // batch trace sum
     // A batch(B=3) is 3 logical token-forwards but 1 traversal, so the
-    // logical count strictly exceeds the traversal count.
+    // committed logical count strictly exceeds the issued traversal count.
     CHECK(st.logical_token_forwards > st.model_traversal_calls);
     CHECK(st.avg_committed_decode_batch_size > 2.0);
     CHECK(st.avg_committed_decode_batch_size < 3.0);
@@ -772,8 +784,10 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "[ok] A/B/C/D dynamic run == independent references (B "
                  "prefix-exact vs cancelled); true batched decode "
-                 "grow/shrink; D reuses A's freed delta slot with fresh-zero "
-                 "final state\n");
+                 "grow/shrink; D reuses A's freed delta slot; D live hybrid "
+                 "state @ length 5 == fresh-D reference @ length 5 "
+                 "(fresh-zero slot, no contamination; D later runs one more "
+                 "decode before retiring)\n");
   }
 
   CUDA_CHECK(cudaStreamDestroy(stream));
@@ -787,7 +801,9 @@ int main(int argc, char** argv) {
       "trace {1,1,2,2,2,3,1} grows and shrinks, max_batch_size=3, "
       "batch_forward_calls>0; A/C/D generated IDs + per-step FULL logits + "
       "forward count + finish reason EXACT vs independent references, "
-      "cancelled B prefix EXACT; D reuses A's freed delta slot (fresh-zero "
-      "final state); serving metrics sane)\n");
+      "cancelled B prefix EXACT; D reuses A's freed delta slot and D live "
+      "hybrid state @ length 5 == fresh-D reference @ length 5 "
+      "(fresh-zero slot, no contamination); attempt-vs-committed serving "
+      "metrics sane: issued=17 successful=17 logical=26 traversals=21)\n");
   return 0;
 }
