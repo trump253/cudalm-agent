@@ -1351,10 +1351,16 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
   - **变更**：
     - **serving metrics**（`include/cudalm/scheduler.h` +
       `src/runtime/scheduler.cpp`，**只读观察、不影响正确性**）：
-      `SchedulerStats` + `stats()` —— 生命周期计数、
-      single/batch/traversal forward、`batched_sequence_tokens`、
-      `logical_token_forwards`（logical ≠ traversal：一次 committed batch
-      B 是 B 个 logical token-forward 但 1 次 traversal）、
+      `SchedulerStats` + `stats()` —— 生命周期计数、**attempt vs
+      committed 口径（reviewer fix 钉死）**：`single_forward_calls` =
+      ISSUED single attempts（失败也计）、`successful_single_forward_calls`
+      = COMMITTED（成功）single、`batch_forward_calls` = COMMITTED batch
+      （每次 = 1 次 traversal）、`model_traversal_calls` = ISSUED
+      traversals（= single attempts + committed batch；失败 attempt 也是
+      1 次 traversal）、`logical_token_forwards` = COMMITTED logical
+      tokens（= successful singles + `batched_sequence_tokens`；失败
+      attempt 贡献 **0**；一次 committed batch B 是 B 个 logical token
+      但 1 次 traversal）、
       `max/avg decode batch size`、`batch_size_trace`、
       `decode_cohort_trace`（grow/shrink 证据）。
     - **真检查点动态硬门**（`tests/cuda/test_qwen35_continuous_batching.cpp`
@@ -1384,7 +1390,7 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
       checkpoint/workload 与 wall time / logical tokens/s / single·batch
       forward calls / avg·max decode batch；**无性能通过阈值、无提速声明**。
   - **Evidence（clean tree 于 `V06C_EVIDENCE_SHA =
-    4e4f3693c676465e0fbf0d67f1708b74929a3a8b`）**：
+    3bdca9ea8387514283689017ba2ffa13a96d5960`）**：
     - 完整 ctest **60/60 PASS、0 failed、0 skipped**（新增
       `test_qwen35_continuous_batching` 与
       `test_qwen35_scheduler_continuous_stress` 真实运行，非 skip；含
@@ -1397,14 +1403,17 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
       parity、hybrid state 比对）**PASS + ERROR SUMMARY: 0 errors**（原始
       日志：`benchmarks/sanitizer_qwen35_continuous_batching.txt`）。
     - benchmark 可复现结果：`benchmarks/v06_continuous_batching.txt`（本
-      环境：serial 0.134s / batched 0.118s、27 logical tokens、
+      环境：serial 0.1355s / batched 0.1165s、27 logical tokens、
       max_batch=3、avg batch 2.67；**无提速声明**）。
   - **evidence 绑定**：`V06C_EVIDENCE_SHA =
-    4e4f3693c676465e0fbf0d67f1708b74929a3a8b`（clean tree、HEAD == SHA；
+    3bdca9ea8387514283689017ba2ffa13a96d5960`（clean tree、HEAD == SHA；
     完整 ctest 60/60 + check_no_torch CLEAN + 真实连续批处理门
     compute-sanitizer memcheck 0 错误 + benchmark，均于该 SHA）。**失效
-    声明（未删除历史）**：Phase C 修改了 `src/`、`include/`、`tests/` 与
-    benchmark CMake，按失效规则：**`V06B_EVIDENCE_SHA =
+    声明（未删除历史）**：Phase C 及其 reviewer fix round（attempt vs
+    committed metrics + 失败路径 metric 门 + benchmark guard + D-state
+    claim）修改了 `src/`、`include/`、`tests/` 与 benchmark CMake，按失效
+    规则：Phase C 首版
+    `4e4f3693c676465e0fbf0d67f1708b74929a3a8b`、**`V06B_EVIDENCE_SHA =
     21305eb48646d2e6e60fcca386239a862161f9e1`**（及其更早的
     `31b3ad2c3122465c3a43eee8c2b49f68f029a7a7`、**V06A_EVIDENCE_SHA =
     928d0a772f698bcc22e55a6d2ff1a19f48e0f037**、首版 `459ff12f...`、

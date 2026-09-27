@@ -2332,11 +2332,17 @@ benchmark + 真检查点动态硬门**。
 
 - **request 生命周期**：`requests_admitted` / `requests_live` /
   `requests_finished` / `requests_cancelled` / `requests_failed`。
-- **forward 计数**：`single_forward_calls`、`batch_forward_calls`、
-  `model_traversal_calls`（= single + batch，**一次 committed batch 算
-  一次 traversal**）、`batched_sequence_tokens`（各 committed batch 的 B
-  之和）、`logical_token_forwards`（= single×1 + batched_sequence_tokens，
-  **每前进一个 token 记 1**）。
+- **forward 计数（attempt vs committed，reviewer fix 钉死）**：
+  `single_forward_calls`（**ISSUED** single attempts，失败也计）、
+  `successful_single_forward_calls`（**COMMITTED**/成功 single，失败
+  attempt 不在此）、`batch_forward_calls`（**COMMITTED** batch，preflight
+  失败不算 batch attempt —— 回退的 serial 行在 single 计数里）、
+  `model_traversal_calls`（= single attempts + committed batch = **ISSUED
+  traversals**；一次 committed batch 算 **1** 次 traversal、失败 single
+  attempt 也算 1 次）、`batched_sequence_tokens`（各 committed batch 的 B
+  之和）、`logical_token_forwards`（= **successful** single×1 +
+  batched_sequence_tokens = **COMMITTED** logical tokens，**每成功前进一个
+  token 记 1**；失败 attempt 贡献 **0**，也不进 `Request.forward_count`）。
 - **batch 形状**：`max_batch_size`、`avg_committed_decode_batch_size`、
   `batch_size_trace`（每次 committed batch 的 B）、`decode_cohort_trace`
   （**每个** decode cohort 的大小：size-1 single 记 1、committed batch 记
@@ -2345,9 +2351,11 @@ benchmark + 真检查点动态硬门**。
 **关键区分（钉死）**：`logical sequence-token forwards` **≠** `model
 traversal calls`。一次 committed batch（B=4）是 **4 个 logical
 token-forward 但 1 次 model traversal**（绝不把 batch(B=4) 错算成 1 个
-logical token，也不把它错算成 4 次 traversal）。指标在 **commit 点**记录
-（forward_batch 成功后 +B logical / +1 traversal；fallback 行按 size-1
-decode cohort 记）。
+logical token，也不把它错算成 4 次 traversal）。计数点：single attempt
+在 **issue 点**（`forward_token()` 调用前）+1；successful / logical /
+batch 计数在 **commit 点**（forward 成功后 +1 logical；forward_batch
+成功后 +B logical / +1 traversal；失败 attempt 只进 attempt + traversal、
+不进 committed/logical）。fallback 行按 size-1 decode cohort 记。
 
 ### 27.2 动态连续批处理真检查点硬门
 （`tests/cuda/test_qwen35_continuous_batching.cpp`；真实
@@ -2397,7 +2405,11 @@ max_new 3, seed 300，**更晚 / 资源复用**）。
   恰好一次**、失败 forward **不 commit**（forward_count 保持 0）、**永不再
   执行**；**其他 live request 继续**到 `Finished`（forward_count 正确）；
   `run()` 返回**第一个** error 且 step/run 语义**不退化**；最终资源
-  accounting **精确**（`num_live==0` 且 `mgr.num_live_sequences==0`）。
+  accounting **精确**（`num_live==0` 且 `mgr.num_live_sequences==0`）；
+  **attempt vs committed metric 门**：失败 request（forward_count=0）的
+  失败 attempt **不得**被计入 committed logical-token metric（asserted：
+  `single_forward_calls=13` issued / `successful_single_forward_calls=12`
+  / `logical_token_forwards=12` / `model_traversal_calls=13`）。
 - **Part 2（确定性 lifecycle stress，固定 seed，完全可复现，无无限/flaky
   随机）**：**40 个 request**，固定 seed 驱动 admit / step / late admit /
   finish / cancel / 继续；**每一步 / 每次 admit / 每次 cancel 后**检查
@@ -2436,10 +2448,17 @@ tokens；原始报告：`benchmarks/v06_continuous_batching.txt`。）
   batched decode、heterogeneous position/state）。
 
 ### 27.6 Evidence（于 `V06C_EVIDENCE_SHA =
-4e4f3693c676465e0fbf0d67f1708b74929a3a8b`，clean tree）
+3bdca9ea8387514283689017ba2ffa13a96d5960`，clean tree）
 
-（Phase C 修改了 `src/`、`include/`、`tests/` 与 benchmark CMake，按失效
-规则：**`V06B_EVIDENCE_SHA =
+（reviewer fix round：serving metrics 的 attempt vs committed 语义
+（`single_forward_calls` = issued attempts、新增
+`successful_single_forward_calls` = committed、`logical_token_forwards`
+只计 committed、`model_traversal_calls` = issued traversals）+ 失败路径
+metric 门 + benchmark sampler guard fix + D-state claim cleanup（D live
+hybrid state @ length 5 == fresh-D reference @ length 5，非 final state）。
+Phase C 及其 fix 修改了 `src/`、`include/`、`tests/` 与 benchmark CMake，
+按失效规则：Phase C 首版
+`4e4f3693c676465e0fbf0d67f1708b74929a3a8b`、**`V06B_EVIDENCE_SHA =
 21305eb48646d2e6e60fcca3862161f9e1`** 及其更早的 V06A/V05C 绑定对本 tree
 **失效**，历史保留；其全部门面回归已在本 SHA 的 60/60 内重跑全绿。）
 

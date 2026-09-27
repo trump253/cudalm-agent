@@ -1,8 +1,8 @@
 # compute-sanitizer --tool memcheck test_qwen35_continuous_batching (v0.6 Phase C evidence)
-# at V06C_EVIDENCE_SHA = 4e4f3693c676465e0fbf0d67f1708b74929a3a8b
+# at NEW_V06C_EVIDENCE_SHA = 3bdca9ea8387514283689017ba2ffa13a96d5960
 # command:
 #   /usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck ./tests/test_qwen35_continuous_batching data/qwen35_08b_full.cudalm /root/models/Qwen3.5-0.8B-Base /root/py311/venv/bin/python3 /root/code/cudalm-agent --no-convert
-# date: 2026-09-27T06:17:50Z
+# date: 2026-09-27T06:50:52Z
 # =============================================================================
 ========= COMPUTE-SANITIZER
 [continuous] model loaded: 24 layers, vocab 248320, page_tokens 2, pool pages 16, delta slots 4
@@ -83,7 +83,7 @@
   D@len5 (reused slot) vs fresh-D reference L22 delta.rec bit-identical (n=262144)
   D@len5 (reused slot) vs fresh-D reference L23 kv.K[0..4] bit-identical (n=2560)
   D@len5 (reused slot) vs fresh-D reference L23 kv.V[0..4] bit-identical (n=2560)
-[ok] A/B/C/D dynamic run == independent references (B prefix-exact vs cancelled); true batched decode grow/shrink; D reuses A's freed delta slot with fresh-zero final state
-test_qwen35_continuous_batching: PASS (A/B/C/D dynamic arrival completes/cancels/reuses under true batched decode: decode-cohort trace {1,1,2,2,2,3,1} grows and shrinks, max_batch_size=3, batch_forward_calls>0; A/C/D generated IDs + per-step FULL logits + forward count + finish reason EXACT vs independent references, cancelled B prefix EXACT; D reuses A's freed delta slot (fresh-zero final state); serving metrics sane)
+[ok] A/B/C/D dynamic run == independent references (B prefix-exact vs cancelled); true batched decode grow/shrink; D reuses A's freed delta slot; D live hybrid state @ length 5 == fresh-D reference @ length 5 (fresh-zero slot, no contamination; D later runs one more decode before retiring)
+test_qwen35_continuous_batching: PASS (A/B/C/D dynamic arrival completes/cancels/reuses under true batched decode: decode-cohort trace {1,1,2,2,2,3,1} grows and shrinks, max_batch_size=3, batch_forward_calls>0; A/C/D generated IDs + per-step FULL logits + forward count + finish reason EXACT vs independent references, cancelled B prefix EXACT; D reuses A's freed delta slot and D live hybrid state @ length 5 == fresh-D reference @ length 5 (fresh-zero slot, no contamination); attempt-vs-committed serving metrics sane: issued=17 successful=17 logical=26 traversals=21)
 ========= ERROR SUMMARY: 0 errors
 # test exit code: 0
