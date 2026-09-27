@@ -1,0 +1,52 @@
+# =============================================================================
+# CUDALM v0.7 Phase B (W4A16 GEMV optimization) — W4A16 production shape census (authoritative)
+# V07B evidence at exact SHA: d9c2f85e7e000c1fb60b7c91e650d78c72bef285
+# tree state: tracked tree CLEAN at generation (no modified/deleted
+#             tracked files; untracked = evidence outputs of this run)
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
+# checkpoint: /root/models/Qwen3.5-0.8B-Base
+# model: /root/code/cudalm-agent/build/data/qwen35_08b_full.cudalm
+# workload: 4 requests (prompts 2/5/3/4 tok; max_new 3/6/5/3;
+#           1 greedy + 3 seeded); dynamic arrival A,B -> C -> D;
+#           serial prefill, true batched decode, single stream
+# date: 2026-09-27T14:17:34Z
+# =============================================================================
+# sources: (1) actual model config from /root/code/cudalm-agent/build/data/qwen35_08b_full.cudalm (WeightFileV2), (2)
+# actual call sites (qwen35_full_attention.cpp / qwen35_deltanet.cpp,
+# shapes pinned by weight_loader_v2.cpp::validate_layer), (3) Phase-A
+# batched-only nsys CSV reconciliation: /root/code/cudalm-agent/benchmarks/profiling/v07_batched_nsys_kernel_summary_gpukernsum.csv
+# command:
+#   /root/code/cudalm-agent/build/tool_dump_w4a16_shape_census /root/code/cudalm-agent/build/data/qwen35_08b_full.cudalm /root/code/cudalm-agent/benchmarks/profiling/v07_batched_nsys_kernel_summary_gpukernsum.csv
+# ------------------------------------------------------------------------
+CUDALM v0.7 Phase B — W4A16 production shape census
+model: /root/code/cudalm-agent/build/data/qwen35_08b_full.cudalm
+config: H=1024 layers=24 (full_attention=6, gated_deltanet=18) intermediate=3584 q_proj_out=4096 kv_proj_out=512 o_proj_in=2048 lin_conv_dim=6144 lin_value_dim=2048 lin_v_heads=16 group_size=128
+
+== per-projection list (call-site mirror) ==
+role                                    N      K   layers calls/trav
+mlp.gate_proj                        3584   1024       24         24
+mlp.up_proj                          3584   1024       24         24
+mlp.down_proj                        1024   3584       24         24
+self_attn.q_proj (fused [q;gate])    4096   1024        6          6
+self_attn.k_proj                      512   1024        6          6
+self_attn.v_proj                      512   1024        6          6
+self_attn.o_proj                     1024   2048        6          6
+linear_attn.in_proj_qkv              6144   1024       18         18
+linear_attn.in_proj_z                2048   1024       18         18
+linear_attn.in_proj_b                  16   1024       18         18
+linear_attn.in_proj_a                  16   1024       18         18
+linear_attn.out_proj                 1024   2048       18         18
+total W4A16 calls per model traversal: 186
+
+== census rows (unique (N,K); the kernel sees (N,K) only) ==
+N      K      gridR4 gridR1 calls/tr | B1 inst(ns)    B2 inst(ns)    B3 inst(ns)    | roles
+16     1024        4     16       36 | 4104(19942us)  216(1042us)    432(2069us)    | linear_attn.in_proj_b + linear_attn.in_proj_a
+512    1024      128    512       12 | 1368(7499us)   72(400us)      144(819us)     | self_attn.k_proj + self_attn.v_proj
+1024   2048      256   1024       24 | 5472(42051us)  288(2707us)    576(7366us)    | [grid 256 group, 48 calls/tr total: self_attn.o_proj + linear_attn.out_proj
+1024   3584      256   1024       24 | -              -              -              | (grid 256 group above) mlp.down_proj
+2048   1024      512   2048       18 | 2052(13372us)  108(1051us)    216(2752us)    | linear_attn.in_proj_z
+3584   1024      896   3584       48 | 5472(55605us)  288(4520us)    576(11591us)   | mlp.gate_proj + mlp.up_proj
+4096   1024     1024   4096        6 | 684(7268us)    36(594us)      72(1635us)     | self_attn.q_proj (fused [q;gate])
+6144   1024     1536   6144       18 | 2052(28870us)  108(2497us)    216(6919us)    | linear_attn.in_proj_qkv
+implied traversals over the whole profiled process: B1=114 B2=6 B3=12 (sum=132)
+census reconciles with Phase A CSV: OK

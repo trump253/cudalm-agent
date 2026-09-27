@@ -1,0 +1,49 @@
+# =============================================================================
+# CUDALM v0.7 Phase B — compute-sanitizer memcheck, W4A16 optimized paths
+# SHA: d9c2f85e7e000c1fb60b7c91e650d78c72bef285
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08
+# Coverage: B=1 optimized shapes (N=16/N=512 x R1/R2/R8), B=2/3 batch
+# optimized shapes, small-N dispatch (edges N=1/3 + full parity test that
+# drives the production dispatcher on all shapes).
+# =============================================================================
+=== memcheck: tool_ncu_w4a16_target 16 1024 1 r1 ===
+========= COMPUTE-SANITIZER
+========= ERROR SUMMARY: 0 errors
+=== memcheck: tool_ncu_w4a16_target 16 1024 1 r2 ===
+========= COMPUTE-SANITIZER
+========= ERROR SUMMARY: 0 errors
+=== memcheck: tool_ncu_w4a16_target 16 1024 1 r8 ===
+========= COMPUTE-SANITIZER
+========= ERROR SUMMARY: 0 errors
+=== memcheck: tool_ncu_w4a16_target 512 1024 1 r1 ===
+========= COMPUTE-SANITIZER
+========= ERROR SUMMARY: 0 errors
+=== memcheck: tool_ncu_w4a16_target 512 1024 1 r2 ===
+========= COMPUTE-SANITIZER
+========= ERROR SUMMARY: 0 errors
+=== memcheck: tool_ncu_w4a16_target 512 1024 1 r8 ===
+========= COMPUTE-SANITIZER
+========= ERROR SUMMARY: 0 errors
+=== memcheck: tool_ncu_w4a16_target 16 1024 2 r1 ===
+========= COMPUTE-SANITIZER
+========= ERROR SUMMARY: 0 errors
+=== memcheck: tool_ncu_w4a16_target 16 1024 3 r1 ===
+========= COMPUTE-SANITIZER
+========= ERROR SUMMARY: 0 errors
+=== memcheck: tool_ncu_w4a16_target 512 1024 2 r2 ===
+========= COMPUTE-SANITIZER
+========= ERROR SUMMARY: 0 errors
+=== memcheck: tool_ncu_w4a16_target 512 1024 3 r2 ===
+========= COMPUTE-SANITIZER
+========= ERROR SUMMARY: 0 errors
+=== memcheck: tool_ncu_w4a16_target 1 1024 1 r1 ===
+========= COMPUTE-SANITIZER
+========= ERROR SUMMARY: 0 errors
+=== memcheck: tool_ncu_w4a16_target 3 1024 1 r2 ===
+========= COMPUTE-SANITIZER
+========= ERROR SUMMARY: 0 errors
+=== memcheck: test_w4a16_qwen35_optimized (dispatcher + all shapes x B=1/2/3) ===
+========= COMPUTE-SANITIZER
+[PASS] test_w4a16_qwen35_optimized
+bit-exact checks passed: 9804
+========= ERROR SUMMARY: 0 errors
