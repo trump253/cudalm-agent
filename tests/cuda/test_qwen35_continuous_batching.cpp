@@ -727,13 +727,17 @@ int main(int argc, char** argv) {
     CHECK_EQ(st.requests_failed, 0);
     CHECK_EQ(st.requests_live, 0);
     // Attempt vs committed (happy path: NO failed forwards, so issued ==
-    // committed for singles). Exact contract:
+    // successful for singles). Exact contract:
     //   issued singles = 17 (A 4 + B 9 + C 7 + D 6 forward counts)
-    //   committed singles = 17; committed batches = 4 (B = 2,2,2,3)
+    //   successful singles = 17; committed batches = 4 (B = 2,2,2,3)
     CHECK_EQ(st.single_forward_calls, 17);
     CHECK_EQ(st.successful_single_forward_calls, 17);  // no failures
+    CHECK_EQ(st.batch_forward_calls, 4);
+    // COMPLETED model traversals = successful singles + committed batches
+    // (a failed attempt would NOT be a traversal; none here). One committed
+    // batch of any B is ONE traversal.
     CHECK_EQ(st.model_traversal_calls,
-             st.single_forward_calls + st.batch_forward_calls);  // = 21
+             st.successful_single_forward_calls + st.batch_forward_calls);
     CHECK_EQ(st.model_traversal_calls, 21);
     // logical token-forwards = SUCCESSFUL singles*1 + sum(batch B) — a
     // failed attempt (none here) would contribute ZERO, so the formula

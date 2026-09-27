@@ -1354,13 +1354,14 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
       `SchedulerStats` + `stats()` —— 生命周期计数、**attempt vs
       committed 口径（reviewer fix 钉死）**：`single_forward_calls` =
       ISSUED single attempts（失败也计）、`successful_single_forward_calls`
-      = COMMITTED（成功）single、`batch_forward_calls` = COMMITTED batch
-      （每次 = 1 次 traversal）、`model_traversal_calls` = ISSUED
-      traversals（= single attempts + committed batch；失败 attempt 也是
-      1 次 traversal）、`logical_token_forwards` = COMMITTED logical
-      tokens（= successful singles + `batched_sequence_tokens`；失败
-      attempt 贡献 **0**；一次 committed batch B 是 B 个 logical token
-      但 1 次 traversal）、
+      = SUCCESSFUL/COMMITTED single、`batch_forward_calls` = COMMITTED
+      batch（每次 = 1 次 traversal）、`model_traversal_calls` =
+      **COMPLETED** traversals（= successful singles + committed batch；
+      **失败 single attempt 不算 traversal** —— 可能 preflight 失败根本没
+      执行 layer traversal；一次 committed batch 无论 B 多大 = 1 次
+      traversal）、`logical_token_forwards` = COMMITTED logical tokens（=
+      successful singles + `batched_sequence_tokens`；失败 attempt 贡献
+      **0**）、
       `max/avg decode batch size`、`batch_size_trace`、
       `decode_cohort_trace`（grow/shrink 证据）。
     - **真检查点动态硬门**（`tests/cuda/test_qwen35_continuous_batching.cpp`

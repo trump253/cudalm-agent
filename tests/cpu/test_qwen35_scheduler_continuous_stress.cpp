@@ -234,14 +234,15 @@ int main() {
     // ---- attempt vs committed FAILURE-PATH gate -------------------------
     // The failing request ISSUED exactly one single attempt (its first
     // forward failed) but COMMITTED nothing: forward_count == 0 (checked
-    // above) and the failed attempt must NOT leak into the COMMITTED
-    // logical-token metric.
-    //   committed successful singles = good1 5 + good2 3 + good3 4 = 12
+    // above) and the failed attempt must NOT leak into the COMPLETED
+    // traversal or the COMMITTED logical-token metrics (it may have failed
+    // at model preflight without ever executing the layer traversal).
+    //   completed successful singles = good1 5 + good2 3 + good3 4 = 12
     //   issued single attempts       = 12 + 1 (the failed one)   = 13
-    CHECK_EQ(st.single_forward_calls, 13);             // ISSUED (incl. failed)
-    CHECK_EQ(st.successful_single_forward_calls, 12);  // COMMITTED (ok only)
-    CHECK_EQ(st.logical_token_forwards, 12);           // failed attempt = ZERO
-    CHECK_EQ(st.model_traversal_calls, 13);            // failed attempt IS 1 traversal
+    CHECK_EQ(st.single_forward_calls, 13);                // ISSUED (incl. failed)
+    CHECK_EQ(st.successful_single_forward_calls, 12);     // successful only
+    CHECK_EQ(st.logical_token_forwards, 12);              // failed attempt = ZERO
+    CHECK_EQ(st.model_traversal_calls, 12);  // failed preflight/fake call is NOT a traversal
     CHECK_EQ(st.batch_forward_calls, 0);
     CHECK_EQ(st.batched_sequence_tokens, 0);
     std::fprintf(stderr,
@@ -250,8 +251,8 @@ int main() {
                  "forward_count=0), the other 3 continued to Finished; "
                  "run() reported the first error; final num_live=0, mgr "
                  "live=0; attempt-vs-committed metrics: issued=13 "
-                 "successful=12 logical=12 traversals=13 (failed attempt "
-                 "not in committed logical)\n");
+                 "successful=12 logical=12 traversals=12 (failed attempt "
+                 "is neither a traversal nor committed logical)\n");
   }
 
   // =========================================================================

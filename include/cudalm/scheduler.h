@@ -173,11 +173,12 @@ class ModelForwarder : public SequenceForwarder {
 //
 // ATTEMPT vs COMMITTED semantics (pinned, unambiguous):
 //  * "issued attempt" = a forward call that was sent to the forwarder
-//    (counted BEFORE the call; a FAILED attempt still counts as an attempt
-//    and as a traversal — the model did run once).
-//  * "committed" = the forward SUCCEEDED and its progress was committed
-//    (a failed single forward commits NOTHING: no logical token, no
-//    Request.forward_count).
+//    (counted BEFORE the call; a FAILED attempt still counts as an attempt,
+//    but it may have failed at model preflight and never executed the layer
+//    traversal — so a failed attempt is NOT a completed model traversal).
+//  * "committed" = the forward SUCCEEDED (the model traversal completed)
+//    and its progress was committed (a failed single forward commits
+//    NOTHING: no traversal, no logical token, no Request.forward_count).
 //  * A batched forward is only ever COMMITTED (the preflight + the
 //    forward_batch call itself succeed before any batch counter moves; a
 //    preflight failure is NOT a batch attempt — the cohort falls back to
@@ -185,13 +186,14 @@ class ModelForwarder : public SequenceForwarder {
 //
 // CONSEQUENT DEFINITIONS:
 //  * single_forward_calls        = ISSUED single attempts (incl. failed)
-//  * successful_single_forward_calls = COMMITTED (successful) single forwards
+//  * successful_single_forward_calls = SUCCESSFUL / COMMITTED single forwards
 //  * batch_forward_calls         = COMMITTED batched forwards (each = ONE model
 //                                  traversal, never B)
-//  * model_traversal_calls       = single_forward_calls + batch_forward_calls
-//                                  = ISSUED model traversals (a failed single
-//                                  attempt IS one traversal; a committed batch
-//                                  of B is ONE)
+//  * model_traversal_calls       = successful_single_forward_calls +
+//                                  batch_forward_calls = COMPLETED model
+//                                  traversals (a failed single attempt is
+//                                  NOT a traversal; a committed batch of B —
+//                                  any B — is ONE)
 //  * logical_token_forwards      = successful_single_forward_calls +
 //                                  batched_sequence_tokens = COMMITTED logical
 //                                  tokens (one per TOKEN advanced; a failed
@@ -199,11 +201,11 @@ class ModelForwarder : public SequenceForwarder {
 //
 // KEY DISTINCTION (pinned): "logical sequence-token forwards" counts one
 // per TOKEN committed (a successful single forward = 1 token; a committed
-// batch of B = B tokens). "model traversal calls" counts one per model
-// traversal ISSUED (a single attempt = 1 traversal, failed or not; a
-// committed batch of B = ONE traversal, never B). A batch(B=4) is therefore
-// 4 logical token-forwards but 1 model traversal. Confusing the two is the
-// exact error this struct disambiguates.
+// batch of B = B tokens). "model traversal calls" counts one per COMPLETED
+// model traversal (a successful single forward = 1 traversal; a committed
+// batch of B = ONE traversal, never B; a failed single attempt = ZERO). A
+// batch(B=4) is therefore 4 logical token-forwards but 1 model traversal.
+// Confusing the two is the exact error this struct disambiguates.
 struct SchedulerStats {
   // ---- request lifecycle ----------------------------------------------------
   int requests_admitted = 0;   // total requests ever admitted (incl. terminal)
@@ -213,12 +215,14 @@ struct SchedulerStats {
   int requests_failed = 0;     // terminal Failed (fatal forward / logits)
 
   // ---- forward accounting (attempt vs committed, see header above) ----------
-  int single_forward_calls = 0;            // ISSUED single attempts (incl. failed)
-  int successful_single_forward_calls = 0;  // COMMITTED (successful) single forwards
-  int batch_forward_calls = 0;             // COMMITTED batched forwards (ONE each)
-  int model_traversal_calls = 0;  // ISSUED traversals = single_forward_calls +
+  int single_forward_calls = 0;               // ISSUED single attempts (incl. failed)
+  int successful_single_forward_calls = 0;    // SUCCESSFUL / COMMITTED single forwards
+  int batch_forward_calls = 0;                // COMMITTED batched forwards (ONE each)
+  int model_traversal_calls = 0;  // COMPLETED traversals =
+                                  // successful_single_forward_calls +
                                   // batch_forward_calls (failed single attempt
-                                  // IS one traversal; committed batch = ONE)
+                                  // is NOT a traversal; committed batch of any
+                                  // B = ONE)
   int batched_sequence_tokens = 0;  // sum of B over committed batch forwards
   int logical_token_forwards = 0;   // COMMITTED logical tokens =
                                     // successful_single_forward_calls +

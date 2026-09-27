@@ -227,8 +227,9 @@ Status Scheduler::advance_one(Request& r) {
   }
 
   // Phase B instrumentation: every call here is ONE ISSUED single attempt
-  // (counted BEFORE the call; a failed attempt still counts as an attempt
-  // and as one model traversal, but commits NOTHING).
+  // (counted BEFORE the call; a failed attempt still counts as an attempt,
+  // but if it failed at preflight it never executed the layer traversal —
+  // so it is NOT a completed model traversal and commits NOTHING).
   ++single_forward_calls_;
   Status s = fwd_.forward_token(token, r.sequence_id, mgr_, stream_);
   if (!s.ok) {
@@ -237,8 +238,10 @@ Status Scheduler::advance_one(Request& r) {
     // committed: prefill_pos (prefill) and forward_count are unchanged
     // (e.g. prompt {50, 99} with 50 ok / 99 failing -> forward_count = 1,
     // prefill_pos = 1, NOT 2), and it increments NEITHER
-    // successful_single_forward_calls_ NOR logical_token_forwards (a failed
-    // attempt is an attempt + a traversal, but zero committed work).
+    // successful_single_forward_calls_ NOR logical_token_forwards NOR
+    // model_traversal_calls (a failed attempt is an ISSUED attempt only —
+    // it may have failed at preflight without executing the traversal, and
+    // commits zero work).
     r.status = RequestStatus::Failed;
     r.finish_reason = FinishReason::Failed;
     finish(r, RequestStatus::Failed, FinishReason::Failed);
@@ -579,15 +582,17 @@ SchedulerStats Scheduler::stats() const {
   }
   // Attempt vs committed (see the SchedulerStats header for the pinned
   // definitions): single_forward_calls counts ISSUED attempts (including
-  // failed ones); successful_single_forward_calls counts COMMITTED (ok)
+  // failed ones); successful_single_forward_calls counts COMPLETED (ok)
   // singles; batch_forward_calls counts COMMITTED batches (each ONE
   // traversal).
   st.single_forward_calls = single_forward_calls_;
   st.successful_single_forward_calls = successful_single_forward_calls_;
   st.batch_forward_calls = batch_forward_calls_;
-  // ISSUED model traversals: every single attempt (failed or not — the
-  // model ran once) + every committed batch (ONE each, never B).
-  st.model_traversal_calls = single_forward_calls_ + batch_forward_calls_;
+  // COMPLETED model traversals: successful singles only (a failed single
+  // attempt may have failed at preflight without executing the traversal,
+  // so it is NOT one) + every committed batch (ONE each, never B).
+  st.model_traversal_calls =
+      successful_single_forward_calls_ + batch_forward_calls_;
   st.batched_sequence_tokens = batched_sequence_tokens_;
   // COMMITTED logical sequence-token forwards: one per TOKEN advanced —
   // successful singles only (a failed attempt contributes ZERO) + B per
