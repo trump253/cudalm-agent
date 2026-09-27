@@ -30,9 +30,19 @@
 //
 // The report also prints a "profile_totals" section: the completed
 // model-traversal / forward counts accumulated over EVERY workload execution
-// of the process (warmup + all measured runs, both modes). That is the
+// of the process (warmup + all measured runs, selected mode(s)). That is the
 // denominator for the v0.7 Nsight-Systems kernels-per-traversal launch-
 // overhead analysis.
+//
+// --mode both|serial|batched (default both = v0.6 behavior, byte-for-byte):
+//   serial  — mode A only (independent / serial, each request alone)
+//   batched — mode B only (scheduler continuous batched: same checkpoint,
+//             same requests, same dynamic arrivals, same warmup/measured
+//             methodology, single stream, serial prefill, true batched
+//             decode). This is the CONTINUOUS-BATCHED SERVING profile used
+//             for the v0.7 Phase-B optimization ranking.
+// Profiling/tooling-only selector: it changes ONLY which modes execute —
+// never any kernel/runtime behavior.
 //
 // NO performance pass threshold. This benchmark REPORTS numbers for THIS
 // environment; it makes no general "X% speedup" claim (the correctness-first
@@ -40,11 +50,12 @@
 // no speedup here, that is NOT a failure.
 //
 // The report explicitly records: GPU, CUDA version, checkpoint, batch
-// workload, warmup / measured runs.
+// workload, warmup / measured runs, mode selector.
 //
 // Usage:
 //   bench_qwen35_continuous_batching <full_model.cudalm> <checkpoint_dir>
-//       <python> <src_dir> [out.txt] [--no-convert]
+//       <python> <src_dir> [out.txt] [--no-convert] [--measured-runs N]
+//       [--mode both|serial|batched]
 // out.txt defaults to "-" (stdout). Self-skips (77) when the checkpoint is
 // absent.
 
@@ -247,7 +258,8 @@ int main(int argc, char** argv) {
   if (argc < 5) {
     std::fprintf(stderr,
                  "usage: %s <full_model.cudalm> <checkpoint_dir> <python> "
-                 "<src_dir> [out.txt] [--no-convert]\n",
+                 "<src_dir> [out.txt] [--no-convert] [--measured-runs N] "
+                 "[--mode both|serial|batched]\n",
                  argv[0]);
     return 2;
   }
@@ -262,6 +274,15 @@ int main(int argc, char** argv) {
                                       // ONLY the number of timed repetitions
                                       // changes — the per-run execution is
                                       // identical)
+  // v0.7 tooling (profiling-only mode selector): which workload(s) to run.
+  //   both    (default) — v0.6 behavior, byte-for-byte
+  //   serial  — mode A only (independent / serial, each request alone)
+  //   batched — mode B only (scheduler continuous batched: same checkpoint,
+  //             same requests, same dynamic arrivals, same warmup/measured
+  //             methodology, single stream, serial prefill, true batched
+  //             decode). Used for the continuous-batched SERVING profile.
+  // Runs only change WHICH modes execute — never kernel/runtime behavior.
+  std::string mode = "both";
   for (int i = 5; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--no-convert") no_convert = true;
@@ -271,8 +292,19 @@ int main(int argc, char** argv) {
     } else if (a.rfind("--measured-runs=", 0) == 0) {
       measured_runs = std::atoi(a.c_str() + 16);
       if (measured_runs < 1) measured_runs = 1;
+    } else if (a == "--mode") {
+      if (i + 1 < argc) mode = argv[++i];
+    } else if (a.rfind("--mode=", 0) == 0) {
+      mode = a.substr(7);
     } else if (report_path == "-") report_path = a;
   }
+  if (mode != "both" && mode != "serial" && mode != "batched") {
+    std::fprintf(stderr, "invalid --mode '%s' (want both|serial|batched)\n",
+                 mode.c_str());
+    return 2;
+  }
+  const bool run_serial_mode = (mode != "batched");
+  const bool run_batched_mode = (mode != "serial");
 
   if (no_convert && !file_exists(out_path)) {
     std::fprintf(stderr,
@@ -336,19 +368,23 @@ int main(int argc, char** argv) {
     int batched_batched_tokens = 0;     // sum of B over committed batches
   } tot;
 
-  // ---- warmup (un-timed): one run of each mode ----------------------------
+  // ---- warmup (un-timed): one run of each SELECTED mode --------------------
   for (int w = 0; w < kWarmupRuns; ++w) {
-    SerialMetrics sm;
-    if (run_serial(model, cfg, ws, stream, &sm) != 0) return 1;
-    tot.serial_traversals += sm.single_forward_calls;
-    BatchedMetrics bm;
-    if (run_batched(model, cfg, ws, stream, &bm) != 0) return 1;
-    tot.batched_single += bm.stats.single_forward_calls;
-    tot.batched_successful_single += bm.stats.successful_single_forward_calls;
-    tot.batched_batch += bm.stats.batch_forward_calls;
-    tot.batched_traversals += bm.stats.model_traversal_calls;
-    tot.batched_logical += bm.stats.logical_token_forwards;
-    tot.batched_batched_tokens += bm.stats.batched_sequence_tokens;
+    if (run_serial_mode) {
+      SerialMetrics sm;
+      if (run_serial(model, cfg, ws, stream, &sm) != 0) return 1;
+      tot.serial_traversals += sm.single_forward_calls;
+    }
+    if (run_batched_mode) {
+      BatchedMetrics bm;
+      if (run_batched(model, cfg, ws, stream, &bm) != 0) return 1;
+      tot.batched_single += bm.stats.single_forward_calls;
+      tot.batched_successful_single += bm.stats.successful_single_forward_calls;
+      tot.batched_batch += bm.stats.batch_forward_calls;
+      tot.batched_traversals += bm.stats.model_traversal_calls;
+      tot.batched_logical += bm.stats.logical_token_forwards;
+      tot.batched_batched_tokens += bm.stats.batched_sequence_tokens;
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
@@ -357,36 +393,40 @@ int main(int argc, char** argv) {
   SerialMetrics sm_last;
   BatchedMetrics bm_last;
   for (int r = 0; r < measured_runs; ++r) {
-    CUDA_CHECK(cudaStreamSynchronize(stream));  // clean start
-    const auto t0 = std::chrono::steady_clock::now();
-    SerialMetrics sm;
-    if (run_serial(model, cfg, ws, stream, &sm) != 0) {
-      std::fprintf(stderr, "serial run %d failed\n", r);
-      return 1;
+    if (run_serial_mode) {
+      CUDA_CHECK(cudaStreamSynchronize(stream));  // clean start
+      const auto t0 = std::chrono::steady_clock::now();
+      SerialMetrics sm;
+      if (run_serial(model, cfg, ws, stream, &sm) != 0) {
+        std::fprintf(stderr, "serial run %d failed\n", r);
+        return 1;
+      }
+      CUDA_CHECK(cudaStreamSynchronize(stream));  // include all GPU work
+      const auto t1 = std::chrono::steady_clock::now();
+      serial_times.push_back(std::chrono::duration<double>(t1 - t0).count());
+      sm_last = sm;
+      tot.serial_traversals += sm.single_forward_calls;
     }
-    CUDA_CHECK(cudaStreamSynchronize(stream));  // include all GPU work
-    const auto t1 = std::chrono::steady_clock::now();
-    serial_times.push_back(std::chrono::duration<double>(t1 - t0).count());
-    sm_last = sm;
-    tot.serial_traversals += sm.single_forward_calls;
 
-    CUDA_CHECK(cudaStreamSynchronize(stream));  // clean start
-    const auto u0 = std::chrono::steady_clock::now();
-    BatchedMetrics bm;
-    if (run_batched(model, cfg, ws, stream, &bm) != 0) {
-      std::fprintf(stderr, "batched run %d failed\n", r);
-      return 1;
+    if (run_batched_mode) {
+      CUDA_CHECK(cudaStreamSynchronize(stream));  // clean start
+      const auto u0 = std::chrono::steady_clock::now();
+      BatchedMetrics bm;
+      if (run_batched(model, cfg, ws, stream, &bm) != 0) {
+        std::fprintf(stderr, "batched run %d failed\n", r);
+        return 1;
+      }
+      CUDA_CHECK(cudaStreamSynchronize(stream));  // include all GPU work
+      const auto u1 = std::chrono::steady_clock::now();
+      batched_times.push_back(std::chrono::duration<double>(u1 - u0).count());
+      bm_last = bm;
+      tot.batched_single += bm.stats.single_forward_calls;
+      tot.batched_successful_single += bm.stats.successful_single_forward_calls;
+      tot.batched_batch += bm.stats.batch_forward_calls;
+      tot.batched_traversals += bm.stats.model_traversal_calls;
+      tot.batched_logical += bm.stats.logical_token_forwards;
+      tot.batched_batched_tokens += bm.stats.batched_sequence_tokens;
     }
-    CUDA_CHECK(cudaStreamSynchronize(stream));  // include all GPU work
-    const auto u1 = std::chrono::steady_clock::now();
-    batched_times.push_back(std::chrono::duration<double>(u1 - u0).count());
-    bm_last = bm;
-    tot.batched_single += bm.stats.single_forward_calls;
-    tot.batched_successful_single += bm.stats.successful_single_forward_calls;
-    tot.batched_batch += bm.stats.batch_forward_calls;
-    tot.batched_traversals += bm.stats.model_traversal_calls;
-    tot.batched_logical += bm.stats.logical_token_forwards;
-    tot.batched_batched_tokens += bm.stats.batched_sequence_tokens;
   }
   const RunStats serial_stats = compute_stats(serial_times);
   const RunStats batched_stats = compute_stats(batched_times);
@@ -424,52 +464,61 @@ int main(int argc, char** argv) {
   line("  warmup_runs (un-timed): " + std::to_string(kWarmupRuns));
   line("  measured_runs: " + std::to_string(measured_runs) +
        " (each bracketed by cudaStreamSynchronize; steady_clock wall)");
+  line("  mode selector (--mode): " + mode +
+       (mode == "both" ? " (default; v0.6 behavior)"
+                       : " (PROFILING-ONLY: single-mode serving profile)"));
   line("");
   line("results (per-run metrics are identical across measured runs for this "
        "fixed workload; wall time is summarized):");
   line("");
-  line("  mode A — independent / SERIAL (each request alone, one at a time):");
-  line("    wall_time_s mean:   " + std::to_string(serial_stats.mean));
-  line("    wall_time_s median: " + std::to_string(serial_stats.median));
-  line("    wall_time_s min:    " + std::to_string(serial_stats.min));
-  line("    wall_time_s max:    " + std::to_string(serial_stats.max));
-  line("    logical_tokens: " + std::to_string(sm_last.logical_tokens));
-  line("    logical_tokens_per_s (mean): " +
-       std::to_string(sm_last.logical_tokens / serial_stats.mean));
-  line("    single_forward_calls: " +
-       std::to_string(sm_last.single_forward_calls));
-  line("    successful_single_forward_calls: " +
-       std::to_string(sm_last.single_forward_calls));
-  line("    batch_forward_calls: 0");
-  line("    model_traversal_calls: " +
-       std::to_string(sm_last.single_forward_calls));
-  line("    avg_decode_batch_size: 0");
-  line("    max_decode_batch_size: 0");
-  line("");
-  line("  mode B — SCHEDULER CONTINUOUS BATCHED (dynamic arrivals):");
-  line("    wall_time_s mean:   " + std::to_string(batched_stats.mean));
-  line("    wall_time_s median: " + std::to_string(batched_stats.median));
-  line("    wall_time_s min:    " + std::to_string(batched_stats.min));
-  line("    wall_time_s max:    " + std::to_string(batched_stats.max));
-  line("    logical_tokens: " +
-       std::to_string(bm_last.stats.logical_token_forwards));
-  line("    logical_tokens_per_s (mean): " +
-       std::to_string(bm_last.stats.logical_token_forwards / batched_stats.mean));
-  line("    single_forward_calls: " +
-       std::to_string(bm_last.stats.single_forward_calls));
-  line("    successful_single_forward_calls: " +
-       std::to_string(bm_last.stats.successful_single_forward_calls));
-  line("    batch_forward_calls: " +
-       std::to_string(bm_last.stats.batch_forward_calls));
-  line("    model_traversal_calls: " +
-       std::to_string(bm_last.stats.model_traversal_calls));
-  line("    batched_sequence_tokens: " +
-       std::to_string(bm_last.stats.batched_sequence_tokens));
-  line("    avg_decode_batch_size: " +
-       std::to_string(bm_last.stats.avg_committed_decode_batch_size));
-  line("    max_decode_batch_size: " +
-       std::to_string(bm_last.stats.max_batch_size));
-  line("");
+  if (run_serial_mode) {
+    line("  mode A — independent / SERIAL (each request alone, one at a "
+         "time):");
+    line("    wall_time_s mean:   " + std::to_string(serial_stats.mean));
+    line("    wall_time_s median: " + std::to_string(serial_stats.median));
+    line("    wall_time_s min:    " + std::to_string(serial_stats.min));
+    line("    wall_time_s max:    " + std::to_string(serial_stats.max));
+    line("    logical_tokens: " + std::to_string(sm_last.logical_tokens));
+    line("    logical_tokens_per_s (mean): " +
+         std::to_string(sm_last.logical_tokens / serial_stats.mean));
+    line("    single_forward_calls: " +
+         std::to_string(sm_last.single_forward_calls));
+    line("    successful_single_forward_calls: " +
+         std::to_string(sm_last.single_forward_calls));
+    line("    batch_forward_calls: 0");
+    line("    model_traversal_calls: " +
+         std::to_string(sm_last.single_forward_calls));
+    line("    avg_decode_batch_size: 0");
+    line("    max_decode_batch_size: 0");
+    line("");
+  }
+  if (run_batched_mode) {
+    line("  mode B — SCHEDULER CONTINUOUS BATCHED (dynamic arrivals):");
+    line("    wall_time_s mean:   " + std::to_string(batched_stats.mean));
+    line("    wall_time_s median: " + std::to_string(batched_stats.median));
+    line("    wall_time_s min:    " + std::to_string(batched_stats.min));
+    line("    wall_time_s max:    " + std::to_string(batched_stats.max));
+    line("    logical_tokens: " +
+         std::to_string(bm_last.stats.logical_token_forwards));
+    line("    logical_tokens_per_s (mean): " +
+         std::to_string(bm_last.stats.logical_token_forwards /
+                        batched_stats.mean));
+    line("    single_forward_calls: " +
+         std::to_string(bm_last.stats.single_forward_calls));
+    line("    successful_single_forward_calls: " +
+         std::to_string(bm_last.stats.successful_single_forward_calls));
+    line("    batch_forward_calls: " +
+         std::to_string(bm_last.stats.batch_forward_calls));
+    line("    model_traversal_calls: " +
+         std::to_string(bm_last.stats.model_traversal_calls));
+    line("    batched_sequence_tokens: " +
+         std::to_string(bm_last.stats.batched_sequence_tokens));
+    line("    avg_decode_batch_size: " +
+         std::to_string(bm_last.stats.avg_committed_decode_batch_size));
+    line("    max_decode_batch_size: " +
+         std::to_string(bm_last.stats.max_batch_size));
+    line("");
+  }
   line("profile_totals (this process: warmup + all measured runs, BOTH "
        "modes;");
   line("ties the whole run to the Nsight Systems kernel-launch count):");
@@ -501,10 +550,18 @@ int main(int argc, char** argv) {
   line("");
   line("per-measured-run wall_time_s:");
   for (int r = 0; r < measured_runs; ++r) {
-    line("  run " + std::to_string(r + 1) + ": serial=" +
-         std::to_string(serial_times[static_cast<std::size_t>(r)]) +
-         "s batched=" +
-         std::to_string(batched_times[static_cast<std::size_t>(r)]) + "s");
+    if (run_serial_mode && run_batched_mode) {
+      line("  run " + std::to_string(r + 1) + ": serial=" +
+           std::to_string(serial_times[static_cast<std::size_t>(r)]) +
+           "s batched=" +
+           std::to_string(batched_times[static_cast<std::size_t>(r)]) + "s");
+    } else if (run_serial_mode) {
+      line("  run " + std::to_string(r + 1) + ": serial=" +
+           std::to_string(serial_times[static_cast<std::size_t>(r)]) + "s");
+    } else {
+      line("  run " + std::to_string(r + 1) + ": batched=" +
+           std::to_string(batched_times[static_cast<std::size_t>(r)]) + "s");
+    }
   }
 
   if (report_path == "-") {
@@ -516,9 +573,19 @@ int main(int argc, char** argv) {
   }
 
   CUDA_CHECK(cudaStreamDestroy(stream));
-  std::fprintf(stderr,
-               "benchmark complete: serial=%.4fs batched=%.4fs "
-               "(logical=%d tokens)\n",
-               serial_s, batched_s, logical);
+  if (run_serial_mode && run_batched_mode) {
+    std::fprintf(stderr,
+                 "benchmark complete: serial=%.4fs batched=%.4fs "
+                 "(logical=%d tokens)\n",
+                 serial_s, batched_s, logical);
+  } else if (run_serial_mode) {
+    std::fprintf(stderr, "benchmark complete (serial only): serial=%.4fs "
+                 "(logical=%d tokens)\n", serial_s, logical);
+  } else {
+    std::fprintf(stderr,
+                 "benchmark complete (batched only): batched=%.4fs "
+                 "(logical=%d tokens)\n",
+                 batched_s, logical);
+  }
   return 0;
 }

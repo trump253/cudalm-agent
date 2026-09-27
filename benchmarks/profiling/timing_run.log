@@ -1,2 +1,0 @@
-wrote /root/code/cudalm-agent/benchmarks/profiling/.timing_body.txt
-benchmark complete: serial=0.1338s batched=0.1180s (logical=27 tokens)
