@@ -143,6 +143,57 @@ class Qwen35Model {
                                   Qwen35StateManager& mgr,
                                   cudaStream_t stream);
 
+  // ---- v0.6 Phase B: TRUE BATCHED decode forward (B rows) --------------
+  // Run the COMPLETE model on B decode tokens AT ONCE: row b takes
+  // token_ids[b] for the LIVE sequence seq_ids[b] at position
+  // sequence.length[b] (derived, as in the single path). One model/layer
+  // traversal for the whole batch (NO host loop over rows calling the
+  // single forward): batch embedding gather -> 24 batched layers (external
+  // state: row b's Delta slot / block table / logical KV prefix) -> final
+  // RMSNorm (M = B) -> batched tied LM head -> logits [B][vocab_size].
+  //
+  // On success each row is EXACTLY what the frozen
+  // forward_token_with_state() would do for that row alone (BIT-IDENTICAL
+  // per row — the row-parity contract): 24 layers completed, state updated
+  // in place, length += 1, that row's logits available.
+  //
+  // ZERO-MUTATION PREFLIGHT (checked FIRST; on ANY failure no Delta
+  // mutation, no KV allocation, no length change, no layer forward):
+  //   * model loaded; B >= 1; non-null arrays;
+  //   * every token_id in [0, vocab_size);
+  //   * every SequenceId LIVE and the ids UNIQUE;
+  //   * mgr.config() == config() (the v0.5 compatibility gate);
+  //   * stream == the manager pools' stream (single-stream contract);
+  //   * every row's position (= sequence length) < max_seq_len;
+  //   * AGGREGATE KV capacity: the SUM of the NEW pages any row needs
+  //     fits the pool's free pages (per-row needs are computed from the
+  //     row's block table + page size).
+  // After the preflight, per-row ensure_kv_capacity runs in row order
+  // (it cannot fail: the aggregate check covers it) and the per-row
+  // metadata (tokens / positions / slots / block tables) is H2D'd once.
+  // Lengths are committed (mgr.advance) only after the whole batch is
+  // enqueued.
+  Status forward_batch_with_state(const int* token_ids,
+                                  const SequenceId* seq_ids, int B,
+                                  Qwen35StateManager& mgr,
+                                  cudaStream_t stream);
+
+  // ---- Batch forward outputs (device; valid after forward_batch_...
+  // until the next forward) — row layout [B][...]:
+  const __nv_bfloat16* batch_embedding_output() const {
+    return embed_out_batch_.data<__nv_bfloat16>();
+  }
+  const __nv_bfloat16* batch_final_norm_output() const {
+    return norm_out_batch_.data<__nv_bfloat16>();
+  }
+  // FULL logits [B][vocab_size] bf16.
+  const __nv_bfloat16* batch_logits() const {
+    return logits_batch_.data<__nv_bfloat16>();
+  }
+  // Each layer's final output, row layout [B][hidden_size] (dispatches on
+  // the layer type; null if `i` invalid or not loaded).
+  const __nv_bfloat16* batch_layer_final_output(int i) const;
+
   // ---- Forward outputs (device; valid from forward_token until the next) --
   // Embedding output [hidden_size] bf16 (= embed_tokens.weight[token_id]).
   const __nv_bfloat16* embedding_output() const {
@@ -189,6 +240,16 @@ class Qwen35Model {
   // paged kernels read only entries [0, position/page_tokens], so stale
   // content beyond the copied prefix is never read).
   DeviceBuffer block_table_scratch_{};
+  // v0.6 Phase B: batch forward scratch + outputs (grow-only; sized to the
+  // largest B seen). embed_out/norm_out/logits are [B][...].
+  int batch_cap_ = 0;
+  DeviceBuffer embed_out_batch_{};
+  DeviceBuffer norm_out_batch_{};
+  DeviceBuffer logits_batch_{};
+  DeviceBuffer batch_token_ids_{};   // int [B]
+  DeviceBuffer batch_positions_{};   // int [B]
+  DeviceBuffer batch_slots_{};       // int [B] (Delta slots)
+  DeviceBuffer batch_block_tables_{};  // int [B * max_blocks]
   bool tie_ = false;
   bool loaded_ = false;
 };

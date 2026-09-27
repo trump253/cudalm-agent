@@ -10,15 +10,19 @@
 
 #include "cudalm/qwen35_model.h"
 
+#include <algorithm>
 #include <string>
 
 #include "cudalm/cuda_check.h"
+#include "cudalm/kernels/batch_decode.h"
 #include "cudalm/kernels/bf16_gemv.h"
 #include "cudalm/kernels/qwen35_kernels.h"
 #include "cudalm/qwen35_kv_cache.h"
 #include "cudalm/qwen35_kv_page_pool.h"
 
 namespace cudalm {
+
+using kernels::batch_bf16_gemv;  // v0.6 Phase B batch GEMV (kernels namespace)
 
 Status Qwen35Model::load(const WeightFileV2& file, cudaStream_t stream,
                          Qwen35Model* out) {
@@ -299,4 +303,220 @@ const __nv_bfloat16* Qwen35Model::layer_final_output(int i) const {
   return attention(i)->stage_final_output();
 }
 
+
+// ---------------------------------------------------------------------------
+// v0.6 Phase B: TRUE BATCHED decode forward (B rows, one traversal).
+// Per row BIT-IDENTICAL to forward_token_with_state() (row-parity).
+// ---------------------------------------------------------------------------
+Status Qwen35Model::forward_batch_with_state(const int* token_ids,
+                                             const SequenceId* seq_ids, int B,
+                                             Qwen35StateManager& mgr,
+                                             cudaStream_t stream) {
+  // ---------- PREFLIGHT (ZERO MUTATION — checked BEFORE anything) -------
+  if (!loaded_)
+    return Status::error("Qwen35Model::forward_batch_with_state: not loaded");
+  if (B < 1)
+    return Status::error("Qwen35Model::forward_batch_with_state: B >= 1");
+  if (token_ids == nullptr || seq_ids == nullptr)
+    return Status::error(
+        "Qwen35Model::forward_batch_with_state: null token/sequence arrays");
+  // COMPATIBILITY GATE (as in the single path): the manager's config must
+  // be EXACTLY the model's config.
+  if (!(mgr.config() == cfg_))
+    return Status::error(
+        "Qwen35Model::forward_batch_with_state: manager config does not "
+        "match the model config");
+  // SINGLE-STREAM CONTRACT (the batch path is single-stream like the rest
+  // of v0.5/v0.6).
+  if (stream != mgr.kv_pool().stream() || stream != mgr.delta_pool().stream())
+    return Status::error(
+        "Qwen35Model::forward_batch_with_state: stream mismatch — the batch "
+        "forward stream must equal the manager pool streams");
+  const int vocab = cfg_.vocab_size;
+  // Per row: token validity, live sequence, UNIQUE ids, position in bounds.
+  std::vector<const SequenceState*> recs(B);
+  std::vector<SequenceId> ids(seq_ids, seq_ids + B);
+  for (int b = 0; b < B; ++b) {
+    if (token_ids[b] < 0 || token_ids[b] >= vocab)
+      return Status::error(
+          "Qwen35Model::forward_batch_with_state: row " + std::to_string(b) +
+          " token_id " + std::to_string(token_ids[b]) + " out of range");
+    const SequenceState* rec = mgr.lookup(seq_ids[b]);
+    if (rec == nullptr)
+      return Status::error(
+          "Qwen35Model::forward_batch_with_state: row " + std::to_string(b) +
+          " sequence id " + std::to_string(seq_ids[b]) + " is not a live "
+          "sequence");
+    if (rec->length >= cfg_.max_seq_len)
+      return Status::error(
+          "Qwen35Model::forward_batch_with_state: row " + std::to_string(b) +
+          " sequence length " + std::to_string(rec->length) + " >= "
+          "max_seq_len " + std::to_string(cfg_.max_seq_len));
+    recs[b] = rec;
+  }
+  // UNiqueness of the sequence ids.
+  {
+    std::vector<SequenceId> sorted = ids;
+    std::sort(sorted.begin(), sorted.end());
+    for (int b = 1; b < B; ++b) {
+      if (sorted[b] == sorted[b - 1])
+        return Status::error(
+            "Qwen35Model::forward_batch_with_state: duplicate sequence id " +
+            std::to_string(sorted[b]));
+    }
+  }
+  // AGGREGATE KV CAPACITY: the SUM of the NEW pages any row needs must fit
+  // the pool's free pages (row order allocation below is then guaranteed to
+  // succeed; on failure NOTHING was allocated/changed).
+  {
+    const int pt = mgr.page_tokens();
+    long long pages_needed = 0;
+    for (int b = 0; b < B; ++b) {
+      const int position = recs[b]->length;  // the forward position
+      const int need_blocks =
+          (position + pt) / pt;  // blocks covering positions [0..position]
+      const int have_blocks = recs[b]->block_table.num_blocks();
+      if (need_blocks > have_blocks)
+        pages_needed += (need_blocks - have_blocks);
+    }
+    if (pages_needed > mgr.kv_pool().free_pages())
+      return Status::error(
+          "Qwen35Model::forward_batch_with_state: aggregate KV capacity "
+          "insufficient for the batch (need " +
+          std::to_string(pages_needed) + " new pages, free " +
+          std::to_string(mgr.kv_pool().free_pages()) +
+          ") — the scheduler may fall back to the frozen serial path");
+  }
+
+  // ---------- GROW batch scratch to B (reallocate only on a larger B) ----
+  if (B > batch_cap_) {
+    batch_cap_ = B;
+    const std::size_t b = static_cast<std::size_t>(B);
+    const std::size_t H = static_cast<std::size_t>(cfg_.hidden_size);
+    const std::size_t V = static_cast<std::size_t>(cfg_.vocab_size);
+    embed_out_batch_.allocate(H * b * sizeof(__nv_bfloat16), stream);
+    norm_out_batch_.allocate(H * b * sizeof(__nv_bfloat16), stream);
+    logits_batch_.allocate(V * b * sizeof(__nv_bfloat16), stream);
+    batch_token_ids_.allocate(b * sizeof(int), stream);
+    batch_positions_.allocate(b * sizeof(int), stream);
+    batch_slots_.allocate(b * sizeof(int), stream);
+  }
+
+  // ---------- COMMIT capacity (cannot fail: the aggregate check covers it)
+  for (int b = 0; b < B; ++b) {
+    const Status s = mgr.ensure_kv_capacity(seq_ids[b], recs[b]->length);
+    CUDALM_PRECONDITION(
+        s.ok,
+        "forward_batch_with_state: post-preflight ensure_kv_capacity "
+        "failure (logic bug — the aggregate capacity check must cover it)");
+  }
+
+  // ---------- H2D the per-batch metadata (tokens / positions / slots /
+  // block tables). The block tables are re-read AFTER the ensure above so
+  // they include the freshly allocated pages. Per-token metadata H2D,
+  // stream-ordered — exactly the frozen single path's block-table H2D. ----
+  const int max_blocks = recs[0]->block_table.max_blocks();
+  if (batch_block_tables_.bytes() <
+      static_cast<std::size_t>(B) * static_cast<std::size_t>(max_blocks) *
+          sizeof(int)) {
+    batch_block_tables_.allocate(
+        static_cast<std::size_t>(B) * static_cast<std::size_t>(max_blocks) *
+            sizeof(int),
+        stream);
+  }
+  std::vector<int> host_bt(static_cast<std::size_t>(B) * max_blocks);
+  std::vector<int> host_pos(B), host_slots(B);
+  for (int b = 0; b < B; ++b) {
+    const int* pids = recs[b]->block_table.page_ids();
+    const int nb = recs[b]->block_table.num_blocks();
+    for (int k = 0; k < max_blocks; ++k)
+      host_bt[static_cast<std::size_t>(b) * max_blocks + k] =
+          (k < nb) ? pids[k] : 0;  // stale tail never read (prefix contract)
+    host_pos[b] = recs[b]->length;
+    host_slots[b] = recs[b]->delta_slot;
+  }
+  CUDA_CHECK(cudaMemcpyAsync(batch_token_ids_.data(), token_ids,
+                             static_cast<std::size_t>(B) * sizeof(int),
+                             cudaMemcpyHostToDevice, stream));
+  CUDA_CHECK(cudaMemcpyAsync(batch_positions_.data(), host_pos.data(),
+                             static_cast<std::size_t>(B) * sizeof(int),
+                             cudaMemcpyHostToDevice, stream));
+  CUDA_CHECK(cudaMemcpyAsync(batch_slots_.data(), host_slots.data(),
+                             static_cast<std::size_t>(B) * sizeof(int),
+                             cudaMemcpyHostToDevice, stream));
+  CUDA_CHECK(cudaMemcpyAsync(batch_block_tables_.data(), host_bt.data(),
+                             static_cast<std::size_t>(B) * max_blocks *
+                                 sizeof(int),
+                             cudaMemcpyHostToDevice, stream));
+
+  const int* d_tokens = static_cast<int*>(batch_token_ids_.data());
+  const int* d_positions = static_cast<int*>(batch_positions_.data());
+  const int* d_slots = static_cast<int*>(batch_slots_.data());
+  const int* d_block_tables = static_cast<int*>(batch_block_tables_.data());
+
+  Qwen35KvPagePool& kpool = mgr.kv_pool_mut();
+  Qwen35DeltaStatePool& dpool = mgr.delta_pool_mut();
+  const int H = cfg_.hidden_size;
+  const int pt = mgr.page_tokens();
+
+  // 1. Batch embedding gather: embed_out_batch_[b] = embed[token_ids[b]].
+  kernels::batch_embed_gather_bf16(embed_.data<__nv_bfloat16>(), d_tokens,
+                                   embed_out_batch_.data<__nv_bfloat16>(), B,
+                                   H, stream);
+  const __nv_bfloat16* x = embed_out_batch_.data<__nv_bfloat16>();
+
+  // 2. Chain all 24 decoder layers with EXTERNAL state, BATCHED (one
+  //    traversal; row b addresses its own slot / block table / logical KV).
+  for (int i = 0; i < num_layers(); ++i) {
+    if (is_linear_attention(i)) {
+      const int ord = dpool.linear_layer_ordinal(i);
+      delta(i)->forward_batch_with_state(
+          B, d_slots, x, dpool.conv_mut(ord, 0), dpool.recurrent_mut(ord, 0),
+          stream);
+      x = delta(i)->stage_final_output_batch();
+    } else {
+      const int ord = kpool.full_layer_ordinal(i);
+      Qwen35FullAttentionLayer::PagedStateRefBatch psb;
+      psb.k_pages = kpool.k_page_mut(ord, 0);
+      psb.v_pages = kpool.v_page_mut(ord, 0);
+      psb.block_table = d_block_tables;
+      psb.row_stride = max_blocks;
+      psb.d_positions = d_positions;
+      psb.page_tokens = pt;
+      psb.page_stride = kpool.page_stride_elems();
+      attention(i)->forward_batch_with_paged_state(B, host_pos.data(), x,
+                                                   psb, stream);
+      x = attention(i)->stage_final_output_batch();
+    }
+  }
+
+  // 3. Final zero-centered RMSNorm (M = B rows).
+  kernels::qwen35_rmsnorm_zc_bf16(x, norm_.data<__nv_bfloat16>(),
+                                  norm_out_batch_.data<__nv_bfloat16>(), B, H,
+                                  cfg_.eps, stream);
+  const __nv_bfloat16* normed = norm_out_batch_.data<__nv_bfloat16>();
+
+  // 4. Tied LM head (batched bf16 GEMV): logits [B][vocab].
+  batch_bf16_gemv(embed_.data<__nv_bfloat16>(), normed,
+                  logits_batch_.data<__nv_bfloat16>(), cfg_.vocab_size, H, B,
+                  stream);
+
+  // 5. Commit: only AFTER the whole batch is enqueued do we advance each
+  //    sequence length (pure metadata; cannot fail: position+1 <= max).
+  for (int b = 0; b < B; ++b) {
+    const Status s = mgr.advance(seq_ids[b], 1);
+    CUDALM_PRECONDITION(
+        s.ok,
+        "forward_batch_with_state: post-forward advance failure (logic bug — "
+        "the preflight checked every position < max_seq_len)");
+  }
+  return Status::ok_status();
+}
+
+const __nv_bfloat16* Qwen35Model::batch_layer_final_output(int i) const {
+  if (i < 0 || i >= num_layers()) return nullptr;
+  if (is_linear_attention(i))
+    return delta(i)->stage_final_output_batch();
+  return attention(i)->stage_final_output_batch();
+}
 }  // namespace cudalm

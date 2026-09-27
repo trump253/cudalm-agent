@@ -55,6 +55,46 @@ cudalm_add_test(test_kv_block_table test_kv_block_table
 cudalm_add_test(test_state_pool_formulas test_state_pool_formulas
                 cpu/test_state_pool_formulas.cpp)
 
+# v0.6 Phase A: request scheduler / control-plane gate (CPU test: NO
+# checkpoint, NO model — a deterministic fake forwarder over the REAL
+# Qwen35StateManager pools). Gates: request lifecycle (Waiting/Running/
+# terminal records stay inspectable), monotonic never-reused RequestId,
+# TRANSACTIONAL admission (capacity exhaustion + input validation: no
+# leaked sequence, no half-request, no consumed RequestId; re-admission
+# after retire/cancel), deterministic FIFO/round-robin iteration with
+# snapshot semantics (admission order == RequestId order == iteration
+# order; a request admitted between iterations joins the NEXT one),
+# prefill/decode coexistence, EOS / max_new_tokens completion (exact
+# generated stream + forward count N + m - 1), cancel + retire (idempotent
+# re-cancel ok, unknown id fail-loud, stale request never advances),
+# per-request SAMPLING RNG isolation (A(seed 42) interleaved == A alone;
+# same prompt + same seed => identical streams regardless of
+# interleaving), fatal Status (Failed + retire exactly once, the
+# iteration's remaining snapshot ids still advance; a FAILED forward is
+# not committed: forward_count + prefill_pos exclude it — prompt
+# {50,99} with 50 ok/99 failing -> forward_count 1, prefill_pos 1, NOT
+# 2; run() failure isolation: a request that fatals during run() does
+# not stop the other live requests — they run to completion and run()
+# returns the first error).
+cudalm_add_test(test_qwen35_scheduler test_qwen35_scheduler
+                cpu/test_qwen35_scheduler.cpp)
+
+# v0.6 Phase C: COMBINED CONTROL-PLANE STRESS gate (CPU, NO checkpoint —
+# deterministic fake forwarder over the REAL state pools; single-only, so the
+# frozen serial path is always taken). Part 1: failure isolation in a
+# DYNAMIC set (one request's forwards always fail -> Failed + retired once,
+# forward NOT committed, never re-advanced; the other live requests continue
+# to Finished; run() reports the first error; final num_live=0 and
+# mgr.num_live_sequences=0). Part 2: DETERMINISTIC lifecycle stress, FIXED
+# SEED, 40 requests (admit / step / late admit / finish / cancel), checking
+# invariants after EVERY step/admit/cancel (scheduler live count ==
+# StateManager live sequence count; a terminal request is never advanced
+# again; each live request owns exactly one live SequenceId) and the exact
+# final reclamation. No infinite / flaky randomness.
+cudalm_add_test(test_qwen35_scheduler_continuous_stress
+                test_qwen35_scheduler_continuous_stress
+                cpu/test_qwen35_scheduler_continuous_stress.cpp)
+
 # --- CUDA tests ---------------------------------------------------------------
 cudalm_add_test(test_cuda_smoke test_cuda_smoke cuda/test_cuda_smoke.cpp)
 cudalm_add_test(test_elementwise_rmsnorm test_elementwise_rmsnorm cuda/test_elementwise_rmsnorm.cpp)
@@ -67,6 +107,12 @@ cudalm_add_test(test_int4_gemv_bf16 test_int4_gemv_bf16 cuda/test_int4_gemv_bf16
 # hard gate: vec4 (K%8==0, aligned) + scalar (K%8!=0 / misaligned) + zero-row,
 # vs a CPU FP32-accumulate -> BF16 RNE reference. No checkpoint needed.
 cudalm_add_test(test_bf16_gemv test_bf16_gemv cuda/test_bf16_gemv.cpp)
+# v0.6 Phase B: TRUE BATCHED decode kernel family — ROW-WISE parity of every
+# new batched kernel (W4A16 GEMV, BF16 LM-head GEMV, paged KV write, paged
+# attention, Delta stateful conv/gbeta/delta) against the frozen v0.5 single
+# kernel. Deterministic synthetic inputs, no checkpoint (pure kernel parity).
+cudalm_add_test(test_qwen35_batch_kernels test_qwen35_batch_kernels
+                cuda/test_qwen35_batch_kernels.cpp)
 cudalm_add_test(test_qwen35_kernels test_qwen35_kernels cuda/test_qwen35_kernels.cpp)
 cudalm_add_test(test_rope test_rope cuda/test_rope.cpp)
 cudalm_add_test(test_kv_cache test_kv_cache cuda/test_kv_cache.cpp)
@@ -154,6 +200,117 @@ add_test(NAME test_qwen35_state_interleave
                  ${CUDALM_TOOL_PYTHON3}
                  ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_qwen35_state_interleave PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# v0.6 Phase A: scheduler INTEGRATION hard gate (real checkpoint) — the
+# Phase A sign-off test. Scheduler semantics == independent execution:
+# A (3-tok prompt, max_new 3, seed 42) + B (7-tok prompt, max_new 2, seed
+# 123) admitted, 2 iterations, then C (2-tok prompt, max_new 3, seed 7)
+# admitted DYNAMICALLY, run to completion (deterministic FIFO/round-robin;
+# one single-sequence forward_token_with_state per advance, single model +
+# single stream — NO batched CUDA compute in Phase A). Gates: per request
+# A/B/C the generated token IDs, the FULL logits[248320] that produced each
+# generated token, the forward count, and the finish reason are EXACT vs
+# INDEPENDENT fresh-manager references (direct forwards, not the
+# scheduler); B's FULL hybrid state at length 4 (before A finishes) and
+# length 5 (after A's finish + retire) == B-alone reference states
+# (isolation: another request's finish/retire changes nothing in a
+# still-live request's state); SAMPLING ISOLATION (same prompt + same seed
+# => identical streams: X alone == Y alone == X+Y interleaved).
+# Self-skips (77) when the checkpoint is absent; the Phase A evidence
+# environment MUST actually run it.
+add_executable(test_qwen35_scheduler_integration
+               cuda/test_qwen35_scheduler_integration.cpp)
+target_link_libraries(test_qwen35_scheduler_integration PRIVATE cudalm)
+add_test(NAME test_qwen35_scheduler_integration
+         COMMAND test_qwen35_scheduler_integration
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_scheduler_integration PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# v0.6 Phase B: TRUE BATCHED decode — FULL-MODEL real-checkpoint hard gate.
+# B=3 heterogeneous positions (3/5/2-token prompts, page_tokens=2) + B=1, two
+# decode steps: per-row embedding / 24 layer-finals / final-norm / FULL
+# logits[248320] / final hybrid state (18 Delta conv/rec + 6 FA logical K/V) /
+# length all BIT-IDENTICAL to the frozen single path
+# (forward_token_with_state) run from an equivalent state. No throughput claim
+# (correctness-first; prefill stays serial, single stream).
+add_executable(test_qwen35_batched_decode cuda/test_qwen35_batched_decode.cpp)
+target_link_libraries(test_qwen35_batched_decode PRIVATE cudalm)
+add_test(NAME test_qwen35_batched_decode
+         COMMAND test_qwen35_batched_decode
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_batched_decode PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# v0.6 Phase B: scheduler TRUE-BATCHED decode real-checkpoint gate.
+# Three requests with DIFFERENT prompt lengths (3/5/2) and chosen max_new so
+# the decode cohort forms at B=3 then SHRINKS to B=2 (A finishes mid-run):
+# proves batch_forward_calls>0, max_batch_size==3, forwarder cohort sizes
+# exactly {3,2} (one batch forward per B>=2 cohort, never B single forwards),
+# and per request the generated IDs / per-step FULL logits / forward count /
+# finish reason / FINAL hybrid state are EXACT vs independent references.
+add_executable(test_qwen35_scheduler_batch cuda/test_qwen35_scheduler_batch.cpp)
+target_link_libraries(test_qwen35_scheduler_batch PRIVATE cudalm)
+add_test(NAME test_qwen35_scheduler_batch
+         COMMAND test_qwen35_scheduler_batch
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_scheduler_batch PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# v0.6 Phase B: ZERO-MUTATION batch preflight + SERIAL FALLBACK
+# real-checkpoint gate. Aggregate KV capacity shortfall (pool 3 pages,
+# two length-2 sequences, 1 page free, batch needs 2): the FAILED
+# forward_batch_with_state leaves length / block tables / KV pool
+# accounting / Delta state / logical KV exactly unchanged (no partial
+# allocation); the scheduler then falls back to the frozen serial path
+# (batch_fallback_calls == 1, batch_forward_calls == 0): row A advances
+# bit-identically to an independent direct-serial reference, row B's
+# serial forward fails (Failed + retired once, forward NOT committed).
+add_executable(test_qwen35_batch_fallback cuda/test_qwen35_batch_fallback.cpp)
+target_link_libraries(test_qwen35_batch_fallback PRIVATE cudalm)
+add_test(NAME test_qwen35_batch_fallback
+         COMMAND test_qwen35_batch_fallback
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_batch_fallback PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# v0.6 Phase C: DYNAMIC CONTINUOUS-BATCHING real-checkpoint hard gate.
+# Four requests (distinct prompt length 2/5/3/4, distinct max_new, 1 greedy +
+# 3 seeded) under TRULY dynamic arrival (A,B first; C late while A/B run; A
+# finishes; D latest, reusing A's freed resources): true batched decode with
+# a natural GROW (1->2, 2->3) and SHRINK (3->1) decode-cohort trace
+# {1,1,2,2,2,3,1}, max_batch_size=3, batch_forward_calls>0, no fallback;
+# MID-FLIGHT cancellation of B (prefix EXACT vs its independent reference,
+# retired exactly once, never executed again); resource REUSE (D takes A's
+# freed delta slot, D's live hybrid state at length 5 BIT-IDENTICAL to a
+# fresh-D reference -> fresh-zero, no contamination); per-request generated
+# IDs + per-step FULL logits + forward count + finish reason EXACT vs
+# independent references; serving metrics (logical != traversal) sane.
+# Self-skips (77) when the checkpoint is absent; the Phase C evidence
+# environment MUST actually run it.
+add_executable(test_qwen35_continuous_batching
+               cuda/test_qwen35_continuous_batching.cpp)
+target_link_libraries(test_qwen35_continuous_batching PRIVATE cudalm)
+add_test(NAME test_qwen35_continuous_batching
+         COMMAND test_qwen35_continuous_batching
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_continuous_batching PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 if(CUDALM_PYTHON3)

@@ -10,10 +10,13 @@
 
 #include "cudalm/cuda_check.h"
 #include "cudalm/kernels/int4_gemv_bf16.h"
+#include "cudalm/kernels/batch_decode.h"
 #include "cudalm/kernels/qwen35_deltanet_kernels.h"
 #include "cudalm/kernels/qwen35_kernels.h"
 
 namespace cudalm {
+
+using kernels::batch_int4_gemv_bf16;  // v0.6 Phase B batch GEMV (kernels namespace)
 
 namespace {
 std::size_t bf_bytes(std::size_t n) { return n * sizeof(__nv_bfloat16); }
@@ -252,6 +255,170 @@ void Qwen35DeltaNetLayer::forward_impl(int position,
   kernels::qwen35_add_bf16(res1_.data<__nv_bfloat16>(),
                            mlp_down_.data<__nv_bfloat16>(),
                            final_.data<__nv_bfloat16>(), H, stream);
+}
+
+
+// ---------------------------------------------------------------------------
+// v0.6 Phase B: TRUE BATCHED decode (B rows, one launch per stage; per row
+// BIT-IDENTICAL to forward_with_state() — see include/cudalm/kernels/
+// batch_decode.h and docs §26).
+// ---------------------------------------------------------------------------
+void Qwen35DeltaNetLayer::grow_batch(int B, cudaStream_t stream) {
+  if (B <= batch_cap_) return;
+  batch_cap_ = B;
+  const std::size_t b = static_cast<std::size_t>(B);
+  const std::size_t H = static_cast<std::size_t>(cfg_.hidden_size);
+  const std::size_t conv_dim = static_cast<std::size_t>(cfg_.linear_conv_dim());
+  const std::size_t key_dim = static_cast<std::size_t>(cfg_.linear_key_dim());
+  const std::size_t value_dim =
+      static_cast<std::size_t>(cfg_.linear_value_dim());
+  const std::size_t n_heads = static_cast<std::size_t>(cfg_.lin_num_v_heads);
+  const std::size_t inter = static_cast<std::size_t>(cfg_.intermediate_size);
+  b_input_.allocate(bf_bytes(b * H), stream);
+  b_rms1_.allocate(bf_bytes(b * H), stream);
+  b_mixed_.allocate(bf_bytes(b * conv_dim), stream);
+  b_z_.allocate(bf_bytes(b * value_dim), stream);
+  b_b_.allocate(bf_bytes(b * n_heads), stream);
+  b_a_.allocate(bf_bytes(b * n_heads), stream);
+  b_conv_out_.allocate(bf_bytes(b * conv_dim), stream);
+  b_conv_silu_.allocate(bf_bytes(b * conv_dim), stream);
+  b_q_.allocate(bf_bytes(b * key_dim), stream);
+  b_k_.allocate(bf_bytes(b * key_dim), stream);
+  b_v_.allocate(bf_bytes(b * value_dim), stream);
+  b_beta_.allocate(bf_bytes(b * n_heads), stream);
+  b_g_.allocate(f32_bytes(b * n_heads), stream);
+  b_core_.allocate(bf_bytes(b * value_dim), stream);
+  b_gated_.allocate(bf_bytes(b * value_dim), stream);
+  b_out_proj_.allocate(bf_bytes(b * H), stream);
+  b_res1_.allocate(bf_bytes(b * H), stream);
+  b_rms2_.allocate(bf_bytes(b * H), stream);
+  b_mlp_gate_.allocate(bf_bytes(b * inter), stream);
+  b_mlp_up_.allocate(bf_bytes(b * inter), stream);
+  b_silu_mul_.allocate(bf_bytes(b * inter), stream);
+  b_mlp_down_.allocate(bf_bytes(b * H), stream);
+  b_final_.allocate(bf_bytes(b * H), stream);
+}
+
+void Qwen35DeltaNetLayer::forward_batch_with_state(
+    int B, const int* d_slots, const __nv_bfloat16* x_in,
+    __nv_bfloat16* conv_base, float* rec_base, cudaStream_t stream) {
+  CUDALM_PRECONDITION(B >= 1, "forward_batch_with_state: B >= 1");
+  grow_batch(B, stream);
+  const int H = cfg_.hidden_size;
+  const int conv_dim = cfg_.linear_conv_dim();
+  const int key_dim = cfg_.linear_key_dim();
+  const int value_dim = cfg_.linear_value_dim();
+  const int n_heads = cfg_.lin_num_v_heads;
+  const int inter = cfg_.intermediate_size;
+  const float eps = cfg_.eps;
+
+  // 0) stage.input: plain D2D copy of [B][H] (bit-exact, like the frozen
+  //    single path's stage.input).
+  CUDA_CHECK(cudaMemcpyAsync(b_input_.data(), x_in,
+                             bf_bytes(static_cast<std::size_t>(B) * H),
+                             cudaMemcpyDeviceToDevice, stream));
+
+  // 1) zero-centered RMSNorm 1 (frozen kernel, M = B rows).
+  kernels::qwen35_rmsnorm_zc_bf16(
+      b_input_.data<__nv_bfloat16>(),
+      w_->input_layernorm.data<__nv_bfloat16>(),
+      b_rms1_.data<__nv_bfloat16>(), B, H, eps, stream);
+
+  // 2) projections (W4A16, batched GEMV — per row bit-identical to the
+  //    frozen single-row int4_gemv_bf16).
+  batch_int4_gemv_bf16(w_->in_proj_qkv.weight.data<std::uint8_t>(),
+                       w_->in_proj_qkv.scale.data<__half>(),
+                       b_rms1_.data<__nv_bfloat16>(),
+                       b_mixed_.data<__nv_bfloat16>(), w_->in_proj_qkv.N,
+                       w_->in_proj_qkv.K, B, stream);
+  batch_int4_gemv_bf16(w_->in_proj_z.weight.data<std::uint8_t>(),
+                       w_->in_proj_z.scale.data<__half>(),
+                       b_rms1_.data<__nv_bfloat16>(), b_z_.data<__nv_bfloat16>(),
+                       w_->in_proj_z.N, w_->in_proj_z.K, B, stream);
+  batch_int4_gemv_bf16(w_->in_proj_b.weight.data<std::uint8_t>(),
+                       w_->in_proj_b.scale.data<__half>(),
+                       b_rms1_.data<__nv_bfloat16>(), b_b_.data<__nv_bfloat16>(),
+                       w_->in_proj_b.N, w_->in_proj_b.K, B, stream);
+  batch_int4_gemv_bf16(w_->in_proj_a.weight.data<std::uint8_t>(),
+                       w_->in_proj_a.scale.data<__half>(),
+                       b_rms1_.data<__nv_bfloat16>(), b_a_.data<__nv_bfloat16>(),
+                       w_->in_proj_a.N, w_->in_proj_a.K, B, stream);
+
+  // 3) depthwise causal conv1d decode update (per-row slot) + SiLU.
+  kernels::batch_deltanet_conv_decode_bf16(
+      conv_base, d_slots, b_mixed_.data<__nv_bfloat16>(),
+      w_->conv1d_weight.data<__nv_bfloat16>(),
+      b_conv_out_.data<__nv_bfloat16>(), b_conv_silu_.data<__nv_bfloat16>(),
+      conv_dim, B, stream);
+
+  // 4) split conv_silu -> q/k/v (one kernel; the frozen path's three D2D
+  //    copies as a single batched pass).
+  kernels::batch_deltanet_conv_split_bf16(
+      b_conv_silu_.data<__nv_bfloat16>(), b_q_.data<__nv_bfloat16>(),
+      b_k_.data<__nv_bfloat16>(), b_v_.data<__nv_bfloat16>(), key_dim,
+      value_dim, B, stream);
+
+  // 5) g (fp32) + beta (bf16) — batched.
+  kernels::batch_deltanet_gbeta_bf16(
+      b_b_.data<__nv_bfloat16>(), b_a_.data<__nv_bfloat16>(),
+      w_->A_log.data<float>(), w_->dt_bias.data<__nv_bfloat16>(),
+      b_beta_.data<__nv_bfloat16>(), b_g_.data<float>(), n_heads, B, stream);
+
+  // 6) gated delta-rule recurrent decode update (per-row slot, in place).
+  kernels::batch_deltanet_delta_rule_fp32(
+      b_q_.data<__nv_bfloat16>(), b_k_.data<__nv_bfloat16>(),
+      b_v_.data<__nv_bfloat16>(), b_g_.data<float>(),
+      b_beta_.data<__nv_bfloat16>(), rec_base, d_slots,
+      b_core_.data<__nv_bfloat16>(), n_heads, cfg_.lin_value_head_dim, eps, B,
+      stream);
+
+  // 7) gated RMSNorm (frozen kernel, n = B*n_heads rows).
+  kernels::qwen35_rmsnorm_gated_bf16(
+      b_core_.data<__nv_bfloat16>(), b_z_.data<__nv_bfloat16>(),
+      w_->linear_norm.data<float>(), b_gated_.data<__nv_bfloat16>(),
+      B * n_heads, cfg_.lin_value_head_dim, eps, stream);
+
+  // 8) out_proj (W4A16, batched) + residual 1 (frozen add, flat [B][H]).
+  batch_int4_gemv_bf16(w_->out_proj.weight.data<std::uint8_t>(),
+                       w_->out_proj.scale.data<__half>(),
+                       b_gated_.data<__nv_bfloat16>(),
+                       b_out_proj_.data<__nv_bfloat16>(), w_->out_proj.N,
+                       w_->out_proj.K, B, stream);
+  kernels::qwen35_add_bf16(
+      b_input_.data<__nv_bfloat16>(), b_out_proj_.data<__nv_bfloat16>(),
+      b_res1_.data<__nv_bfloat16>(),
+      static_cast<std::size_t>(B) * H, stream);
+
+  // 9) zero-centered RMSNorm 2 (M = B rows).
+  kernels::qwen35_rmsnorm_zc_bf16(
+      b_res1_.data<__nv_bfloat16>(),
+      w_->post_attention_ln.data<__nv_bfloat16>(),
+      b_rms2_.data<__nv_bfloat16>(), B, H, eps, stream);
+
+  // 10) SwiGLU MLP + residual 2.
+  batch_int4_gemv_bf16(w_->gate_proj.weight.data<std::uint8_t>(),
+                       w_->gate_proj.scale.data<__half>(),
+                       b_rms2_.data<__nv_bfloat16>(),
+                       b_mlp_gate_.data<__nv_bfloat16>(), w_->gate_proj.N,
+                       w_->gate_proj.K, B, stream);
+  batch_int4_gemv_bf16(w_->up_proj.weight.data<std::uint8_t>(),
+                       w_->up_proj.scale.data<__half>(),
+                       b_rms2_.data<__nv_bfloat16>(),
+                       b_mlp_up_.data<__nv_bfloat16>(), w_->up_proj.N,
+                       w_->up_proj.K, B, stream);
+  kernels::qwen35_silu_mul_bf16(b_mlp_gate_.data<__nv_bfloat16>(),
+                                b_mlp_up_.data<__nv_bfloat16>(),
+                                b_silu_mul_.data<__nv_bfloat16>(),
+                                static_cast<std::size_t>(B) * inter, stream);
+  batch_int4_gemv_bf16(w_->down_proj.weight.data<std::uint8_t>(),
+                       w_->down_proj.scale.data<__half>(),
+                       b_silu_mul_.data<__nv_bfloat16>(),
+                       b_mlp_down_.data<__nv_bfloat16>(), w_->down_proj.N,
+                       w_->down_proj.K, B, stream);
+  kernels::qwen35_add_bf16(b_res1_.data<__nv_bfloat16>(),
+                           b_mlp_down_.data<__nv_bfloat16>(),
+                           b_final_.data<__nv_bfloat16>(),
+                           static_cast<std::size_t>(B) * H, stream);
 }
 
 }  // namespace cudalm

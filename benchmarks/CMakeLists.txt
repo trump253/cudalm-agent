@@ -18,3 +18,16 @@ target_link_libraries(bench_qwen35_full_attention PRIVATE cudalm)
 #       benchmarks/results/bench_qwen35_hybrid_microstack.json
 add_executable(bench_qwen35_hybrid_microstack bench_qwen35_hybrid_microstack.cpp)
 target_link_libraries(bench_qwen35_hybrid_microstack PRIVATE cudalm)
+
+# v0.6 Phase C: dynamic continuous-batching reproducible benchmark (real
+# Qwen3.5-0.8B-Base). Compares the SAME four-request workload (dynamic
+# arrival, true batched decode) executed INDEPENDENT/SERIAL (each request
+# alone) vs SCHEDULER CONTINUOUS BATCHED. Warmup + multiple measured runs,
+# each bracketed by cudaStreamSynchronize. NO performance pass threshold (the
+# correctness-first batch kernels are untuned; tuning is v0.7). Run with a
+# converted .cudalm v2 (full model) file, e.g.
+#   build/benchmarks/bench_qwen35_continuous_batching \
+#       build/data/qwen35_08b_full.cudalm /root/models/Qwen3.5-0.8B-Base \
+#       <python> <src_dir> benchmarks/v06_continuous_batching.txt --no-convert
+add_executable(bench_qwen35_continuous_batching bench_qwen35_continuous_batching.cpp)
+target_link_libraries(bench_qwen35_continuous_batching PRIVATE cudalm)
