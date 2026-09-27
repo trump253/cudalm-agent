@@ -314,59 +314,61 @@ void batch_int4_gemv_bf16_rowtile8(const std::uint8_t* weight,
 // path — the bit-compatible generic fallback (with its scalar fallback
 // for non-16B-aligned inputs).
 //
-// MEASURED OUTCOME (REJECTED FOR PRODUCTION — frozen baseline retained).
+// MEASURED ADAPTIVE TABLE — PRODUCTION CANDIDATE (V07B_CANDIDATE_SHA).
 //
-// The candidates were measured (benchmarks/bench_w4a16_qwen35_shapes, two
-// independent runs; NCU; batched-only nsys; full evidence in docs/
-// v07_w4a16_optimization.md):
+// The R choice is a STATIC measured-shape table (no runtime autotuning),
+// keyed on the Qwen3.5-0.8B production census (benchmarks/profiling/
+// v07b_w4a16_shape_census.txt), from the Phase-B microbenchmark
+// (benchmarks/bench_w4a16_qwen35_shapes, exact-SHA runs in benchmarks/
+// v07b_w4a16_microbench_run*.txt), NCU (benchmarks/profiling/
+// v07b_ncu_*.txt) and the candidate batched-only nsys (benchmarks/
+// profiling/v07b_candidate_batched_nsys_*). Anything not in the table
+// takes the FROZEN R4 baseline — the bit-compatible generic fallback
+// (with its scalar fallback for non-16B-aligned inputs).
 //
-//   B=1 (single decode):
-//     N=16   (grid 4):  R1  1.40~1.43x  — degenerate small-N: R4 runs 4
-//                                     blocks (K=1024 -> nvec=32, so only
-//                                     1 of 4 warps is active per block;
-//                                     occ 11.3%, waves 0.01); R1 runs
-//                                     16 blocks (waves 0.03, SM 0.28->0.69%).
-//     N=512  (grid 128): R2  1.43~1.47x — occupancy-limited (occ 21.2%,
-//                                     waves 0.24; R2: occ 42.5%, waves 0.47).
-//     N>=1024:          R4  best (R1/R2/R8 all <= 1.0x; R1 up to 25%
-//                                     SLOWER at N=6144 B=3).
-//   Batch:
-//     N=16   (any B>1): R1  1.38~1.42x (per-call; per-token 1.7~2.4x)
-//     N=512, B=2:       R2  1.09~1.11x
-//     N=512, B=3:       R4  (R2 LOSES 0.94x at B=3)
-//     N>=1024:          R4  best for all B
+//   B=1:  N=16,K=1024  -> R1   (1.38-1.43x; grid 4 -> 16 blocks,
+//                                     waves 0.01 -> 0.03)
+//         N=512,K=1024 -> R2   (1.43-1.47x; grid 128 -> 256, waves
+//                                     0.24 -> 0.47, occ 21 -> 42%)
+//         else         -> frozen R4
+//   B>1:  N=16,K=1024              -> R1   (1.38-1.42x per call)
+//         N=512,K=1024 && B==2     -> R2   (1.09-1.11x per call)
+//         N=512,K=1024 && B==3     -> frozen R4 (R2 measured 0.94x)
+//         else                     -> frozen R4
 //
-//   Kernel-level result: W4A16 family -5.99% (nsys batched-only, 132
-//   traversals; drift-corrected -5.2%), weighted microbench -5.9%.
-//   E2E verdict: the canonical continuous-batched wall improvement
-//   (~0.4~0.7 ms per run, pooled over 110 runs) is WITHIN the per-run
-//   noise (sd 2.6~3.6 ms; Welch t = -0.02) — the ~1.7%-of-wall effect is
-//   masked by the short canonical workload. Per the Phase-B acceptance
-//   criteria (e2e median improvement must be reproducible; "if e2e is
-//   within noise -> do not claim success; keep the code in bench/test
-//   without replacing the dispatcher"), the candidates are REJECTED for
-//   production and this dispatcher RETAINS THE FROZEN R4 BASELINE for
-//   every production shape. The row-tile variants and this dispatcher
-//   remain as bench/test infrastructure and a measured extension point.
+// This candidate SHA carries the measured table through the production
+// runtime call sites for the full-model candidate benchmark. The final
+// production decision (E2E acceptance) is recorded in docs/
+// v07_w4a16_optimization.md.
 // ---------------------------------------------------------------------------
 
 namespace {
 
 // Measured R for a B=1 shape; 4 = frozen baseline (default/fallback).
-// REJECTED FOR PRODUCTION: every shape takes the frozen R4 baseline.
 int pick_rowtile_b1(int N, int K) {
-  (void)N;
   (void)K;
-  return 4;  // frozen R4 baseline (production decision; see header comment)
+  switch (N) {
+    case 16:
+      return 1;  // in_proj_b/a: 1.38~1.43x (degenerate small-N, grid 4)
+    case 512:
+      return 2;  // k/v_proj: 1.43~1.47x (occupancy-limited, grid 128)
+    default:
+      return 4;  // frozen R4 baseline (generic fallback)
+  }
 }
 
 // Measured R for a batch shape; 4 = frozen baseline (default/fallback).
-// REJECTED FOR PRODUCTION: every shape takes the frozen R4 baseline.
 int pick_rowtile_batch(int N, int K, int B) {
-  (void)N;
   (void)K;
-  (void)B;
-  return 4;  // frozen R4 baseline (production decision; see header comment)
+  if (N == 16) {
+    return 1;  // in_proj_b/a: 1.38~1.42x per call for B=2 and B=3
+  }
+  if (N == 512) {
+    // k/v_proj: R2 wins only at B=2 (1.09~1.11x); R2 LOSES at B=3
+    // (0.94x) and beyond — keep the frozen baseline there.
+    return (B == 2) ? 2 : 4;
+  }
+  return 4;  // frozen R4 baseline (generic fallback)
 }
 
 }  // namespace

@@ -60,6 +60,14 @@ NCU_ITERS="${CUDALM_NCU_ITERS:-64}"
 NCU_LAUNCH_COUNT="${CUDALM_NCU_LAUNCH_COUNT:-12}"
 NCU_SKIP="${CUDALM_NCU_SKIP:-8}"
 
+# Evidence tag: which candidate/state this evidence run binds to.
+#   CUDALM_EVIDENCE_TAG=candidate  -> v07b_candidate_* artifacts
+#   CUDALM_EVIDENCE_TAG=final      -> v07b_final_* artifacts (default)
+# CUDALM_EVIDENCE_SHA_TAG: the SHA symbol line in the evidence header
+#   (V07B / V07B_CANDIDATE / V07B_FINAL_FUNCTIONAL).
+TAG="${CUDALM_EVIDENCE_TAG:-final}"
+SHA_TAG="${CUDALM_EVIDENCE_SHA_TAG:-V07B}"
+
 # NCU targets: name -> "N|K|B|variant"
 #   * small-N pathological: N=16 (in_proj_b/a) — frozen vs the R1 winner,
 #     B=1 and B=3 (batch);
@@ -125,7 +133,7 @@ check_clean_tree() {
 header() {
   echo "# ============================================================================="
   echo "# CUDALM v0.7 Phase B (W4A16 GEMV optimization) — $1"
-  echo "# V07B evidence at exact SHA: $SHA"
+  echo "# ${SHA_TAG} evidence (tag: $TAG) at exact SHA: $SHA"
   echo "# tree state: tracked tree CLEAN at generation (no modified/deleted"
   echo "#             tracked files; untracked = evidence outputs of this run)"
   echo "# GPU: $GPU_NAME | driver $CUDA_DRV | CUDA ${CUDA_RT_LIB:-11.8}"
@@ -227,11 +235,11 @@ cmd_ncu() {
 cmd_e2e() {
   check_clean_tree
   mkdir -p "$OUT"
-  local out="$SRC/benchmarks/v07b_continuous_batching.txt"
-  local tmp="$OUT/.e2e_body.txt"
+  local out="$SRC/benchmarks/v07b_${TAG}_e2e.txt"
+  local tmp="$OUT/.e2e_body_${TAG}.txt"
   (cd "$BUILD" && "$BENCH" $(bench_args) "$tmp" \
       --measured-runs "$E2E_MEASURED_RUNS" --warmup-runs "$E2E_WARMUP_RUNS" \
-      --mode batched >/dev/null 2>"$OUT/e2e_run.log")
+      --mode batched >/dev/null 2>"$OUT/e2e_run_${TAG}.log")
   {
     header "canonical end-to-end, --mode batched, $E2E_WARMUP_RUNS warmup + $E2E_MEASURED_RUNS measured runs"
     echo "# command:"
@@ -266,19 +274,19 @@ nsys_stats() {
 cmd_nsys_batched() {
   check_clean_tree
   mkdir -p "$OUT"
-  local rep="$OUT/v07b_batched_nsys"
-  local tmp="$OUT/.nsys_e2e_report.txt"
+  local rep="$OUT/v07b_${TAG}_batched_nsys"
+  local tmp="$OUT/.nsys_e2e_report_${TAG}.txt"
   header "nsys — CONTINUOUS-BATCHED-ONLY serving profile AFTER the Phase-B dispatcher freeze (--mode batched, $NSYS_WARMUP_RUNS warmup + $NSYS_MEASURED_RUNS measured; Phase-A-comparable schedule)" \
-    > "$OUT/v07b_nsys_batched_header.txt"
+    > "$OUT/v07b_${TAG}_nsys_batched_header.txt"
   echo "running: nsys profile -> $rep.nsys-rep (batched-only)"
   (cd "$BUILD" && nsys profile -o "$rep" -f true \
       "$BENCH" $(bench_args) "$tmp" \
       --measured-runs "$NSYS_MEASURED_RUNS" --warmup-runs "$NSYS_WARMUP_RUNS" \
-      --mode batched >/dev/null 2>"$OUT/v07b_nsys_batched_run.log")
-  nsys_stats "$rep" "v07b_batched_nsys" "$OUT/v07b_nsys_batched_header.txt"
-  echo "wrote $OUT/v07b_batched_nsys_{kernel,cuda_api,memops,kernexec}_summary.txt (+ .csv)"
+      --mode batched >/dev/null 2>"$OUT/v07b_${TAG}_nsys_batched_run.log")
+  nsys_stats "$rep" "v07b_${TAG}_batched_nsys" "$OUT/v07b_${TAG}_nsys_batched_header.txt"
+  echo "wrote $OUT/v07b_${TAG}_batched_nsys_{kernel,cuda_api,memops,kernexec}_summary.txt (+ .csv)"
   # keep the report for the aggregation denominator + e2e cross-check
-  mv "$tmp" "$OUT/v07b_batched_nsys_report.txt"
+  mv "$tmp" "$OUT/v07b_${TAG}_batched_nsys_report.txt"
 }
 
 # ---------------------------------------------------------------------------
@@ -286,13 +294,13 @@ cmd_nsys_batched() {
 # ---------------------------------------------------------------------------
 cmd_aggregate_batched() {
   check_clean_tree
-  local csv="$OUT/v07b_batched_nsys_kernel_summary_gpukernsum.csv"
-  local rep="$OUT/v07b_batched_nsys_report.txt"
+  local csv="$OUT/v07b_${TAG}_batched_nsys_kernel_summary_gpukernsum.csv"
+  local rep="$OUT/v07b_${TAG}_batched_nsys_report.txt"
   [ -f "$csv" ] || { echo "missing $csv (run nsys_batched first)"; exit 2; }
   local trav
   trav="$(grep -oE "batched_mode_traversals: [0-9]+" "$rep" | grep -oE '[0-9]+$' | head -1 || true)"
   [ -n "$trav" ] || { echo "cannot read batched_mode_traversals from $rep"; exit 2; }
-  local out="$OUT/v07b_batched_kernel_families.txt"
+  local out="$OUT/v07b_${TAG}_kernel_families.txt"
   {
     header "kernel-family aggregation (Phase-B batched) from nsys kernel summary CSV"
     echo "# nsys CSV: $csv"
