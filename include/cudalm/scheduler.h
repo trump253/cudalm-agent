@@ -167,6 +167,44 @@ class ModelForwarder : public SequenceForwarder {
   mutable std::vector<__nv_bfloat16> host_logits_;  // D2H scratch
 };
 
+// v0.6 Phase C: scheduler / runtime SERVING METRICS (observability ONLY —
+// these counters never gate or alter correctness; the control-plane
+// semantics are pinned by the tests independently of them).
+//
+// KEY DISTINCTION (pinned): "logical sequence-token forwards" counts one
+// per TOKEN advanced (a single forward = 1 token; a committed batch of B
+// = B tokens). "model traversal calls" counts one per model traversal
+// (a single forward = 1 traversal; a committed batch of B = ONE traversal,
+// never B). A batch(B=4) is therefore 4 logical token-forwards but 1 model
+// traversal. Confusing the two is the exact error this struct disambiguates.
+struct SchedulerStats {
+  // ---- request lifecycle ----------------------------------------------------
+  int requests_admitted = 0;   // total requests ever admitted (incl. terminal)
+  int requests_live = 0;       // non-terminal right now
+  int requests_finished = 0;   // terminal Finished (EOS / max_new_tokens)
+  int requests_cancelled = 0;  // terminal Cancelled
+  int requests_failed = 0;     // terminal Failed (fatal forward / logits)
+
+  // ---- forward accounting ---------------------------------------------------
+  int single_forward_calls = 0;   // single-sequence forwards issued
+  int batch_forward_calls = 0;    // committed batched forwards issued
+  int model_traversal_calls = 0;  // single + batch (ONE per traversal; a
+                                  // committed batch of B is ONE traversal)
+  int batched_sequence_tokens = 0;  // sum of B over committed batch forwards
+  int logical_token_forwards = 0;   // single*1 + batched_sequence_tokens
+                                    // (one per TOKEN advanced)
+
+  // ---- batch shape ------------------------------------------------------------
+  int max_batch_size = 0;  // largest committed decode cohort (0 if none)
+  double avg_committed_decode_batch_size = 0.0;  // batched tokens / batch calls
+  // Cohort size B of every COMMITTED batched forward (B >= 2), in order.
+  std::vector<int> batch_size_trace;
+  // Size of EVERY decode cohort advanced (1 for a size-1 single decode, B
+  // for a committed batch; prefill advances are NOT decode cohorts and are
+  // not recorded). This is the trace used to evidence batch GROW / SHRINK.
+  std::vector<int> decode_cohort_trace;
+};
+
 // The v0.6 Phase A request scheduler (control plane; deterministic FIFO).
 class Scheduler {
  public:
@@ -230,6 +268,11 @@ class Scheduler {
   // frozen serial path.
   int batch_fallback_calls() const { return batch_fallback_calls_; }
 
+  // ---- v0.6 Phase C: serving metrics (observability only) --------------------
+  // A snapshot of the serving / runtime statistics (see SchedulerStats).
+  // Pure observation: reading this never mutates scheduler state.
+  SchedulerStats stats() const;
+
   // Run step() until EVERY request is terminal (deterministic; bounded —
   // fails loud if the bound is exceeded, which cannot happen for a
   // correctly advancing forwarder). FAILURE ISOLATION (pinned): a failing
@@ -281,6 +324,10 @@ class Scheduler {
   int single_forward_calls_ = 0;
   int max_batch_size_ = 0;
   int batch_fallback_calls_ = 0;
+  // v0.6 Phase C serving-metric accumulators (observability only).
+  int batched_sequence_tokens_ = 0;          // sum of B over committed batches
+  std::vector<int> batch_size_trace_;        // B of each committed batch
+  std::vector<int> decode_cohort_trace_;     // size of every decode cohort
 };
 
 }  // namespace cudalm

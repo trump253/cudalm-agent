@@ -324,9 +324,15 @@ Status Scheduler::step() {
     if (j - i < 2 || !fwd_.supports_batch()) {
       // Single path (Phase A semantics unchanged) — including a size-1
       // decode cohort (a batch of 1 keeps the single path).
+      const bool decode_advance = is_decode_ready(it->second);
       Status s = advance_one(it->second);
       if (!s.ok && first_error.ok) {
         first_error = s;  // continue with the remaining snapshot ids
+      }
+      // Serving metrics (observability): a COMMITTED size-1 DECODE cohort is
+      // a decode cohort of size 1 (a prefill advance is not a decode cohort).
+      if (decode_advance && s.ok) {
+        decode_cohort_trace_.push_back(1);
       }
       ++i;
     } else {
@@ -379,6 +385,11 @@ void Scheduler::advance_batch_run(const std::vector<RequestId>& runnable,
       if (!fs.ok && first_error->ok) {
         *first_error = fs;
       }
+      // Serving metrics: a fallback row advanced serially is a committed
+      // size-1 decode cohort (the intended batch did NOT commit).
+      if (fs.ok) {
+        decode_cohort_trace_.push_back(1);
+      }
     }
     return;
   }
@@ -389,6 +400,12 @@ void Scheduler::advance_batch_run(const std::vector<RequestId>& runnable,
   if (static_cast<int>(B) > max_batch_size_) {
     max_batch_size_ = static_cast<int>(B);
   }
+  // Serving metrics (observability): one committed batch = B logical
+  // sequence-token forwards (NOT B traversals — it is ONE model traversal),
+  // and one decode cohort of size B.
+  batched_sequence_tokens_ += static_cast<int>(B);
+  batch_size_trace_.push_back(static_cast<int>(B));
+  decode_cohort_trace_.push_back(static_cast<int>(B));
 
   // The batch forward SUCCEEDED: commit each row's progress NOW — BEFORE
   // the logits D2H — exactly the frozen advance_one() order (forward ok ->
@@ -532,5 +549,45 @@ int Scheduler::num_live() const {
 }
 
 RequestId Scheduler::next_request_id() const { return next_id_; }
+
+SchedulerStats Scheduler::stats() const {
+  SchedulerStats st;
+  st.requests_admitted = static_cast<int>(requests_.size());
+  st.requests_live = num_live();
+  for (const auto& kv : requests_) {
+    const Request& r = kv.second;
+    switch (r.status) {
+      case RequestStatus::Finished:
+        st.requests_finished++;
+        break;
+      case RequestStatus::Cancelled:
+        st.requests_cancelled++;
+        break;
+      case RequestStatus::Failed:
+        st.requests_failed++;
+        break;
+      default:
+        break;  // Waiting / Running are live (already counted in requests_live)
+    }
+  }
+  st.single_forward_calls = single_forward_calls_;
+  st.batch_forward_calls = batch_forward_calls_;
+  st.model_traversal_calls = single_forward_calls_ + batch_forward_calls_;
+  st.batched_sequence_tokens = batched_sequence_tokens_;
+  // Logical sequence-token forwards: one per TOKEN advanced (a single
+  // forward = 1 token; a committed batch of B = B tokens). This is NOT the
+  // same as model traversal calls (a committed batch of B is ONE traversal).
+  st.logical_token_forwards =
+      single_forward_calls_ + batched_sequence_tokens_;
+  st.max_batch_size = max_batch_size_;
+  st.avg_committed_decode_batch_size =
+      batch_forward_calls_ > 0
+          ? static_cast<double>(batched_sequence_tokens_) /
+                static_cast<double>(batch_forward_calls_)
+          : 0.0;
+  st.batch_size_trace = batch_size_trace_;
+  st.decode_cohort_trace = decode_cohort_trace_;
+  return st;
+}
 
 }  // namespace cudalm
