@@ -6,7 +6,7 @@ decoder block —— W4A16 量化线性层、fp16 激活、单 GPU 自回归解�
 `sm_75`（RTX 2080 Ti）。kernel 只接收裸指针 + `cudaStream_t`；Python
 只存在于 `tools/`（离线生成测试数据），绝不链接进运行时。
 
-**v0.1.1（架构清理，当前版本）**：泛化 decoder 投影形状契约
+**v0.1.1（架构清理）**：泛化 decoder 投影形状契约
 （Q 宽度不再等于 hidden_size）、benchmark 的"stage 之和"与"整块 GPU
 时间"分离、速率指标更名 `block_steps_per_second`、权重来源显式化
 （固定种子合成权重）。不新增模型架构、不改 W4A16 kernel 算法、
@@ -305,3 +305,59 @@ HEAD == SHA）执行；失效规则：此后任何 `src/`/`include/`/`tools/`/
 
 **sign-off**：external reviewer 判 PASS —— v0.4 正式 **DONE /
 FROZEN**，`v0.4-generation` 已 merge 进 main。
+
+## v0.7：Profile-Guided 性能优化（continuous batching serving 路径）
+
+**状态：DONE / FROZEN**（`v0.7-profile-opt` 已 merge 进 main）。
+
+v0.7 在 v0.4 的 Qwen3.5-0.8B continuous batching serving 路径上做
+**profile-driven 性能优化**（PROFILE FIRST：先量化 baseline，再按证据优化）。
+四个阶段都走完整证据链（baseline → BIT-EXACT 门 → microbench → Nsys → paired
+E2E → KEEP/REJECT），并**保持逐位精确**（full logits/token/state EXACT；不改
+数值语义、不引入 CUDA Graph、不重调 W4A16/DeltaNet）。
+
+### 阶段结论
+
+| 阶段 | 内容 | 结论 |
+|------|------|------|
+| Phase A | profiling baseline（PROFILE FIRST，无优化） | **DONE** |
+| Phase B | W4A16 GEMV row-tile 变体 | **REJECTED**（提升 selected kernels/shapes，但无稳健 E2E 收益，未进 production） |
+| Phase C | DeltaNet delta-rule 变体 | **REJECTED**（delta-rule GPU 时间大幅下降，但 paired E2E 门未过，未进 production） |
+| Phase D | **BIT-EXACT fused residual-add + RMSNorm**（post-attention 残差路径，4 处） | **KEPT**（进 production） |
+
+> Phase B / C 候选被 **REJECTED**，**不是** production 提速。v0.7 production
+> runtime 相对 Phase-A baseline 的唯一功能性改动是 Phase D 的 fused
+> add+rmsnorm（README 不堆 profiler 细节，完整数据见下链接）。
+
+### production 收益（仅列有证据支持者）
+
+- **kernels/traversal：442.6 → 418.6（−24 / traversal）**（exact，= −1 launch/层 × 24 层）
+- **host `cudaLaunchKernel`：约 −125 µs / traversal**（paired Nsys capture 下）
+- **canonical paired E2E：mean delta ≈ −1.238 ms，95% CI [−2.437, −0.040] ms**（20 对 fresh-process 配对，CI 不含 0 → KEEP）
+- 全量 ctest **63/63**、`check_no_torch` **CLEAN**、compute-sanitizer **0 errors**、full logits/token/state **EXACT**。
+
+Phase D fused kernel 为 **BIT-EXACT**（residual 与 norm 双双 `memcmp` 一致），
+冻结 RMSNorm 归约树 / 算子序不变，RMSNorm 基于**已 BF16 舍入的 residual** 计算。
+
+### 详细证据（链接）
+
+- [`docs/v07_profiling.md`](docs/v07_profiling.md) — Phase A profiling baseline
+- [`docs/v07_w4a16_optimization.md`](docs/v07_w4a16_optimization.md) — Phase B W4A16 实验（REJECTED）
+- [`docs/v07_deltanet_optimization.md`](docs/v07_deltanet_optimization.md) — Phase C DeltaNet 实验（REJECTED）
+- [`docs/v07_final_performance.md`](docs/v07_final_performance.md) — Phase D final sign-off（KEEP + 硬门 + Phase-A vs v0.7 对比）
+
+### v0.7 最终 evidence
+
+`V07D_FINAL_FUNCTIONAL_SHA = 9edd9ef6aec84b8dcf66a262652c2e285ff73793`
+（production runtime 最终态 = fused add+rmsnorm）；`V07_FINAL_HEAD =
+c5d20efe3424a82ac0c6e4b01849645c74a1aa40`（其后 commits 均为 docs/evidence-only，
+无 runtime functional drift）。完整 ctest（63/63）+ `scripts/check_no_torch.sh`
++ compute-sanitizer 于该 SHA（clean tree、HEAD == SHA）执行；失效规则：此后任何
+`src/`/`include/`/`tools/`/`tests/`/functional CMake 修改 → evidence 失效必须重跑
+（仅 docs/evidence 修改不失效）。
+
+**sign-off**：v0.7 正式 **DONE / FROZEN**，`v0.7-profile-opt` 已 merge 进 main。
+
+### 下一阶段（未开始）
+
+**v0.8 — multi-turn / session runtime**（不在本任务实现）。
