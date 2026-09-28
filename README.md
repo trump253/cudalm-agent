@@ -481,13 +481,22 @@ conv / Delta recurrent / position **全部保留**（只有 `reset_session` /
 - **`cudalm-chat` CLI**（`tools/cudalm_chat.cpp`）：persistent
   **raw text** 多轮 demo REPL（`--model` / `--tokenizer` /
   `--max-new-tokens` / `--temperature` / `--top-k` / `--top-p` /
-  `--seed` / `--greedy` / `--page-tokens` / `--pages` / `--slots`；
-  REPL 命令 `reset` / `quit`）。用户输入**原样** encode 追加到同一
-  persistent session（**不加** chat template / special token /
-  separator）；response fully committed 后才显示。**这是
-  persistent text-session demo，不是完整 instruct/chat-template
-  serving API**（Qwen3.5-0.8B-Base 是 base 模型，仓库没有冻结的
-  official chat-template contract）；
+  `--seed` / `--greedy` / `--page-tokens` / `--pages` / `--slots`）。
+  用户输入**原样（逐字节、不 trim）** encode 追加到同一 persistent
+  session（**不加** chat template / special token / separator）；
+  response fully committed 后才显示。**这是 persistent text-session
+  demo，不是完整 instruct/chat-template serving API**（Qwen3.5-0.8B-
+  Base 是 base 模型，仓库没有冻结的 official chat-template
+  contract）。**REPL 命令语义（pinned，exact whole-line
+  matching）**：命令识别**只认整行精确匹配**——`reset` / `quit` /
+  `exit` 是命令；` reset `（带空格）是 **raw text** 不是命令；
+  **只有真空行 `""` 被忽略（"empty line is ignored"）**；
+  whitespace-only 非空行（如 `"   "`）是 raw-text turn（不被 trim
+  掉）。非命令行逐字节传给 `generate_turn`（不增删任何空格 / 换行 /
+  separator / special token）。generated text 用 **length-aware
+  （binary-safe）** 写输出（embedded NUL 逐字节保留，不用 `%s`）；
+  response 末尾若无 `\n`，CLI 补一个**仅显示用**的换行（UX，**不
+  进入** session / token history）；
 - **真实 CLI 示例**（真实 checkpoint 输出）：
 
   ```text

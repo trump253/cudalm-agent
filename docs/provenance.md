@@ -1646,6 +1646,8 @@ template，无 special token，无 separator，用户输入原样 append）；v0
 |---|---|---|
 | `include/cudalm/session_text_generator.h`、`src/runtime/session_text_generator.cpp` | `Qwen35SessionTextGenerator` 薄 facade（非拥有 forwarder / state manager / session manager / tokenizer / stream；只拥有自己的 Scheduler）：`create_session` / `reset_session` / `destroy_session` + `generate_turn`（4-arg 重载 = tokenizer pinned real EOS gate，v0.4 text contract；5-arg = 显式 gate，`-1` = no gate）；pinned text-session contract（verbatim / incremental / commit / no-half-turn）；错误 turn 只报告 committed 前缀，session LIVE | `1e399d1` |
 | `tools/cudalm_chat.cpp`、`CMakeLists.txt`（注册 `cudalm-chat`） | persistent text-session demo REPL（model / tokenizer / max-new-tokens / temperature / top-k / top-p / seed / greedy / page-tokens / pages / slots；REPL `reset` / `quit`；exit 0/1/2 约定同 `cudalm-generate`）；明确"raw text completion demo，不是 instruct/chat-template serving API" | `1e399d1` |
+| `include/cudalm/chat_cli.h`、`tools/cudalm_chat.cpp`（**external review 修复**，CLI-only） | CLI contract blocker 修复：① **EXACT WHOLE-LINE 命令匹配**（pinned helper `classify_chat_line`：只认整行精确 `reset` / `quit` / `exit`；**绝不 trim**——` reset ` 是 raw text；只有真空行 `""` 被忽略；whitespace-only 非空行是 raw-text turn）；② **binary-safe 输出**（`write_binary_safe`，length-aware 写——embedded NUL 逐字节保留；显示换行 UX-only，不进 session history） | `482f4ae` |
+| `tests/cpu/test_cudalm_chat_cli.cpp`、`tests/CMakeLists.txt`（注册） | CLI line contract 小 CPU 门（NO model / NO GPU，check.h only）：exact 命令识别全表（` reset ` / `reset ` / `  reset` / ` RESET` / `Reset` / ` quit` / `quit ` / ` quit\n` 全是 raw text；`""` 唯一 Ignored；`"   "` / `"\t"` / `" \t "` 是 raw text）+ binary-safe（`"a\0b\0c"` 5 字节含 embedded NUL 逐字节读回；zero-size 写不写） | `bd8329a` |
 | `tests/cpu/test_qwen35_session_text.cpp`、`tests/CMakeLists.txt`（注册，tokenizer artifact 参数，SKIP 77） | text/session contract gate（CPU：真实 native tokenizer artifact + Phase C deterministic fake forwarder + 真实池 + 真实 SessionManager + 真实 Scheduler 经 facade 驱动）：encode → session-bound request → decode（input ids == native encode、generated text == native decode、context == input + committed、forward_count 精确、request id == scheduler next id）；**turn 2 只 encode 新文本且从 committed length 续接（fake per-sequence step 计数证明不 replay）**；reset 同 SessionId 重新开始（reset_count == 1）；错误全路径零 mutation + session LIVE（invalid UTF-8 / 空文本 / unknown session / context overflow / forward failure——失败 turn 只报 committed 前缀、下一 turn 从 committed boundary 继续） | `e408192` |
 | `tests/cuda/test_qwen35_session_text_e2e.cpp`、`tests/CMakeLists.txt`（注册，checkpoint 参数 + tokenizer artifact，SKIP 77，TIMEOUT 1800） | 真实 Qwen3.5-0.8B-Base checkpoint + 真实 tokenizer E2E hard gate：两轮 incremental TEXT turn（facade）与**直接 token-level Phase C 路径**（同 encoded ids 经 `Scheduler::admit_session_turn` 在独立 session）逐轮比较——encoded ids 相同（turn 2 只含新文本）、generated ids 相同（turn 2 续接，replay 会破坏 RoPE 依赖 logits）、decoded text 相同、final context length 相同（恰为 n1+m1+n2+m2）；reset（post-reset turn fresh）；overflow admission 零 mutation（真实 session，独立 manager）；clean teardown（两 manager 池 accounting 归零） | `e408192` |
 
@@ -1667,6 +1669,29 @@ template，无 special token，无 separator，用户输入原样 append）；v0
   两轮）：turn 1（5 input + 24 generated，context 29）→ turn 2（7
   input + 24 generated，context 60 = 29 + 7 + 24 精确累加）——
   续接可见、无 replay；输出已收入 README 示例。
+- **external review 修复（CLI contract blocker，CLI-only；text
+  facade / Session / Scheduler / generation / sampling 未动）**：
+  ① **EXACT WHOLE-LINE 命令匹配**——REPL 原先 `trim()` 后识别命令，
+  导致 ` reset `（带空格）被当成 reset 命令而非 raw text；修复后
+  **绝不 trim**，只认整行精确匹配 `reset` / `quit` / `exit`（新
+  pinned helper `classify_chat_line`，`include/cudalm/chat_cli.h`）；
+  只有真空行 `""` 被忽略（"empty line is ignored"，写入 help 与
+  README）；whitespace-only 非空行是 raw-text turn。② **binary-safe
+  输出**——generated text 原来用 `printf("%s")`（embedded NUL 处
+  截断），改为 length-aware 写（`write_binary_safe`，fwrite 基）；
+  显示换行仍为 UX-only，不进入 session / token history。修复 @
+  `482f4ae`（functional：`include/cudalm/chat_cli.h` +
+  `tools/cudalm_chat.cpp`）+ `bd8329a`（test：
+  `test_cudalm_chat_cli` 小 CPU 门——exact 命令识别全表 + embedded
+  NUL 逐字节）。修复后 `cmake --build build -j8` clean；targeted
+  `ctest -R "chat|scheduler|session" --output-on-failure`
+  **13/13**；CLI smoke（真实 checkpoint，`--max-new-tokens 16`）：
+  `reset` → reset 命令、` reset ` → raw text turn（+2 input，context
+  18 = 2+16）、`"   "` → raw text turn（+1 input，context 35 =
+  18+1+16）、其后两轮正常 text session（context 56 / 79 精确
+  累加）、`quit` 干净退出——四项语义全过。按评审意见不重跑
+  compute-sanitizer、不重跑全部历史 CUDA hard gates（本修复仅
+  CLI）。
 - **本阶段能力与限制（明说）**：text-level persistent Session API
   （薄 facade，不写 generation loop；verbatim / incremental / commit /
   no-half-turn contract）+ `cudalm-chat` 多轮 raw text demo + v0.8
