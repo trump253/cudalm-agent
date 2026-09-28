@@ -1,11 +1,17 @@
-# CUDALM v0.9 Serving Hardening — Phase A（serving admission / backpressure / resource guardrails）
+# CUDALM v0.9 Serving Hardening — Phase A + Phase B（serving admission / backpressure / resource guardrails + committed-token streaming / cancellation / deadline）
 
-> **状态：Phase A 完成（等待 external review）**。
+> **状态：Phase A 完成（external review PASS）；Phase B 完成（等待
+> external review）**。
 >
 > **Phase A 目标**：在冻结的 v0.8 persistent Session + Scheduler 之上
 > 增加一个明确的 **serving admission layer**——服务在资源不足时
 > **reject early / fail loud / zero mutation**，而不是先接收 request、
 > 最后在 GPU state allocation / forward 时才失败。
+>
+> **Phase B 目标**：在 serving layer 增加 **pull-based committed-token
+> streaming**、**explicit cancellation**、**per-request deadline**
+> （cooperative，scheduler step 边界）——保持单线程、单 CUDA stream，
+> 不引入 HTTP 或异步线程。
 >
 > 基线：`main` @ `1d6c83a8c5b64c92a8f4a8df4d750411dab3f36f`（v0.8
 > merge，tag `v0.8`）。开发分支：`v0.9-serving-hardening`。
@@ -162,7 +168,85 @@ ServingStats stats() const;      // 快照（live_* 读取时推导）
 const ServingLimits& limits() const;
 ```
 
-## 7. 测试
+## 7. Phase B：Committed-token Streaming（commit-before-visible）
+
+**硬约束：`sampled token != stream-visible token`**。SessionBound
+request 中 `generated` 可能含 sampled-but-pending token（0 或 1 个，
+frozen Phase C commit-then-stop contract）；**只有
+`generated[0 .. committed_generated)` 允许对外 streaming**：
+
+- token 只有在 **forward 成功、已经进入 Session KV / Delta /
+  position** 之后才能 emit；
+- **pending token 永远不 emit**（包括 forward failure 与 cancel 时）；
+- 每个 committed token **exactly once、按顺序** emit（serving-layer
+  的 per-request `emitted_count` cursor）；
+- **EOS / max-new 的最后 token 必须先 emit，再报告 terminal**
+  （frozen commit-then-stop 保证最后 token 先 committed 才 terminal）；
+- **pull-based**：controller 从不 push——token 只在 drive / poll
+  **drain** 时变得可见；
+- **不复制 generation loop**：继续驱动 frozen `Scheduler::step()`
+  （含 batched decode）；serving 层只做 drain 与事件包装。
+
+**API**（`ServingEvent` + 三个入口）：
+
+```cpp
+struct ServingEvent {
+  ServingEventKind kind;        // Token / RequestTerminal
+  RequestId request_id; SessionId session_id;
+  int token_id;                 // Token 事件
+  RequestStatus status; FinishReason finish_reason;  // Terminal 事件
+  bool deadline_exceeded;       // serving-layer termination reason
+};
+std::vector<ServingEvent> step_stream();   // 一次 frozen step + drain
+std::vector<ServingEvent> run_stream();    // 驱动到 quiescence（逐步 drain）
+Status poll(RequestId, std::vector<ServingEvent>*);  // 不 drive，单请求 drain
+```
+
+**多 request streaming**：A/B 多 Session 同时 live 时仍用现有
+scheduler / batched decode——一次 `Scheduler::step()` 可以让多个
+request 各自产生新的 committed token，serving 层**分别 drain**；每个
+request 的事件连续、有序，`RequestTerminal` 事件在该 request 的**所有
+Token 事件之后**；**无重复 / 无跨 request contamination**。
+
+## 8. Phase B：Cancellation（cancel preserves Session）
+
+`ServingController::cancel(request_id)` 透传 frozen scheduler
+（Waiting/Running → Cancelled；already-terminal 保持现有 idempotent
+contract）：
+
+- 后续**不得再 forward**；
+- **已 committed 且尚未 emit 的 token 可正常 drain**（cancel 不 reap
+  streaming bookkeeping——`poll` / 下一次 `step_stream` 仍可取走）；
+- **pending token 不得 emit**；
+- **Session 保持 live**，context / KV / Delta 保持**最后 committed
+  boundary**；
+- **request quota 正常释放**（derived live count，立即生效）；
+- **next turn 能从该 boundary 继续**。
+
+## 9. Phase B：Deadline（cooperative boundary between scheduler steps）
+
+- **monotonic clock**：`MonotonicClock`（抽象）+
+  `SystemMonotonicClock`；CPU test 注入 **fake clock**（构造参数，
+  `nullptr` = 系统时钟）；
+- **per-request deadline**：`admit_turn(..., deadline)`（默认
+  `time_point::max()` = 无 deadline）；
+- **语义固定**：**每次 scheduler step 之前检查 deadline**（`step` /
+  `run` / `step_stream` / `run_stream` 全部在 step 前检查）；已过期
+  → **cancel request before its next forward** → **no additional
+  token commit** → **session remains live**；
+- **deadline = cooperative boundary between scheduler steps**：不要求
+  中断已发出的 CUDA work，不做 kernel preemption；
+- **独立 termination reason**：`ServingEvent::deadline_exceeded`
+  （serving-layer 标志）——**不修改 frozen `FinishReason`**（scheduler
+  层面该 request 报告 Cancelled/Cancelled）。
+
+## 10. Phase B 当前限制
+
+streaming 目前是 **token-level（committed token IDs）**；**不做**
+text-byte streaming / incremental UTF-8 decoder / HTTP / OpenAI API /
+threads / async runtime（留给后续 Phase）。
+
+## 11. 测试
 
 - **`test_serving_admission`**（CPU contract gate：deterministic fake
   forwarder + 真实池 + 真实 SessionManager + Scheduler + controller）：
@@ -190,10 +274,33 @@ const ServingLimits& limits() const;
   reject（zero mutation）；clean teardown（所有 manager 池
   accounting 归零）。
 
-验收证据见 `docs/provenance.md` v0.9 Phase A 章节（绑定 exact SHA）。
+- **`test_serving_streaming`**（Phase B CPU contract gate：deterministic
+  fake forwarder + 真实池 + 真实 SessionManager / Scheduler +
+  controller streaming API）：pending g0 不可见 → forward 成功后才
+  emit；exactly-once（后续 poll 不再 emit）；max-new / EOS 最后
+  token 先 emit 再 terminal；**cancel**（committed prefix 可 drain、
+  pending 不 emit、cancel 后无 forward、session 保持 live、next turn
+  从 boundary 继续、quota 释放）；**deadline**（fake monotonic
+  clock：deadline 前正常推进、过期后 next step 前 cancel、不多
+  commit 一个 token、terminal 事件 `deadline_exceeded = true`）；
+  **A/B interleaving**（per-request 事件流 == 各自 final committed
+  ids、无跨 request contamination）；
+- **`test_serving_stream_integration`**（Phase B 真实 Qwen3.5-0.8B-
+  Base checkpoint integration gate）：A（greedy）/ B（seeded）两
+  Session **一起**经 `step_stream` 驱动（batched decode 路径——一次
+  step 为两个 request 提交、分别 drain）：每 turn **concatenated
+  streamed ids == request 最终 committed generated ids**（exactly
+  once、按序）；final context length 精确（6/5 → 10/9）；session
+  可继续下一 turn（turn 3，final A 13）；clean teardown（池
+  accounting 归零）。
 
-## 8. 当前 non-goals（Phase A 不做）
+验收证据见 `docs/provenance.md` v0.9 Phase A / Phase B 章节（绑定
+exact SHA）。
 
-streaming、deadline / timeout、TTL / LRU、eviction、HTTP server、
-OpenAI API、multi-stream、CUDA Graph、kernel 优化、chat template、
-动态 quota 系统——全部属于 v0.9 后续 Phase 或之后版本。
+## 12. 当前 non-goals（v0.9 Phase A/B 不做）
+
+streaming 目前是 **token-level**——**text-byte streaming /
+incremental UTF-8 decoder**、HTTP server、OpenAI API、threads / async
+runtime、multi-stream、TTL / LRU、eviction、chat template、CUDA
+Graph、kernel 优化、动态 quota 系统——全部属于 v0.9 后续 Phase 或
+之后版本。

@@ -1884,6 +1884,95 @@ state allocation / forward 时才失败。
 
 **Phase A 明确不做**（non-goals，属后续 Phase）：streaming、deadline
 / timeout、TTL / LRU、eviction、HTTP server、OpenAI API、multi-
-stream、CUDA Graph、kernel 优化、chat template、动态 quota 系统。
+stream、CUDA Graph、kernel 优化、chat template、动态 quota 系统
+（streaming / deadline 已在 Phase B 做入）。
+
+**Phase A 状态：external review PASS / FROZEN**（含 quota 三态
+review fix）。
+
+## CUDALM v0.9 Phase B（committed-token streaming + cancellation / deadline）
+
+**目标**：在 serving layer 增加 **pull-based committed-token
+streaming**、**explicit cancellation**、**per-request deadline**
+（cooperative，scheduler step 边界）——单线程、单 CUDA stream，不
+引入 HTTP 或异步线程。不修改模型数学、CUDA kernel 或 v0.8
+commit-then-stop 语义。
+
+**Commit**（分支 `v0.9-serving-hardening`，基于 Phase A final HEAD
+`38bbb729ca1e34b538c0c048973f1207fcf926a7`）：
+
+- Functional: `d99d5219166120efbac273ac44afa7725ea15bfe`
+  （`ServingController` 扩展：`ServingEvent` / `MonotonicClock` /
+  `SystemMonotonicClock`；`step_stream()` / `run_stream()` /
+  `poll(request_id)`；`admit_turn(..., deadline)`；cancel 不再
+  reap streaming bookkeeping；`step` / `run` 增加 pre-step deadline
+  检查；sync 清理 streaming bookkeeping。**零** frozen code 改动——
+  `Scheduler` / `SessionManager` / model 未动）
+- Tests: `1f37c1373b52a263f87046e883b4e2b7e6a51849`（新 CPU
+  contract gate `tests/cpu/test_serving_streaming.cpp` + 新真实
+  checkpoint integration gate
+  `tests/cuda/test_serving_stream_integration.cpp` +
+  `tests/CMakeLists.txt` 注册）
+
+**Contract**（详见 `docs/v09_serving_hardening.md` §7–§10）：
+
+- **Commit-before-visible（硬约束 `sampled token != stream-visible
+  token`）**：只有 `generated[0 .. committed_generated)`（forward
+  成功进入 Session KV / Delta / position）可 emit；pending 永不
+  emit（含 failure / cancel）；exactly once、按序（per-request
+  emitted cursor）；EOS / max-new 最后 token 先 emit 再 terminal；
+  pull-based（drive / poll drain 才可见）；继续驱动 frozen
+  `Scheduler::step()`（不复制 generation loop）；
+- **多 request**：一次 step 可多 request 各自新 committed token，
+  分别 drain；per-request 事件连续有序、terminal 在所有 token 之
+  后、无跨 request contamination；
+- **Cancellation**：Waiting/Running → Cancelled（frozen idempotent
+  contract 保留）；后续不再 forward；committed 未 emit prefix 可
+  drain；pending 不 emit；**Session 保持 live**（最后 committed
+  boundary）；quota 立即释放；next turn 从 boundary 继续；
+- **Deadline**：monotonic clock（可注入 fake clock）；
+  `admit_turn(..., deadline)`（默认无 deadline）；**每次 scheduler
+  step 之前检查**——过期 → cancel before its next forward → no
+  additional token commit → session 保持 live；**deadline =
+  cooperative boundary between scheduler steps**（无 CUDA
+  preemption）；serving-layer `deadline_exceeded` 标志（**不改
+  frozen `FinishReason`**——scheduler 层面报告 Cancelled/
+  Cancelled）。
+
+**测试**：
+
+- `test_serving_streaming`（CPU contract gate：deterministic fake
+  forwarder + 真实池 + 真实 SessionManager / Scheduler + streaming
+  API）：pending g0 不可见 → forward 成功后才 emit；exactly-once
+  （后续 poll 不再 emit）；max-new / EOS 最后 token 先 emit 再
+  terminal；cancel（committed prefix 可 drain、pending 不 emit、
+  cancel 后无 forward、session 保持 live、next turn 从 boundary
+  继续、quota 释放）；deadline（fake monotonic clock：deadline 前
+  推进、过期后 next step 前 cancel、不多 commit 一个 token、
+  `deadline_exceeded = true`）；A/B interleaving（per-request 事件
+  流 == 各自 final committed ids、无 contamination）；
+- `test_serving_stream_integration`（真实 Qwen3.5-0.8B-Base
+  checkpoint）：A（greedy）/ B（seeded）两 Session **一起**经
+  `step_stream` 驱动（batched decode 路径）：每 turn concatenated
+  streamed ids == 最终 committed generated ids（exactly once、按
+  序）；final length 精确（6/5 → 10/9）；session 继续 turn 3
+  （final A 13）；clean teardown（池 accounting 归零）。
+
+**验收**（本地验证，非 CI）：
+
+- `test_serving_streaming` → **PASS**（5 个 [ok] 用例）；
+- `test_serving_stream_integration`（真实 checkpoint）→ **PASS**；
+- targeted `ctest -R "stream|serving|scheduler|session"
+  --output-on-failure` → **16/16 PASS**（0 failed；Total 19.72
+  s；含 4 个 serving gate + 全部既有 scheduler/session 回归）；
+- 未修改 CUDA / model state path（frozen `Scheduler` /
+  `SessionManager` / model 零改动）→ 按 Phase B 验收标准**不**需要
+  full ctest / compute-sanitizer / profiling（full ctest 留到 v0.9
+  最终阶段）。
+
+**Phase B 明确不做**（non-goals，属后续 Phase）：text-byte
+streaming / incremental UTF-8 decoder、HTTP / OpenAI API、threads /
+async runtime、multi-stream、TTL / LRU、eviction、chat template、
+CUDA Graph、kernel 优化。
 
 **本阶段不 merge 进 main**——待 external review 签核。

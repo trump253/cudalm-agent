@@ -582,7 +582,7 @@ conv / Delta recurrent / position **全部保留**（只有 `reset_session` /
 
 ### Phase A：Serving Admission / Backpressure / Resource Guardrails
 
-**状态：Phase A 完成（等待 external review）**（分支
+**状态：Phase A 完成（external review PASS / FROZEN）**（分支
 `v0.9-serving-hardening`，从 `1d6c83a`（v0.8 merge）创建；**不**在
 main 开发，**不** merge）。
 
@@ -613,7 +613,42 @@ observability；frozen runtime 仍负责 correctness，零 frozen code
 
 Phase A **不做**：streaming、deadline / timeout、TTL / LRU、eviction、
 HTTP server、OpenAI API、multi-stream、CUDA Graph、kernel 优化、chat
-template、动态 quota 系统（属后续 Phase）。
+template、动态 quota 系统（streaming / deadline 已在 Phase B 做入，
+其余属后续 Phase）。
+
+### Phase B：Committed-token Streaming + Cancellation / Deadline
+
+**状态：Phase B 完成（等待 external review）**。
+
+在 `ServingController` 上增加（单线程、单 CUDA stream，无 HTTP / 无
+异步线程；不修改模型数学 / CUDA kernel / v0.8 commit-then-stop
+语义）：
+
+- **pull-based committed-token streaming**（`ServingEvent` +
+  `step_stream()` / `run_stream()` / `poll(request_id)`）：**commit-
+  before-visible**——只有 `generated[0 .. committed_generated)`
+  （forward 成功进入 Session KV / Delta / position 的 token）可
+  emit；**pending token 永不 emit**；每个 committed token
+  **exactly once、按序**；**EOS / max-new 最后 token 先 emit 再
+  报告 terminal**；继续驱动 frozen `Scheduler::step()`（不复制
+  generation loop）；
+- **explicit cancellation**：cancel 后不再 forward；committed 且未
+  emit 的 prefix 可正常 drain；pending 不 emit；**Session 保持
+  live**（context / KV / Delta 停在最后 committed boundary）；quota
+  正常释放；next turn 从 boundary 继续；
+- **per-request deadline**（monotonic clock，可注入 fake clock）：
+  **每次 scheduler step 之前检查**——过期 → cancel before its next
+  forward → no additional token commit → session 保持 live；
+  **deadline = cooperative boundary between scheduler steps**（不
+  preemption）；serving-layer 独立 termination reason
+  （`deadline_exceeded`，不改 frozen `FinishReason`）；
+- **多 request streaming**：A/B 同时 live 仍走 batched decode——一次
+  step 多 request 各自新 committed token，serving 层分别 drain，无
+  跨 request contamination。
+
+Phase B streaming 目前是 **token-level（committed token IDs）**：
+text-byte streaming / incremental UTF-8 decoder / HTTP / OpenAI API /
+threads 属后续 Phase。
 
 详见 [`docs/v09_serving_hardening.md`](docs/v09_serving_hardening.md)
 与 [`docs/provenance.md`](docs/provenance.md)（SHA 绑定证据）。
