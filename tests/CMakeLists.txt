@@ -438,6 +438,52 @@ add_test(NAME test_serving_integration
 set_tests_properties(test_serving_integration PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+# --- v0.9 Phase B: committed-token streaming + cancellation / deadline --
+# Pull-based committed-token streaming on the ServingController (COMMIT-
+# BEFORE-VISIBLE: only generated[0..committed_generated) is ever emitted;
+# the pending tail is never emitted; exactly once, in order; the final
+# EOS / max-new token is emitted before the terminal report), explicit
+# cancellation (committed prefix drainable, pending never emitted, the
+# session continues from the committed boundary), and cooperative per-
+# request deadlines (checked before each scheduler step; fake-monotonic-
+# clock injectable; a serving-layer deadline_exceeded termination reason).
+#
+# test_serving_streaming (CPU — NO checkpoint / NO model: the
+# deterministic fake forwarder + real pools + real SessionManager /
+# Scheduler): pending g0 invisible until its committing forward;
+# exactly-once (a later poll emits nothing); the final max-new / EOS
+# token emitted before RequestTerminal; cancel semantics (committed
+# prefix drainable, pending never emitted, no forward after the cancel,
+# the next turn continues from the committed boundary); deadline via a
+# fake monotonic clock (progress before expiry, cancel BEFORE the next
+# forward at expiry — no additional token commit, deadline_exceeded on
+# the terminal event); A/B interleaving (per-request event streams
+# concatenate to exactly their own final committed ids, no cross-request
+# contamination).
+cudalm_add_test(test_serving_streaming test_serving_streaming
+                cpu/test_serving_streaming.cpp)
+
+# test_serving_stream_integration (CUDA, REAL Qwen3.5-0.8B-Base
+# checkpoint): two sessions (A greedy / B seeded) run TOGETHER through
+# the controller's step_stream (the batched decode path — one
+# Scheduler::step commits for both; the serving layer drains them
+# separately): per turn the concatenated streamed token ids == the
+# request's final committed generated ids (exactly once, in order), the
+# final context lengths are exact (n + m), and the sessions CONTINUE to
+# the next turn from the committed boundary (turn 3 after streaming
+# turns 1-2); clean teardown (pool accounting to zero). Self-skips (77).
+add_executable(test_serving_stream_integration
+               cuda/test_serving_stream_integration.cpp)
+target_link_libraries(test_serving_stream_integration PRIVATE cudalm)
+add_test(NAME test_serving_stream_integration
+         COMMAND test_serving_stream_integration
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_serving_stream_integration PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 # --- Cross-language weight-file tests (Python tools -> C++ loader) ------------
 # tools/convert_weights.py (torch, offline) emits data/block_v01.cudalm into
 # the build tree; test_weights_crosslang loads it with the PyTorch-free C++
