@@ -1,2 +1,2 @@
 wrote /root/code/cudalm-agent/benchmarks/profiling/.nsys_e2e_report_final.txt
-benchmark complete (batched only): batched=0.1429s (logical=27 tokens)
+benchmark complete (batched only): batched=0.1378s (logical=27 tokens)

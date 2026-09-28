@@ -1,6 +1,6 @@
 # =============================================================================
 # CUDALM v0.7 Phase B (W4A16 GEMV optimization) — nsys — CONTINUOUS-BATCHED-ONLY serving profile AFTER the Phase-B dispatcher freeze (--mode batched, 1 warmup + 5 measured; Phase-A-comparable schedule)
-# V07B_FINAL_FUNCTIONAL evidence (tag: final) at exact SHA: bde72f4389c524b0b7b522804a5d0340d9f6ace2
+# V07B_FINAL_FUNCTIONAL evidence (tag: final) at exact SHA: 46a59984a70a42b8baedf017d4bdcaa14edc91e1
 # tree state: tracked tree CLEAN at generation (no modified/deleted
 #             tracked files; untracked = evidence outputs of this run)
 # GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
@@ -9,7 +9,7 @@
 # workload: 4 requests (prompts 2/5/3/4 tok; max_new 3/6/5/3;
 #           1 greedy + 3 seeded); dynamic arrival A,B -> C -> D;
 #           serial prefill, true batched decode, single stream
-# date: 2026-09-27T15:30:33Z
+# date: 2026-09-28T01:09:40Z
 # =============================================================================
 Processing [/root/code/cudalm-agent/benchmarks/profiling/v07b_final_batched_nsys.sqlite] with [/opt/nvidia/nsight-systems/2022.4.2/host-linux-x64/reports/gpumemtimesum.py]... 
 
@@ -17,8 +17,8 @@ Processing [/root/code/cudalm-agent/benchmarks/profiling/v07b_final_batched_nsys
 
  Time (%)  Total Time (ns)  Count  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)      Operation     
  --------  ---------------  -----  --------  --------  --------  --------  -----------  ------------------
-     78.5        125183739   1592   78633.0    1056.0       927  64070994    1611109.0  [CUDA memcpy HtoD]
-     12.6         20031306   9438    2122.4    2016.0      1695     13632        468.8  [CUDA memcpy DtoD]
-      6.4         10291511   2148    4791.2    2048.0       991    471841      34546.8  [CUDA memset]     
-      2.5          4057669     72   56356.5   38976.0     38624    129121      30470.3  [CUDA memcpy DtoH]
+     77.7        121181086   1592   76118.8    1088.0       927  61592697    1548844.8  [CUDA memcpy HtoD]
+     13.1         20463810   9438    2168.2    2016.0      1536     12192        346.8  [CUDA memcpy DtoD]
+      6.6         10363862   2148    4824.9    2048.0       991    471489      34539.9  [CUDA memset]     
+      2.6          3981129     72   55293.5   39057.0     38656    117152      29437.7  [CUDA memcpy DtoH]
 

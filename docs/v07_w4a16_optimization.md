@@ -12,7 +12,7 @@ re-benchmarked/reproduced. The rejection reason is a failed E2E
 acceptance criterion: at the exact candidate SHA the W4A16 kernel family
 drops ≈ −4.9% drift-corrected, but the canonical continuous-batched E2E
 improvement (50 vs 50 independent measured runs, Welch two-sided
-p = 0.495) is **indistinguishable from noise** (§8, §9). This is the
+p = 0.284) is **indistinguishable from noise** (§8, §9). This is the
 "REJECTED, baseline retained" outcome the Phase-B criteria anticipate.
 
 **SHA chain (this document):**
@@ -186,7 +186,7 @@ cooperative scheme.
   on the activation base; batch rows are 16B-aligned by construction).
 
 Full ctest at both exact SHAs: **61/61 passed, 0 failed, 0 skipped**
-(candidate SHA: 548.27 s; final SHA: 534.88 s; including all existing
+(candidate SHA: 548.27 s; final SHA: 537.79 s; including all existing
 single/batched/continuous/state-isolation/scheduler tests). The
 real-checkpoint FULL-logits / token-ID / hybrid-state EXACT gates are the
 existing suite's (unchanged oracle; the production path IS the frozen
@@ -202,33 +202,33 @@ mean/median/min/p90 µs, µs/token, speedup, regs). A third raw run at
 Per-cell values vary between sessions with GPU clock/thermal state (the
 cross-session-stable numbers are the weighted totals below and the NCU
 durations); rankings do not flip except at N=512 B=1, where R2 stays the
-winner in every run (1.17×–1.47× across runs).
+winner in every committed run (1.15×–1.47× across runs).
 
 Per-shape geo-mean speedup over B=1/2/3 (from the two committed runs):
 
 | shape (N,K) | R1 run1 / run2 | R2 run1 / run2 | R8 run1 / run2 |
 |---|---|---|---|
-| 16,1024 | **1.41 / 1.31** | 1.27 / 1.21 | 0.72 / 0.68 |
-| 512,1024 | 1.02 / 1.07 | **1.06 / 1.12** | 0.76 / 0.76 |
-| 1024,2048 | 0.85 / 0.96 | 0.97 / 1.09 | 0.88 / 0.95 |
-| 1024,3584 | 0.83 / 0.84 | 0.98 / 0.99 | 0.89 / 0.89 |
-| 2048,1024 | 0.84 / 0.84 | 0.93 / 0.93 | 0.90 / 0.90 |
-| 3584,1024 | 0.83 / 0.82 | 0.94 / 0.94 | 0.97 / 0.97 |
-| 4096,1024 | 0.81 / 0.80 | 0.93 / 0.93 | 0.99 / 0.99 |
+| 16,1024 | **1.40 / 1.33** | 1.33 / 1.24 | 0.76 / 0.72 |
+| 512,1024 | 1.02 / 1.03 | **1.04 / 1.06** | 0.75 / 0.76 |
+| 1024,2048 | 0.86 / 0.86 | 0.97 / 0.98 | 0.88 / 0.87 |
+| 1024,3584 | 0.84 / 0.84 | 0.99 / 0.99 | 0.89 / 0.90 |
+| 2048,1024 | 0.84 / 0.84 | 0.94 / 0.94 | 0.90 / 0.90 |
+| 3584,1024 | 0.84 / 0.83 | 0.95 / 0.95 | 0.97 / 0.97 |
+| 4096,1024 | 0.80 / 0.80 | 0.93 / 0.93 | 0.99 / 0.99 |
 | 6144,1024 | 0.78 / 0.78 | 0.91 / 0.91 | 0.92 / 0.92 |
 
 (regs: frozen 56/58 (B=1/batch), R1 47, R2 53, R8 63.)
 
 Table-selected cells (the shapes the measured table changes):
 
-| cell | frozen (µs) | selected | run1 speedup | run2 speedup |
+| cell | frozen run1/run2 (µs) | selected | run1 speedup | run2 speedup |
 |---|---|---|---|---|
-| N=16 B=1 | 7.24 | R1 | 1.42× | 1.28× |
-| N=16 B=2 | 7.19 | R1 | 1.42× | 1.33× |
-| N=16 B=3 | 7.19 | R1 | 1.40× | 1.32× |
-| N=512 B=1 | 7.96 | R2 | 1.17× | 1.19× |
-| N=512 B=2 | 6.51 | R2 | 1.09× | 1.10× |
-| N=512 B=3 | 6.83 | frozen (R2 = 0.94× in run1) | — | — |
+| N=16 B=1 | 7.27 / 5.68 | R1 | 1.42× | 1.32× |
+| N=16 B=2 | 7.14 / 5.84 | R1 | 1.40× | 1.32× |
+| N=16 B=3 | 7.13 / 5.60 | R1 | 1.38× | 1.33× |
+| N=512 B=1 | 6.90 / 6.35 | R2 | 1.15× | 1.17× |
+| N=512 B=2 | 7.09 / 6.39 | R2 | 1.09× | 1.08× |
+| N=512 B=3 | 7.06 / 6.80 | frozen (R2 = 0.90× / 0.95×) | — | — |
 
 **Weighted production score** (census call rates × B distribution
 0.864:0.045:0.091; `W_Bx = Σ calls/trav × mean(shape,B)`, overall =
@@ -236,14 +236,14 @@ Table-selected cells (the shapes the measured table changes):
 
 | variant | run1 overall (µs/trav) | vs frozen run1 | run2 overall | vs frozen run2 |
 |---|---|---|---|---|
-| frozen R4 (all shapes) | 1733.404 | — | 1715.527 | — |
-| R1 everywhere | 1894.950 | +9.32% (worse) | 1899.011 | +10.70% (worse) |
-| R2 everywhere | 1740.643 | +0.42% | 1726.603 | +0.65% |
-| R8 everywhere | 2003.717 | +15.59% (worse) | 1995.538 | +16.32% (worse) |
-| **measured table** (N=16→R1; N=512 B=1/2→R2; else frozen) | **1647.373** | **−4.96%** | **1655.080** | **−3.52%** |
+| frozen R4 (all shapes) | 1756.088 | — | 1662.740 | — |
+| R1 everywhere | 1909.388 | +8.73% (worse) | 1851.218 | +11.34% (worse) |
+| R2 everywhere | 1750.549 | −0.32% | 1679.515 | +1.01% |
+| R8 everywhere | 2017.406 | +14.88% (worse) | 1903.335 | +14.47% (worse) |
+| **measured table** (N=16→R1; N=512 B=1/2→R2; else frozen) | **1669.857** | **−4.91%** | **1602.672** | **−3.61%** |
 
-measured-table by batch class (run1 / run2): B=1 −5.46% / −3.88%,
-B=2 −3.78% / −2.75%, B=3 −2.69% / −1.91%. The measured-table row is
+measured-table by batch class (run1 / run2): B=1 −5.43% / −4.01%,
+B=2 −3.65% / −2.63%, B=3 −2.54% / −1.87%. The measured-table row is
 recomputed from the raw per-cell data of each committed run (table
 selection applied per shape/B). The reviewer's hypothesis is confirmed
 shape-by-shape: R=1 wins only at the degenerate small-N shape, R=2 only
@@ -309,7 +309,7 @@ artifact:
 |---|---|---|---|---|---|
 | Phase A (frozen baseline) | `a9b5a6e` | 220.581 | 42.72% | 516.364 | 58422 |
 | **candidate** (measured table in runtime) | `V07B_CANDIDATE_SHA` | **213.796** | 41.53% | 514.781 | 58422 |
-| **final** (production reverted, direct frozen R4) | `V07B_FINAL_FUNCTIONAL_SHA` | **219.819** | 42.71% | 514.646 | 58422 |
+| **final** (production reverted, direct frozen R4) | `V07B_FINAL_FUNCTIONAL_SHA` | **225.292** | 42.83% | 525.986 | 58422 |
 
 Candidate per-kernel rows (the measured kernels really execute — the
 frozen N=16/N=512-B1/B2 rows disappear and reappear as R1/R2 grids):
@@ -333,13 +333,15 @@ B=2/B=3 — the GPU was running slightly slower in this session. The
 observed family delta (−6.786 ms, −3.08%) minus the B=1 drift on the
 unchanged cells gives a drift-corrected W4A16 reduction of
 **≈ −10.85 ms (−4.9%)** — consistent with the microbench weighted
-(−4.96%/−3.52%) and the NCU per-target numbers (−47%/−44%/−23%/−15% on
+(−4.91%/−3.61%) and the NCU per-target numbers (−47%/−44%/−23%/−15% on
 the changed cells).
 
 **Final state proof:** the final nsys contains **only** frozen
 `int4gemv_rowtile4`/`batch_int4gemv_rowtile4` W4A16 kernels (verified:
-zero non-rowtile4 int4gemv kernel rows); W4A16 219.819 ms / 42.71% vs
-Phase A 220.581 / 42.72% (−0.35% = run drift), launches 58422 identical.
+zero non-rowtile4 int4gemv kernel rows); W4A16 225.292 ms / 42.83% vs
+Phase A 220.581 / 42.72% (+2.1% = session drift, i.e. this baseline run is
+slower than the Phase-A session — no improvement claimed), launches 58422
+identical.
 Chain proven: candidate measured → candidate rejected → production
 reverted.
 
@@ -362,22 +364,22 @@ Pooled per-run analysis (from the committed raw samples):
 
 | side | n | mean (ms) | median (ms) | sd (ms) | min (ms) | max (ms) |
 |---|---|---|---|---|---|---|
-| baseline (final, direct R4) | 50 | 110.359 | 109.291 | 2.172 | 108.112 | 115.176 |
+| baseline (final, direct R4) | 50 | 110.654 | 109.870 | 2.278 | 108.191 | 118.953 |
 | candidate (measured table) | 50 | 109.853 | 108.127 | 4.734 | 106.283 | 136.363 |
-| Δ (candidate − baseline) | | **−0.506 (−0.46%)** | **−1.164** | | | |
+| Δ (candidate − baseline) | | **−0.802 (−0.72%)** | **−1.743** | | | |
 
 Welch two-sample t (pooled sample variances, Welch–Satterthwaite df,
 two-sided p from the t distribution):
 
-* **t = −0.687, df = 68.8, p = 0.495 → indistinguishable from zero.**
+* **t = −1.079, df = 70.5, p = 0.284 → indistinguishable from zero.**
 
 Interpretation: the GPU-side savings are real and accounted for (W4A16
 family −4.9% drift-corrected ≈ ≈1.9 ms per 22-traversal run, §7; Phase
 A: GPU kernels are ~79% of the 109 ms wall, the rest is CPU/launch/sync
 gap), but the canonical workload is short (22 traversals/run) and its
-per-run wall noise (sd 2.2–4.7 ms, with within-invocation thermal drift
+per-run wall noise (sd 2.3–4.7 ms, with within-invocation thermal drift
 of a few ms; the candidate side shows one 136 ms outlier run) exceeds the
-~0.5%-of-wall effect. **Conclusion: the E2E improvement is
+~0.7%-of-wall effect. **Conclusion: the E2E improvement is
 indistinguishable from noise** → the E2E acceptance criterion fails →
 REJECT (§9). (Earlier dev-round A/B tables are deliberately NOT
 reported here: they came from uncommitted builds and their pooled t
@@ -388,10 +390,10 @@ used.)
 
 | candidate | shapes | microbench (weighted, run1/run2) | nsys (candidate, committed) | E2E | decision |
 |---|---|---|---|---|---|
-| R1 (all shapes) | — | +9.32% / +10.70% (worse) | — | — | **REJECT** (loses on 6/8 shapes) |
-| R2 (all shapes) | — | +0.42% / +0.65% | — | — | **REJECT** (≈ neutral weighted; loses on 4/8, flat on 2) |
-| R8 (any) | any | +15.59% / +16.32% (worse) | — | — | **REJECT** (register pressure; loses on every shape) |
-| measured table (R1 @ N=16; R2 @ N=512 B=1/B=2) | 60+24 calls/trav | **−4.96% / −3.52%** | family −3.08% raw / **−4.9% drift-corrected** | pooled n=50/50, **p = 0.495** | **REJECTED for production** (E2E within noise) |
+| R1 (all shapes) | — | +8.73% / +11.34% (worse) | — | — | **REJECT** (loses on 6/8 shapes) |
+| R2 (all shapes) | — | −0.32% / +1.01% | — | — | **REJECT** (≈ neutral weighted; loses on 4/8, flat on 2) |
+| R8 (any) | any | +14.88% / +14.47% (worse) | — | — | **REJECT** (register pressure; loses on every shape) |
+| measured table (R1 @ N=16; R2 @ N=512 B=1/B=2) | 60+24 calls/trav | **−4.91% / −3.61%** | family −3.08% raw / **−4.9% drift-corrected** | pooled n=50/50, **p = 0.284** | **REJECTED for production** (E2E within noise) |
 | B-tiled weight-reuse (same row, multiple b, W fragment shared in registers) | N≥1024 batch | not implemented | — | — | **REJECT without implementation** (reviewer: complexity high / gain unclear, don't dig): NCU shows the batch kernels at large N are SM-leaning (44% SM / 12.7% DRAM, not DRAM-bound) and already enjoy cross-b L2 weight reuse (70% L2 hit); expected gain bounded, register cost high (acc[R][B]) |
 
 **Decision:** the candidate is **REJECTED for production**.
@@ -399,10 +401,10 @@ Acceptance-criterion mapping:
 
 1. all EXACT gates PASS — yes (9808 checks, 0 mismatches; ctest 61/61 at
    both SHAs);
-2. weighted W4A16 clearly improves — yes (−4.96%/−3.52% microbench;
+2. weighted W4A16 clearly improves — yes (−4.91%/−3.61% microbench;
    −4.9% nsys drift-corrected);
 3. **canonical continuous-batched E2E median improvement reproducible —
-   NO** (pooled n=50/50, Δmedian −1.164 ms, Welch p = 0.495);
+   NO** (pooled n=50/50, Δmedian −1.743 ms, Welch p = 0.284);
 4. no major regression on high-frequency shapes — yes (none).
 
 Criterion 3 fails → "do not claim success" → per the criteria the code
@@ -480,12 +482,12 @@ drift at HEAD — same EXACT-SHA discipline as Phase A).
 |---|---|---|
 | authoritative shape census (186 calls/trav, reconciles Phase-A CSV) | `V07B_KERNEL_EXPERIMENT_SHA` | `benchmarks/profiling/v07b_w4a16_shape_census.txt` |
 | microbench raw (3rd run) | `V07B_KERNEL_EXPERIMENT_SHA` | `benchmarks/v07b_w4a16_microbench.txt` |
-| microbench raw run 1 / run 2 (weighted −4.96% / −3.52%) | `V07B_FINAL_FUNCTIONAL_SHA` | `benchmarks/v07b_w4a16_microbench_run1.txt` / `_run2.txt` |
+| microbench raw run 1 / run 2 (weighted −4.91% / −3.61%) | `V07B_FINAL_FUNCTIONAL_SHA` | `benchmarks/v07b_w4a16_microbench_run1.txt` / `_run2.txt` |
 | NCU before/after (11 targets) | `V07B_KERNEL_EXPERIMENT_SHA` | `benchmarks/profiling/v07b_ncu_*.txt` |
 | candidate batched-only nsys (R1 N=16 + R2 N=512 kernels present) | `V07B_CANDIDATE_SHA` | `benchmarks/profiling/v07b_candidate_batched_nsys.*` |
 | candidate kernel families (W4A16 213.796 ms / 41.53%) | `V07B_CANDIDATE_SHA` | `benchmarks/profiling/v07b_candidate_kernel_families.txt` |
 | candidate E2E raw (5 invocations × 10 measured, n=50) | `V07B_CANDIDATE_SHA` | `benchmarks/v07b_candidate_e2e.txt` |
-| final production nsys (R4-only kernels; W4A16 219.819 ms / 42.71%) | `V07B_FINAL_FUNCTIONAL_SHA` | `benchmarks/profiling/v07b_final_batched_nsys.*` |
+| final production nsys (R4-only kernels; W4A16 225.292 ms / 42.83%) | `V07B_FINAL_FUNCTIONAL_SHA` | `benchmarks/profiling/v07b_final_batched_nsys.*` |
 | final kernel families | `V07B_FINAL_FUNCTIONAL_SHA` | `benchmarks/profiling/v07b_final_kernel_families.txt` |
 | final production E2E raw (5 invocations × 10 measured, n=50) | `V07B_FINAL_FUNCTIONAL_SHA` | `benchmarks/v07b_final_e2e.txt` |
 | sanitizer memcheck (13 targets, 0 errors) | `V07B_FINAL_FUNCTIONAL_SHA` | `benchmarks/profiling/sanitizer_v07b_w4a16.txt` |
@@ -494,7 +496,7 @@ drift at HEAD — same EXACT-SHA discipline as Phase A).
 Verification at `V07B_CANDIDATE_SHA`: build clean; ctest 61/61 (0 failed
 / 0 skipped, 548.27 s); `check_no_torch` CLEAN.
 Verification at `V07B_FINAL_FUNCTIONAL_SHA`: build clean; ctest 61/61
-(0 failed / 0 skipped, 534.88 s); `check_no_torch` CLEAN; sanitizer
+(0 failed / 0 skipped, 537.79 s); `check_no_torch` CLEAN; sanitizer
 13/13 `ERROR SUMMARY: 0 errors` (B=1 optimized shapes N=16/N=512 ×
 R1/R2/R8, B=2/3 batch shapes, small-N edges N=1/3, full parity test
 driving the variants + experimental dispatcher on all shapes × B=1/2/3).

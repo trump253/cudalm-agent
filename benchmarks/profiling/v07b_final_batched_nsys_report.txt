@@ -23,12 +23,12 @@ timing:
 results (per-run metrics are identical across measured runs for this fixed workload; wall time is summarized):
 
   mode B — SCHEDULER CONTINUOUS BATCHED (dynamic arrivals):
-    wall_time_s mean:   0.142945
-    wall_time_s median: 0.142991
-    wall_time_s min:    0.136011
-    wall_time_s max:    0.153800
+    wall_time_s mean:   0.137778
+    wall_time_s median: 0.136102
+    wall_time_s min:    0.133132
+    wall_time_s max:    0.146384
     logical_tokens: 27
-    logical_tokens_per_s (mean): 188.884358
+    logical_tokens_per_s (mean): 195.967250
     single_forward_calls: 19
     successful_single_forward_calls: 19
     batch_forward_calls: 3
@@ -54,8 +54,8 @@ notes:
   * Numbers are for THIS environment / checkpoint / workload only; they are not a general performance conclusion.
 
 per-measured-run wall_time_s:
-  run 1: batched=0.153800s
-  run 2: batched=0.144787s
-  run 3: batched=0.136011s
-  run 4: batched=0.137134s
-  run 5: batched=0.142991s
+  run 1: batched=0.146384s
+  run 2: batched=0.135748s
+  run 3: batched=0.133132s
+  run 4: batched=0.136102s
+  run 5: batched=0.137523s

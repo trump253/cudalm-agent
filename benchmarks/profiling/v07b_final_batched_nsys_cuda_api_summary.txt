@@ -1,6 +1,6 @@
 # =============================================================================
 # CUDALM v0.7 Phase B (W4A16 GEMV optimization) — nsys — CONTINUOUS-BATCHED-ONLY serving profile AFTER the Phase-B dispatcher freeze (--mode batched, 1 warmup + 5 measured; Phase-A-comparable schedule)
-# V07B_FINAL_FUNCTIONAL evidence (tag: final) at exact SHA: bde72f4389c524b0b7b522804a5d0340d9f6ace2
+# V07B_FINAL_FUNCTIONAL evidence (tag: final) at exact SHA: 46a59984a70a42b8baedf017d4bdcaa14edc91e1
 # tree state: tracked tree CLEAN at generation (no modified/deleted
 #             tracked files; untracked = evidence outputs of this run)
 # GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
@@ -9,7 +9,7 @@
 # workload: 4 requests (prompts 2/5/3/4 tok; max_new 3/6/5/3;
 #           1 greedy + 3 seeded); dynamic arrival A,B -> C -> D;
 #           serial prefill, true batched decode, single stream
-# date: 2026-09-27T15:30:33Z
+# date: 2026-09-28T01:09:40Z
 # =============================================================================
 Processing [/root/code/cudalm-agent/benchmarks/profiling/v07b_final_batched_nsys.sqlite] with [/opt/nvidia/nsight-systems/2022.4.2/host-linux-x64/reports/cudaapisum.py]... 
 
@@ -17,13 +17,13 @@ Processing [/root/code/cudalm-agent/benchmarks/profiling/v07b_final_batched_nsys
 
  Time (%)  Total Time (ns)  Num Calls   Avg (ns)     Med (ns)    Min (ns)   Max (ns)   StdDev (ns)           Name         
  --------  ---------------  ---------  -----------  -----------  ---------  ---------  -----------  ----------------------
-     37.4        435507591      11102      39227.9       7834.0       3567   64162006     649545.8  cudaMemcpyAsync       
-     26.5        308241699      58422       5276.1       4874.0       3968    1069779       5364.9  cudaLaunchKernel      
-     22.0        256066406          1  256066406.0  256066406.0  256066406  256066406          0.0  cudaStreamCreate      
-      9.1        105356186       2612      40335.4       4160.5       1845    3907278     176945.8  cudaFree              
-      4.1         47796588       2612      18298.8       3807.0       1906     361972      43473.3  cudaMalloc            
-      0.9         10533466       2148       4903.8       4593.5       2465      51545       3415.5  cudaMemsetAsync       
-      0.0           281200         83       3388.0       3206.0       1108      17642       1779.0  cudaStreamSynchronize 
-      0.0            15519          1      15519.0      15519.0      15519      15519          0.0  cudaStreamDestroy     
-      0.0             1477          1       1477.0       1477.0       1477       1477          0.0  cuModuleGetLoadingMode
+     38.2        442941156      11102      39897.4       6690.0       3305   61670550     639528.6  cudaMemcpyAsync       
+     25.6        296405846      58422       5073.5       4770.0       4079    1205878       5761.2  cudaLaunchKernel      
+     21.8        252962320          1  252962320.0  252962320.0  252962320  252962320          0.0  cudaStreamCreate      
+      9.1        105162279       2612      40261.2       4003.0       1732    4632816     249180.5  cudaFree              
+      4.4         51548332       2612      19735.2       3761.0       1785    4190247      96592.6  cudaMalloc            
+      0.8          9735041       2148       4532.1       4390.0       2370      36144       2865.3  cudaMemsetAsync       
+      0.0           251100         83       3025.3       2956.0       1189      11562       1120.3  cudaStreamSynchronize 
+      0.0            15137          1      15137.0      15137.0      15137      15137          0.0  cudaStreamDestroy     
+      0.0             1616          1       1616.0       1616.0       1616       1616          0.0  cuModuleGetLoadingMode
 
