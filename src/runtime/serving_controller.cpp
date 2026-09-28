@@ -129,16 +129,27 @@ Status ServingController::step_drive_(std::vector<ServingEvent>* out) {
   check_deadlines_();
   // (2) THE FROZEN SCHEDULER STEP (batched decode etc. — untouched).
   Status s = sched_.step();
-  // (3) DRAIN (optionally): every tracked request's newly committed
+  // (3) Record the ids that are terminal NOW (for the drive-loop
+  // pending-event pass): a terminal request's stream state must stay
+  // drainable until it is fully drained (review fix).
+  for (RequestId id : tracked_) {
+    const Request* r = sched_.get(id);
+    if (r != nullptr && is_terminal(r->status)) terminal_pending_.insert(id);
+  }
+  // (4) DRAIN (optionally): every tracked request's newly committed
   // tokens (exactly once, in order) + terminal events (after all the
   // request's tokens). Failures surface as RequestTerminal(Failed).
+  // A fully-drained terminal request reaps ITS bookkeeping (and
+  // erases itself from tracked_ — so iterate a SNAPSHOT).
   if (out != nullptr) {
-    for (RequestId id : tracked_) {
+    const std::vector<RequestId> snapshot = tracked_;
+    for (RequestId id : snapshot) {
       const Request* r = sched_.get(id);
       if (r != nullptr) drain_(r, out);
     }
   }
-  // (4) QUOTA SYNC (reap terminal requests + their bookkeeping).
+  // (5) QUOTA SYNC (defensive reap only — terminal requests stay
+  // drainable; see sync()).
   sync();
   return s;
 }
@@ -178,9 +189,20 @@ Status ServingController::run() {
   const std::uint64_t bound = run_bound(tracked_, sched_);
   Status first_error;
   for (std::uint64_t i = 0;; ++i) {
-    if (live_request_count() == 0) break;
-    CUDALM_PRECONDITION(i <= bound,
+    if (live_request_count() == 0 && terminal_pending_.empty()) break;
+    CUDALM_PRECONDITION(i <= bound + tracked_.size() + 1,
                         "serving: run did not converge (logic bug)");
+    // (a) Drain the PENDING terminal events (the events are discarded
+    //     here — the caller of run() is not streaming; they can still
+    //     be polled afterwards). A fully-drained id erases itself from
+    //     terminal_pending_ — iterate a SNAPSHOT:
+    const std::set<RequestId> pending_snapshot = terminal_pending_;
+    for (RequestId id : pending_snapshot) {
+      const Request* r = sched_.get(id);
+      if (r != nullptr) drain_(r, nullptr);
+    }
+    if (live_request_count() == 0) break;  // only pending events left
+    // (b) THE FROZEN STEP (deadline check first):
     Status s = step_drive_(nullptr);
     if (!s.ok && first_error.ok) first_error = s;  // record + CONTINUE
   }
@@ -191,9 +213,23 @@ std::vector<ServingEvent> ServingController::run_stream() {
   const std::uint64_t bound = run_bound(tracked_, sched_);
   std::vector<ServingEvent> all;
   for (std::uint64_t i = 0;; ++i) {
-    if (live_request_count() == 0) break;
-    CUDALM_PRECONDITION(i <= bound,
+    if (live_request_count() == 0 && terminal_pending_.empty()) break;
+    CUDALM_PRECONDITION(i <= bound + tracked_.size() + 1,
                         "serving: run_stream did not converge (logic bug)");
+    // (a) Drain the PENDING terminal events first — a terminal-but-
+    //     not-yet-drained request must NOT lose its remaining events
+    //     just because live_requests is already 0 (review fix):
+    const std::set<RequestId> pending_snapshot = terminal_pending_;
+    for (RequestId id : pending_snapshot) {
+      const Request* r = sched_.get(id);
+      if (r != nullptr) {
+        std::vector<ServingEvent> ev;
+        drain_(r, &ev);
+        all.insert(all.end(), ev.begin(), ev.end());
+      }
+    }
+    if (live_request_count() == 0) break;  // only pending events left
+    // (b) THE FROZEN STEP (deadline check first) + its drain:
     std::vector<ServingEvent> ev;
     (void)step_drive_(&ev);  // failures ride in as RequestTerminal events
     all.insert(all.end(), ev.begin(), ev.end());
@@ -203,11 +239,16 @@ std::vector<ServingEvent> ServingController::run_stream() {
 
 Status ServingController::poll(RequestId request_id,
                                std::vector<ServingEvent>* out) {
-  // WITHOUT driving: drain ONE tracked (not yet reaped) request.
+  // WITHOUT driving: drain ONE tracked (not yet fully drained)
+  // request. Pinned exactly-once semantics: a request's events are
+  // emitted at most ONCE across poll / step_stream / run_stream
+  // combined; a poll of an unknown or ALREADY-FULLY-DRAINED request
+  // id errors (the fully-drained reap removes it from the tracked
+  // set).
   if (std::find(tracked_.begin(), tracked_.end(), request_id) ==
       tracked_.end()) {
-    return Status::error("serving: poll: unknown or already-reaped request "
-                         "id " + std::to_string(request_id));
+    return Status::error("serving: poll: unknown or already-fully-drained "
+                         "request id " + std::to_string(request_id));
   }
   const Request* r = sched_.get(request_id);
   CUDALM_PRECONDITION(r != nullptr,
@@ -246,17 +287,22 @@ void ServingController::drain_(const Request* r,
   // COMMIT-BEFORE-VISIBLE: only generated[0 .. committed_generated) is
   // ever emitted (the pending tail — sampled, not committed — is never
   // emitted). Exactly once (the cursor only advances), in order.
+  // `out == nullptr` = drain-and-DISCARD (the non-streaming run() pass):
+  // the cursor still advances and a fully-drained terminal request is
+  // still reaped — the events simply go nowhere.
   const int committed = r->committed_generated;
   int emitted = 0;
   const auto eit = emitted_.find(r->id);
   if (eit != emitted_.end()) emitted = eit->second;
-  for (int i = emitted; i < committed; ++i) {
-    ServingEvent e;
-    e.kind = ServingEventKind::Token;
-    e.request_id = r->id;
-    e.session_id = r->session_id;
-    e.token_id = r->generated[static_cast<std::size_t>(i)];
-    out->push_back(e);
+  if (out != nullptr) {
+    for (int i = emitted; i < committed; ++i) {
+      ServingEvent e;
+      e.kind = ServingEventKind::Token;
+      e.request_id = r->id;
+      e.session_id = r->session_id;
+      e.token_id = r->generated[static_cast<std::size_t>(i)];
+      out->push_back(e);
+    }
   }
   if (emitted != committed) emitted_[r->id] = committed;
   // TERMINAL (if it is one): ONE RequestTerminal event, and only AFTER
@@ -265,40 +311,59 @@ void ServingController::drain_(const Request* r,
   // scheduler reports terminal, so it is always emitted first).
   if (is_terminal(r->status) &&
       terminal_reported_.find(r->id) == terminal_reported_.end()) {
-    ServingEvent e;
-    e.kind = ServingEventKind::RequestTerminal;
-    e.request_id = r->id;
-    e.session_id = r->session_id;
-    e.status = r->status;
-    e.finish_reason = r->finish_reason;
-    e.deadline_exceeded = deadline_cancelled_.find(r->id) !=
-                          deadline_cancelled_.end();
-    out->push_back(e);
+    if (out != nullptr) {
+      ServingEvent e;
+      e.kind = ServingEventKind::RequestTerminal;
+      e.request_id = r->id;
+      e.session_id = r->session_id;
+      e.status = r->status;
+      e.finish_reason = r->finish_reason;
+      e.deadline_exceeded = deadline_cancelled_.find(r->id) !=
+                            deadline_cancelled_.end();
+      out->push_back(e);
+    }
     terminal_reported_.insert(r->id);
+    // FULLY DRAINED: only NOW is the terminal request's bookkeeping
+    // reaped (review fix: terminal != streaming state destroyed — the
+    // committed tokens + the terminal event must stay drainable until
+    // they are consumed exactly once; the LIVE/QUOTA lifecycle is
+    // unaffected — a terminal request never counts as live).
+    tracked_.erase(std::remove(tracked_.begin(), tracked_.end(), r->id),
+                   tracked_.end());
+    terminal_pending_.erase(r->id);
+    emitted_.erase(r->id);
+    terminal_reported_.erase(r->id);
+    deadline_.erase(r->id);
+    deadline_cancelled_.erase(r->id);
   }
 }
 
 void ServingController::sync() {
-  // Reap tracked requests that reached a terminal state. Idempotent:
-  // a request is removed once and can never be reaped twice (there is
-  // no counter that could double-decrement — the live count is derived
-  // from `tracked_` + the scheduler's status). Reaping also removes
-  // the request's streaming / deadline bookkeeping.
-  std::vector<RequestId> live;
-  live.reserve(tracked_.size());
+  // Reap tracked requests whose scheduler state is GONE (defensive;
+  // the normal reap is the fully-drained terminal path in drain_).
+  // REVIEW FIX (streaming lifecycle): a TERMINAL request is NOT reaped
+  // here — its committed-but-not-yet-emitted tokens + its (not yet
+  // emitted) terminal event must stay drainable until they are
+  // consumed EXACTLY ONCE. The live/quota lifecycle is unaffected:
+  // the live count is derived from the scheduler status, so a
+  // terminal-but-undrained request never counts as live and its
+  // quota is released immediately.
+  std::vector<RequestId> keep;
+  keep.reserve(tracked_.size());
   for (RequestId id : tracked_) {
     const Request* r = sched_.get(id);
-    if (r == nullptr || is_terminal(r->status)) {
-      // reaped:
+    if (r == nullptr) {
+      // scheduler state gone (defensive): reap everything:
       emitted_.erase(id);
       terminal_reported_.erase(id);
+      terminal_pending_.erase(id);
       deadline_.erase(id);
       deadline_cancelled_.erase(id);
       continue;
     }
-    live.push_back(id);
+    keep.push_back(id);
   }
-  tracked_.swap(live);
+  tracked_.swap(keep);
 }
 
 int ServingController::live_request_count() const {

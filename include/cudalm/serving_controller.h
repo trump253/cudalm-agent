@@ -237,16 +237,24 @@ class ServingController {
   std::vector<ServingEvent> step_stream();
   // Drive to quiescence (deadline check before each step), draining
   // after every step; returns ALL events of the whole drive in order.
+  // A TERMINAL-but-not-yet-drained request already present in the
+  // controller does not lose its pending events (they are drained
+  // first / in order) — even if live_requests is already 0.
   std::vector<ServingEvent> run_stream();
   // WITHOUT driving: drain ONE tracked request's not-yet-emitted
   // committed tokens (and its terminal event, if it is terminal).
-  // Errors for unknown / already-reaped request ids.
+  // Pinned exactly-once semantics: a request's events are emitted at
+  // most ONCE across poll / step_stream / run_stream combined; a poll
+  // of an unknown or ALREADY-FULLY-DRAINED request id ERRORS (the
+  // fully-drained reap removes it from the tracked set).
   Status poll(RequestId request_id, std::vector<ServingEvent>* out);
 
-  // Quota sync: reap tracked requests that reached a terminal state
-  // (idempotent; safe to call any number of times). Reaping removes
-  // the request's streaming bookkeeping (cursor / deadline) — drain
-  // BEFORE the next sync if you still need its tokens.
+  // Quota sync (idempotent; safe to call any number of times).
+  // REVIEW FIX (streaming lifecycle): a TERMINAL request's stream
+  // state is NOT destroyed here — its committed-but-not-yet-emitted
+  // tokens + terminal event stay drainable until they are consumed
+  // exactly once (the reap happens in the fully-drained path). The
+  // live/quota lifecycle is unaffected (the live count is derived).
   void sync();
 
   // Observability: a snapshot (live_* derived on read — read-only).
@@ -279,6 +287,11 @@ class ServingController {
   // ---- v0.9 Phase B streaming / deadline bookkeeping --------------------
   std::map<RequestId, int> emitted_;  // per-request emitted cursor
   std::set<RequestId> terminal_reported_;  // terminal event sent once
+  std::set<RequestId> terminal_pending_;  // terminal, stream state not yet
+                                          // fully drained (kept drainable;
+                                          // reaped in drain_ once fully
+                                          // drained — the live/quota
+                                          // lifecycle is unaffected)
   std::map<RequestId, std::chrono::steady_clock::time_point> deadline_;
   std::set<RequestId> deadline_cancelled_;  // cancelled BY the deadline
   std::uint64_t total_admitted_sessions_ = 0;
