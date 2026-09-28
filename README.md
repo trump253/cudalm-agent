@@ -360,9 +360,9 @@ c5d20efe3424a82ac0c6e4b01849645c74a1aa40`（其后 commits 均为 docs/evidence-
 
 ## v0.8：Multi-turn / Session Runtime
 
-**状态：Phase A + Phase B + Phase C 完成**（分支 `v0.8-session-runtime`，
-从 `cf28abd`（v0.7 merge）创建；**不**在 main 开发，**不** merge ——
-等待 external reviewer）。
+**状态：v0.8 完成（Phase A + B + C + D）**（分支
+`v0.8-session-runtime`，从 `cf28abd`（v0.7 merge）创建；**不**在 main
+开发，**不** merge —— 等待 external reviewer 的 v0.8 final review）。
 
 v0.8 把"一次性 Request 生命周期"升级为 **persistent Session + multiple
 Requests/turns**：**SessionId 与 RequestId 分离**；一个 Session 跨 turn
@@ -464,8 +464,98 @@ conv / Delta recurrent / position **全部保留**（只有 `reset_session` /
   `max_batch_size == 2`、`decode_cohort_trace == [1,2,2,1,2,2]`；
   busy / overflow 零 mutation；拆除后 accounting 归零）。
 
-### 后续阶段（未开始）
+### Phase D：text-level multi-turn + demo + final sign-off
 
-Phase D：text/chat 级 multi-turn demo + 最终 sign-off（**Phase D
-尚未开始**）。详见
-[`docs/v08_session_runtime.md`](docs/v08_session_runtime.md)。
+- **text facade**（`Qwen35SessionTextGenerator`，
+  `include/cudalm/session_text_generator.h`）：薄 facade，不写
+  generation loop —— 只把冻结 contract 串起来：
+  `Qwen35Tokenizer::encode`（native，oracle-exact）→
+  `Scheduler::admit_session_turn`（Phase C session-bound，绑定已有
+  bound sequence，**append-only**）→ `Scheduler::run`（frozen
+  control plane，commit-then-stop）→ `Qwen35Tokenizer::decode`。
+  **turn N 只 encode / append 新文本**，turn 1..N-1 不 re-encode /
+  不 replay；`ok == true` 时 result 的**每个** generated id 都已
+  commit 进 session state；错误（invalid UTF-8 / unknown / busy /
+  overflow / forward failure）= fail loud，session 停在 last
+  committed boundary 且保持 LIVE（无半个 turn）；
+- **`cudalm-chat` CLI**（`tools/cudalm_chat.cpp`）：persistent
+  **raw text** 多轮 demo REPL（`--model` / `--tokenizer` /
+  `--max-new-tokens` / `--temperature` / `--top-k` / `--top-p` /
+  `--seed` / `--greedy` / `--page-tokens` / `--pages` / `--slots`；
+  REPL 命令 `reset` / `quit`）。用户输入**原样** encode 追加到同一
+  persistent session（**不加** chat template / special token /
+  separator）；response fully committed 后才显示。**这是
+  persistent text-session demo，不是完整 instruct/chat-template
+  serving API**（Qwen3.5-0.8B-Base 是 base 模型，仓库没有冻结的
+  official chat-template contract）；
+- **真实 CLI 示例**（真实 checkpoint 输出）：
+
+  ```text
+  $ ./build/cudalm-chat --model build/data/qwen35_08b_full.cudalm \
+      --tokenizer build/data/qwen35_tokenizer.cudaltk --max-new-tokens 24
+  cudalm-chat: v0.8 persistent text session (session 1)
+    model: build/data/qwen35_08b_full.cudalm | sampling: greedy | max_new_tokens: 24
+    RAW TEXT contract: your input is appended VERBATIM — no
+    chat template, no special tokens, no separator. ...
+  user> The capital of France is
+  model>  located in the northern part of the country.
+  A. True
+  B. False
+    [turn 1: +5 input, +24 generated, stop max_new_tokens, context 29]
+  user> And its most famous monument is the
+  model>  Eiffel Tower.
+  A. True
+  B. False
+    [turn 2: +7 input, +24 generated, stop max_new_tokens, context 60]
+  user> quit
+  session destroyed (state released)
+  ```
+
+  （turn 2 从 turn 1 的 committed state 继续：context 29 → 60 =
+  29 + 7 + 24 精确累加；turn 2 没有 re-encode / re-forward turn 1。）
+
+- **硬门**：`test_qwen35_session_text`（CPU contract gate：真实
+  tokenizer artifact + deterministic fake forwarder + 真实池 /
+  SessionManager / Scheduler 经 facade 驱动 —— encode →
+  session-bound request → decode；turn 2 只 encode 新文本且**不
+  replay** turn 1（per-sequence step 计数证明续接）；reset 同
+  SessionId 重新开始；错误全路径零 mutation + session LIVE）+
+  `test_qwen35_session_text_e2e`（真实 checkpoint + 真实 tokenizer：
+  两轮 text turn 与**直接 token-level Phase C 路径**逐轮比较 ——
+  encoded ids / generated ids / decoded text / final context length
+  全部相同，final context 恰为 `n1 + m1 + n2 + m2`；reset /
+  overflow 零 mutation / clean teardown）。
+
+### v0.8 能力总览（portfolio 视角）
+
+| 能力 | 说明 |
+|---|---|
+| **SessionId vs RequestId** | 两个独立、单调、不复用的 id 空间（外加 SequenceId 共三个）：**Session = persistent model state owner；Request = 一次被调度的 turn/job**；request 终态 ≠ session 销毁/重置 |
+| **persistent paged KV + Delta recurrent state** | Qwen3.5-0.8B hybrid（6 full-attention 层 paged KV + 18 DeltaNet 层 conv/recurrent）的 state 跨 request 持久化；zero-on-release / zero-on-reset / 精确 byte accounting（v0.5 池冻结继承） |
+| **incremental multi-turn** | turn N 只 forward 新 input，从既有 KV + Delta + position 继续；已证明 incremental == 等价 one-shot continuous（bit-identical） |
+| **scheduler + true batched multi-session decode** | session-bound turn 经 v0.6 scheduler；多 session 交错、true batched decode cohort、per-request sampler 隔离；commit-then-stop 语义 |
+| **native tokenizer** | PyTorch-free 原生 encode/decode（CUDLMTK1 artifact，对 pinned HF oracle 全量 EXACT） |
+| **text-level multi-turn demo** | `cudalm-chat`：raw text persistent session（无 chat template），response fully committed 后显示 |
+| **sampling** | greedy / seeded temperature + top-k + top-p（per-request 全新 sampler，RNG 不跨 request/turn） |
+| **reset / destroy lifecycle** | `reset_session`（state 归零、同 SessionId、序列复用）/ `destroy_session`（释放 slot/pages；池 accounting 归零有硬门） |
+
+### v0.8 当前限制（诚实清单）
+
+- 模型为 **Qwen3.5-0.8B-Base**（base 模型；无 official chat template ——
+  仓库没有可证明的 pinned template contract，Phase D 的 text demo 是
+  raw text completion，不是 instruct serving）；
+- **无 HTTP / OpenAI-compatible API**（只有进程内 C++ API + 两个 CLI）；
+- **无 streaming**（turn 的 generated token 在 request 终态后整体可见）；
+- **无 eviction / sliding window / TTL / LRU**（context overflow =
+  明确 reject，精确边界接受）；
+- **单 CUDA stream**（池与 model 同 stream；无 multi-stream / CUDA
+  Graph）；
+- **同 Session 同时至多一个 live turn**（busy session 的第二个 live
+  request 直接 reject，fail loud）；
+- 生成循环 correctness-first：每步 host 全量 logits D2H + host 采样；
+  池容量（pages/slots）构造期固定。
+
+详见 [`docs/v08_session_runtime.md`](docs/v08_session_runtime.md)（§1–
+§12：四个 phase 的 contract、测试与验收证据）与
+[`docs/provenance.md`](docs/provenance.md)（逐 phase 的 SHA 绑定
+证据）。

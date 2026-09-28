@@ -1,4 +1,4 @@
-# CUDALM v0.8 Session Runtime — Phase A（Session abstraction + persistent-state lifecycle）+ Phase B（incremental multi-turn execution）+ Phase C（scheduler + Session 集成 / 多 session interleaving）
+# CUDALM v0.8 Session Runtime — Phase A（Session abstraction + persistent-state lifecycle）+ Phase B（incremental multi-turn execution）+ Phase C（scheduler + Session 集成 / 多 session interleaving）+ Phase D（text-level multi-turn + demo + final sign-off）
 
 > **Phase A 目标**（§1–§7，已完成并冻结）：建立正确、清晰、可测试的
 > **Session abstraction**，并把现有 KV / DeltaNet state 的生命周期从
@@ -11,10 +11,10 @@
 > **incremental multi-turn execution == 等价 one-shot continuous execution**
 > （bit-exact）。
 >
-> v0.8 **不做**：chat template、HTTP server、OpenAI API、多轮文本对话
-> 历史管理、context eviction / sliding window / TTL / LRU、multi-stream、
-> CUDA Graph、batched prefill、新 kernel 优化、scheduler + Session 接入
-> （Phase C）、多 session batching（见 §9 当前限制）。
+> v0.8 **不做**：official chat template、HTTP server、OpenAI API、
+> streaming、context eviction / sliding window / TTL / LRU、multi-stream、
+> CUDA Graph、新 kernel 优化、性能优化（Phase D 只做 text-level facade +
+> demo CLI + 验收；多 session batching 已在 Phase C 完成，见 §9 当前限制）。
 >
 > 基线：`main` @ `cf28abd60b0d9f493149db68b0958ebb9c5214b5`
 > （v0.7 merge，`V07_FINAL_FUNCTIONAL_SHA = 9edd9ef6aec84b8dcf66a262652c2e285ff73793`）。
@@ -694,9 +694,137 @@ compute-sanitizer --tool memcheck --leak-check full \
 chat template、CLI chat demo、HTTP/OpenAI API、streaming、TTL/LRU/
 eviction、sliding window、multi-stream、CUDA Graph、新 kernel、
 同 session 并行 turn（§9.2 的 busy-reject 是 pinned 语义）——全部
-不在 Phase C。**Phase D 尚未开始。**
+不在 Phase C。Phase D 见 §10。
 
-## 10. 当前限制
+## 10. Phase D — text-level multi-turn + demo + final sign-off（已实现）
+
+Phase D 把 Phase A/B/C 冻结的能力封装成**真正的 UTF-8 text turn**：
+
+```text
+UTF-8 text turn
+  -> encode          (Qwen35Tokenizer, native, oracle-exact)
+  -> append          (Session 已有 bound sequence，append-only，不 replay)
+  -> scheduler generate (Scheduler::admit_session_turn + run，frozen control plane)
+  -> decode          (Qwen35Tokenizer, native, oracle-exact)
+  -> UTF-8 response
+```
+
+### 10.1 范围（pinned）
+
+本阶段是 **raw text multi-turn session / text completion demo**：
+
+- **不做** official chat template（仓库没有可证明的 pinned template
+  contract；`Qwen3.5-0.8B-Base` 是 base 模型）；
+- **不**硬编码任何 HuggingFace/Qwen chat template；
+- 每个用户输入作为**新的 UTF-8 text chunk 原样（verbatim）** append
+  到 persistent Session——**不加** newline / separator / special token，
+  **不改**用户输入（任何隐式修改都被禁止并写进 contract）；
+- 同一 Session 连续多轮时，**turn N 只 encode / append 新文本**，
+  turn 1..N-1 **不重新 encode / 不 replay**（Phase C append-only
+  contract 的 text 级表达）。
+
+### 10.2 API：`Qwen35SessionTextGenerator`（薄 facade）
+
+`include/cudalm/session_text_generator.h` +
+`src/runtime/session_text_generator.cpp`。薄 facade，**不写
+generation loop**——只把四个冻结 contract 串起来：
+
+```text
+Qwen35Tokenizer::encode
+  -> Scheduler::admit_session_turn   (Phase C session-bound，绑定已有
+                                       bound sequence，append-only)
+  -> Scheduler::run                  (frozen v0.6 control plane，
+                                       commit-then-stop)
+  -> Qwen35Tokenizer::decode         (skip_special_tokens == false)
+```
+
+```cpp
+create_session(SessionId*)
+reset_session(SessionId)
+destroy_session(SessionId)
+generate_turn(SessionId, std::string new_text, int max_new_tokens,
+              const SamplingConfig&, [int eos_token_id]) -> SessionTextTurnResult
+```
+
+非拥有（forwarder / state manager / session manager / tokenizer /
+stream 均 outlive facade）；facade 只拥有自己的 `Scheduler`。
+
+返回 `SessionTextTurnResult`：`ok`、`error`、`input_token_ids`、
+`generated_token_ids`、`generated_text`、`stop_reason`、
+`context_length`（turn 后 session 逻辑长度）、`request_id`、
+`forward_count`。
+
+### 10.3 text-session contract（pinned）
+
+- **verbatim**：不加 template / special token / separator；用户 chunk
+  的 encode 结果原样 append 到 session token stream；
+- **incremental**：turn N 只 encode 新文本，从 session 当前 length
+  append（turn 1..N-1 不 re-encode / re-forward）；
+- **commit**：`ok == true` 时，result 的**每个** generated id 都已由
+  Phase B/C commit contract commit 进 session 的 KV / Delta / position
+  state（session length == input + committed generated）；
+- **no half-turn**：invalid UTF-8 / admission 失败（unknown / busy /
+  overflow / 非法 config）/ forward 失败都 fail loud，session 停在
+  **last committed boundary**（admission zero mutation；failed forward
+  不 commit 任何 token），session 保持 **LIVE**；失败 turn 只报告
+  **committed 前缀**，从不把 pending token 当历史；
+- **EOS gate**：4-arg 重载用 tokenizer 的 pinned real EOS（v0.4 text
+  contract，248044）；5-arg 重载用显式 gate（`-1` = no gate，v0.6
+  约定）。
+
+### 10.4 CLI：`cudalm-chat`（persistent text-session demo）
+
+`tools/cudalm_chat.cpp`。单 session 多轮 REPL，参数：
+
+```text
+--model <full_model.cudalm> --tokenizer <tokenizer.cudaltk>
+[--max-new-tokens N] [--temperature T] [--top-k N] [--top-p P]
+[--seed N] [--greedy] [--page-tokens N] [--pages N] [--slots N]
+```
+
+REPL 命令：`reset`（state 归零、同 SessionId）、`quit` / `exit`
+（destroy 并退出）。退出码 0/1/2 与 `cudalm-generate` 同约定。每条
+用户行**原样** encode 并 append 到同一 persistent session；response
+**fully committed** 后才显示。明确**不是** instruct/chat-template
+serving API（README 同说明）。
+
+### 10.5 测试
+
+- **`test_qwen35_session_text`**（CPU contract gate：真实 native
+  tokenizer artifact + Phase C deterministic fake forwarder + 真实池 +
+  真实 SessionManager + 真实 Scheduler，经 facade 驱动）：
+  encode -> session-bound request -> decode；**turn 2 只 encode 新
+  文本且从 committed length 续接**（fake per-sequence step 计数证明
+  **不 replay** turn 1）；reset 后同 SessionId 重新开始；**错误不产生
+  半个 turn**（invalid UTF-8 / 空文本 / unknown session / context
+  overflow / forward failure 全部 fail loud，零 mutation，session
+  LIVE 于 committed boundary）；
+- **`test_qwen35_session_text_e2e`**（CUDA，真实 checkpoint + 真实
+  tokenizer 的 E2E hard gate）：两轮 incremental TEXT turn 经 facade，
+  与**直接 token-level Phase C 路径**（同 encoded ids 经
+  `Scheduler::admit_session_turn` 在独立 session 上）逐轮比较——
+  encoded ids 相同、generated ids 相同、decoded text 相同、final
+  context length 相同（且恰为 `n1 + m1 + n2 + m2`）；加 reset、
+  overflow admission 零 mutation（真实 session）、clean teardown（池
+  accounting 归零）。
+
+### 10.6 验收证据
+
+- functional @ `1e399d1`（facade + CLI），tests @ `e408192`
+  （两个新门 + 注册）—— 详见 `docs/provenance.md` Phase D 章节的
+  逐条证据；
+- targeted `ctest -R "scheduler|session" --output-on-failure`
+  **12/12**；最终 `ctest --output-on-failure` **71/71，0
+  failed，0 skipped**（Total 813.62 s）；
+- `compute-sanitizer --tool memcheck --leak-check full` 对
+  `test_qwen35_session_text_e2e` **PASS + 0 errors + 0 bytes
+  leaked**；`bash scripts/check_no_torch.sh` **CLEAN**。
+
+Phase D 只证明 **text facade 没有破坏底层已冻结的 token/runtime
+contract**（E2E gate 与直接 token-level Phase C 路径逐项 parity）；
+不再重复 Phase C 已证明过的 KV / Delta state 全量 memcmp。
+
+## 11. 当前限制
 
 - **同 session 至多一个 live turn**：busy session 的第二个 live
   request 直接 reject（fail loud，零 mutation）；同 session 并行
@@ -723,7 +851,7 @@ eviction、sliding window、multi-stream、CUDA Graph、新 kernel、
   `delta_capacity_slots` 上限约束，KV pages 受 `kv_capacity_pages`
   约束（超限 = 明确 OOM Status，不静默）。
 
-## 11. 已知风险（诚实清单）
+## 12. 已知风险（诚实清单）
 
 - **scheduler 的 Session 查询**：`admit_session_turn` 的 preflight
   读 session/sequence 元数据（`lookup` 指针），与 v0.5/v0.6 同

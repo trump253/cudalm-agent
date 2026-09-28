@@ -1628,5 +1628,52 @@ v0.4/v0.6 语义：采样时判 stop、末 token 不 forward、`N + m - 1`、终
   Request 终态后整体可见）；Phase B `SessionGenerator`（单 session
   同步 turn 引擎）与 scheduler 路径并存；无 chat template / CLI /
   HTTP / OpenAI API / eviction / multi-stream / CUDA Graph / 新
-  kernel。**Phase D 尚未开始。** 本阶段**不** merge 进 main、**不**
+  kernel。**Phase D 见下文。** 本阶段**不** merge 进 main、**不**
   tag —— 待 external reviewer 签核。
+## CUDALM v0.8 Phase D（text-level multi-turn + demo + final sign-off）
+
+**目标**：把 native tokenizer + persistent Session + session-bound
+Scheduler + sampling 封装成真正的 UTF-8 text turn（encode → append →
+scheduler generate → decode → UTF-8 response），同一 Session 连续多轮
+时 turn N 只 encode / append 新文本、不 replay turn 1..N-1；加
+`cudalm-chat` 多轮 CLI（persistent **raw text** session —— 无 chat
+template，无 special token，无 separator，用户输入原样 append）；v0.8
+最终验收。
+
+### 文件清单
+
+| 文件 | 说明 | commit |
+|---|---|---|
+| `include/cudalm/session_text_generator.h`、`src/runtime/session_text_generator.cpp` | `Qwen35SessionTextGenerator` 薄 facade（非拥有 forwarder / state manager / session manager / tokenizer / stream；只拥有自己的 Scheduler）：`create_session` / `reset_session` / `destroy_session` + `generate_turn`（4-arg 重载 = tokenizer pinned real EOS gate，v0.4 text contract；5-arg = 显式 gate，`-1` = no gate）；pinned text-session contract（verbatim / incremental / commit / no-half-turn）；错误 turn 只报告 committed 前缀，session LIVE | `1e399d1` |
+| `tools/cudalm_chat.cpp`、`CMakeLists.txt`（注册 `cudalm-chat`） | persistent text-session demo REPL（model / tokenizer / max-new-tokens / temperature / top-k / top-p / seed / greedy / page-tokens / pages / slots；REPL `reset` / `quit`；exit 0/1/2 约定同 `cudalm-generate`）；明确"raw text completion demo，不是 instruct/chat-template serving API" | `1e399d1` |
+| `tests/cpu/test_qwen35_session_text.cpp`、`tests/CMakeLists.txt`（注册，tokenizer artifact 参数，SKIP 77） | text/session contract gate（CPU：真实 native tokenizer artifact + Phase C deterministic fake forwarder + 真实池 + 真实 SessionManager + 真实 Scheduler 经 facade 驱动）：encode → session-bound request → decode（input ids == native encode、generated text == native decode、context == input + committed、forward_count 精确、request id == scheduler next id）；**turn 2 只 encode 新文本且从 committed length 续接（fake per-sequence step 计数证明不 replay）**；reset 同 SessionId 重新开始（reset_count == 1）；错误全路径零 mutation + session LIVE（invalid UTF-8 / 空文本 / unknown session / context overflow / forward failure——失败 turn 只报 committed 前缀、下一 turn 从 committed boundary 继续） | `e408192` |
+| `tests/cuda/test_qwen35_session_text_e2e.cpp`、`tests/CMakeLists.txt`（注册，checkpoint 参数 + tokenizer artifact，SKIP 77，TIMEOUT 1800） | 真实 Qwen3.5-0.8B-Base checkpoint + 真实 tokenizer E2E hard gate：两轮 incremental TEXT turn（facade）与**直接 token-level Phase C 路径**（同 encoded ids 经 `Scheduler::admit_session_turn` 在独立 session）逐轮比较——encoded ids 相同（turn 2 只含新文本）、generated ids 相同（turn 2 续接，replay 会破坏 RoPE 依赖 logits）、decoded text 相同、final context length 相同（恰为 n1+m1+n2+m2）；reset（post-reset turn fresh）；overflow admission 零 mutation（真实 session，独立 manager）；clean teardown（两 manager 池 accounting 归零） | `e408192` |
+
+### 验收证据（RTX 2080 Ti / CUDA 11.8）
+
+- **targeted**（facade + CLI 新增，scheduler / session 共享代码被引用
+  → 全部既有 scheduler / session 门回归）：`ctest -R
+  "scheduler|session" --output-on-failure` **12/12**（2 个新 Phase D
+  门 + 既有 10 门，legacy 语义未破坏）。
+- **最终**（functional @ `1e399d1` + tests @ `e408192`，clean
+  tree）：`cmake --build build -j8` clean（`-Wall -Wextra -Werror`）；
+  `ctest --output-on-failure` **71/71，0 failed，0 skipped**（基线 69
+  门全回归 + 新增 2 门真实运行；Total 813.62 s）。
+- **compute-sanitizer**：`--tool memcheck --leak-check full` 对新真实
+  硬门 `test_qwen35_session_text_e2e` **PASS + 0 errors + 0 bytes
+  leaked**（本阶段唯一 sanitizer 运行）。
+- **no-torch**：`bash scripts/check_no_torch.sh` **CLEAN**。
+- **CLI 冒烟**（真实 checkpoint，`cudalm-chat --max-new-tokens 24`
+  两轮）：turn 1（5 input + 24 generated，context 29）→ turn 2（7
+  input + 24 generated，context 60 = 29 + 7 + 24 精确累加）——
+  续接可见、无 replay；输出已收入 README 示例。
+- **本阶段能力与限制（明说）**：text-level persistent Session API
+  （薄 facade，不写 generation loop；verbatim / incremental / commit /
+  no-half-turn contract）+ `cudalm-chat` 多轮 raw text demo + v0.8
+  最终验收。**明确限制**：Qwen3.5-0.8B-Base、无 official chat
+  template（raw text completion，非 instruct serving）、无 HTTP /
+  OpenAI API、无 streaming、无 eviction / sliding window / TTL /
+  LRU、单 CUDA stream、同 session 至多一个 live turn（继承 Phase
+  A–C 全部限制）。**v0.8 至此完成（Phase A + B + C + D）**——
+  **不** merge 进 main、**不** tag —— 等待 external reviewer 的 v0.8
+  final review。
