@@ -309,7 +309,11 @@ class Scheduler {
   //     (fail loud); the next turn can be admitted once the first is
   //     terminal (it then continues from the first turn's committed
   //     state).
-  // ZERO-MUTATION on ANY failure: invalid SessionId (unknown/destroyed),
+  // ZERO-MUTATION on ANY failure: a session manager bound to a DIFFERENT
+  // Qwen35StateManager than this scheduler's (INSTANCE IDENTITY gate —
+  // config / stream / SequenceId equality is NOT a substitute; a
+  // numerically equal SequenceId in another manager's pools would
+  // otherwise be silently driven), invalid SessionId (unknown/destroyed),
   // busy session, empty new_input_tokens, max_new_tokens < 0, invalid
   // eos/sampling/token ids, and CONTEXT OVERFLOW (session length +
   // input + max_new_tokens > max_seq_len — the Phase A/B policy: explicit

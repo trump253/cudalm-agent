@@ -184,6 +184,19 @@ Status Scheduler::admit_session_turn(
         "scheduler: admit_session_turn: this scheduler has no session "
         "manager (constructed without one)");
   }
+  // INSTANCE IDENTITY (the review gate): the session manager must be the
+  // one bound to THIS scheduler's state manager. Without this, a scheduler
+  // over mgrA given a SessionManager over mgrB (whose sessions carry
+  // numerically equal SequenceIds in mgrB's pools) would silently drive
+  // sequences in the WRONG manager's pools. Instance identity is the only
+  // valid check here — config / stream / SequenceId equality must NOT be
+  // substituted for it.
+  if (&sessions_->manager() != &mgr_) {
+    return Status::error(
+        "scheduler: admit_session_turn: the session manager is bound to a "
+        "DIFFERENT Qwen35StateManager than this scheduler (instance "
+        "identity mismatch)");
+  }
   // ---- validation (fail loud; NOTHING is registered on failure) ----------
   std::string serr;
   if (!validate_sampling_config(sampling, &serr)) {
