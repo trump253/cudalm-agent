@@ -18,7 +18,9 @@
 //         policy cap. It can only RESTRICT below the model's
 //         max_seq_len (it is clamped to max_seq_len in the constructor
 //         and the scheduler's own overflow gate still applies below).
-//     A limit of -1 (or 0 for the context cap) means UNLIMITED.
+//     max_sessions / max_live_requests: -1 = unlimited, 0 = zero
+//     capacity (reject EVERY admission), N>0 = capacity N. The context
+//     cap uses a different convention: 0 = disabled.
 //
 //   * REJECT EARLY / FAIL LOUD / ZERO MUTATION: every serving-layer
 //     rejection happens BEFORE the frozen runtime is touched:
@@ -61,11 +63,12 @@
 
 namespace cudalm {
 
-// The serving admission limits. A limit of -1 (or 0 for
-// max_context_tokens_per_session) means UNLIMITED.
+// The serving admission limits. For max_sessions / max_live_requests:
+// -1 = UNLIMITED, 0 = zero capacity (reject EVERY admission), N>0 = N.
+// For max_context_tokens_per_session: 0 = disabled (no policy cap).
 struct ServingLimits {
-  int max_sessions = -1;  // live session quota (-1 = unlimited)
-  int max_live_requests = -1;  // live request quota (-1 = unlimited)
+  int max_sessions = -1;  // live session quota (-1 unlimited / 0 none)
+  int max_live_requests = -1;  // live request quota (-1 unlimited / 0 none)
   int max_context_tokens_per_session = 0;  // policy cap (0 = disabled);
                                            // clamped to the model's
                                            // max_seq_len (it can only

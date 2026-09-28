@@ -22,7 +22,8 @@ ServingController::ServingController(Scheduler& scheduler,
 }
 
 Status ServingController::create_session(SessionId* out_id) {
-  if (limits_.max_sessions > 0 &&
+  // -1 = unlimited, 0 = zero capacity (reject every create), N>0 = N.
+  if (limits_.max_sessions >= 0 &&
       sessions_.num_sessions() >= limits_.max_sessions) {
     ++rejected_session_limit_;
     return Status::error("serving: session limit reached (" +
@@ -41,7 +42,8 @@ Status ServingController::admit_turn(
     int max_new_tokens, int eos_token_id, const SamplingConfig& sampling,
     RequestId* out_request_id) {
   // (1) LIVE REQUEST QUOTA — before the frozen runtime is touched.
-  if (limits_.max_live_requests > 0 &&
+  // -1 = unlimited, 0 = zero capacity (reject every admission), N>0 = N.
+  if (limits_.max_live_requests >= 0 &&
       live_request_count() >= limits_.max_live_requests) {
     ++rejected_request_limit_;
     return Status::error("serving: live request limit reached (" +
