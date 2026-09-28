@@ -108,6 +108,28 @@ cudalm_add_test(test_session_turn_contract test_session_turn_contract
 cudalm_add_test(test_qwen35_scheduler_session test_qwen35_scheduler_session
                 cpu/test_qwen35_scheduler_session.cpp)
 
+# v0.8 Phase D: TEXT-level session facade contract gate (CPU test — NO
+# model / NO GPU: the REAL native tokenizer artifact + the deterministic
+# fake forwarder (Phase C pattern) + real state pools + real
+# SessionManager + real Scheduler, driven through
+# Qwen35SessionTextGenerator). Gates: ENCODE -> SESSION-BOUND REQUEST ->
+# DECODE (input ids == native encode, generated text == native decode,
+# context length == input + committed generated), INCREMENTAL MULTI-TURN
+# (turn 2 encodes ONLY the new text and CONTINUES from the committed
+# length — the fake's per-sequence step counter proves NO REPLAY of turn
+# 1), RESET restarts under the same SessionId, and ERRORS PRODUCE NO
+# HALF-TURN (invalid UTF-8 / empty text / unknown session / context
+# overflow / forward failure all fail loud with ZERO MUTATION and the
+# session LIVE at its committed boundary). Needs the tokenizer artifact
+# (prebuilt at build/data); self-skips (77) when it is absent.
+add_executable(test_qwen35_session_text cpu/test_qwen35_session_text.cpp)
+target_link_libraries(test_qwen35_session_text PRIVATE cudalm)
+add_test(NAME test_qwen35_session_text
+         COMMAND test_qwen35_session_text
+                 ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk)
+set_tests_properties(test_qwen35_session_text PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 # v0.6 Phase A: request scheduler / control-plane gate (CPU test: NO
 # checkpoint, NO model — a deterministic fake forwarder over the REAL
 # Qwen35StateManager pools). Gates: request lifecycle (Waiting/Running/
@@ -339,6 +361,29 @@ add_test(NAME test_qwen35_scheduler_session_integration
                  ${CUDALM_TOOL_PYTHON3}
                  ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_qwen35_scheduler_session_integration PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# v0.8 Phase D: TEXT-level session facade E2E hard gate (REAL Qwen3.5-
+# 0.8B-Base checkpoint + REAL native tokenizer). Two incremental TEXT
+# turns through Qwen35SessionTextGenerator compared turn-by-turn against
+# the DIRECT token-level Phase C path on an independent session: encoded
+# ids == the raw encode of ONLY that turn's text (no re-encode of turn
+# 1), generated token IDs IDENTICAL (turn 2 CONTINUES — a replay would
+# break the RoPE-dependent logits), decoded text IDENTICAL, final
+# context length IDENTICAL (== n1 + m1 + n2 + m2 exactly); plus reset
+# (fresh turn after zero), overflow admission zero-mutation on a real
+# session, and clean teardown (pool accounting to zero).
+add_executable(test_qwen35_session_text_e2e
+               cuda/test_qwen35_session_text_e2e.cpp)
+target_link_libraries(test_qwen35_session_text_e2e PRIVATE cudalm)
+add_test(NAME test_qwen35_session_text_e2e
+         COMMAND test_qwen35_session_text_e2e
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR}
+                 ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk)
+set_tests_properties(test_qwen35_session_text_e2e PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 # --- Cross-language weight-file tests (Python tools -> C++ loader) ------------
