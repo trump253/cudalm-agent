@@ -394,6 +394,50 @@ add_test(NAME test_qwen35_session_text_e2e
 set_tests_properties(test_qwen35_session_text_e2e PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+# --- v0.9 Phase A: serving admission / backpressure / resource guardrails --
+# A thin POLICY layer (ServingController) above the frozen v0.8
+# Session/Scheduler: admission limits (max_sessions, max_live_requests,
+# optional per-session context policy cap), REJECT EARLY / FAIL LOUD /
+# ZERO MUTATION, quota lifecycle (terminal / cancel / failure release
+# request capacity exactly once; destroy releases session capacity;
+# reset does not), lightweight serving stats.
+#
+# test_serving_admission (CPU — NO checkpoint / NO model: the
+# deterministic fake forwarder (Phase C/D pattern) + real pools + real
+# SessionManager + real Scheduler + the ServingController):
+#   * max_sessions: reject at the limit (zero mutation, no SessionId
+#     consumed); reset does NOT release; destroy releases (reuse);
+#   * max_live_requests: reject at the limit (zero mutation, no
+#     RequestId consumed); TERMINAL release + reuse (limit reached ->
+#     reject -> existing finishes -> new admission succeeds); repeated
+#     sync() is a no-op (no double-decrement);
+#   * context policy cap: rejects below the model limit, exact boundary
+#     (==) accepted, constructor clamps to max_seq_len;
+#   * cancel + forward failure release the request quota.
+cudalm_add_test(test_serving_admission test_serving_admission
+                cpu/test_serving_admission.cpp)
+
+# test_serving_integration (CUDA, REAL Qwen3.5-0.8B-Base checkpoint):
+# the serving layer driving the FROZEN Session/Scheduler changes NOTHING
+# about token/state correctness — sessions A (greedy) / B (seeded), two
+# turns each, admitted + driven THROUGH the controller (two live at a
+# time — the batched path) vs the same token streams on a raw
+# Scheduler on an independent manager: generated ids per turn +
+# turn-boundary/final lengths IDENTICAL; limits enforce + release on
+# the real runtime (session limit / request limit / reuse); the context
+# policy cap (8 << max_seq_len) enforces with the exact boundary
+# accepted; clean teardown (pool accounting to zero). Self-skips (77).
+add_executable(test_serving_integration cuda/test_serving_integration.cpp)
+target_link_libraries(test_serving_integration PRIVATE cudalm)
+add_test(NAME test_serving_integration
+         COMMAND test_serving_integration
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_serving_integration PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 # --- Cross-language weight-file tests (Python tools -> C++ loader) ------------
 # tools/convert_weights.py (torch, offline) emits data/block_v01.cudalm into
 # the build tree; test_weights_crosslang loads it with the PyTorch-free C++
