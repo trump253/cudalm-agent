@@ -1,0 +1,84 @@
+# =============================================================================
+# CUDALM v0.7 FINAL production — canonical timing (Phase D candidate 1 KEEP)
+# V07 final functional SHA: 9edd9ef6aec84b8dcf66a262652c2e285ff73793 (runtime = fused add+rmsnorm; B/C rejected)
+# bench sha256: ff71e3221c9f9811d6fb82ce4aca6a2dd1b8779e1853e3518aa12150275dbaf2
+# model sha256: 8637f987d0d59961c63c548e69ac8a75ff7c2a072e8d157f521bbff5b73822dd   checkpoint: /root/models/Qwen3.5-0.8B-Base
+# workload: 4 requests (prompts 2/5/3/4 tok; max_new 3/6/5/3); 1 warmup + 5 measured; CUDA_VISIBLE_DEVICES=0
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
+# date: 2026-09-28T06:50:56Z
+# =============================================================================
+# CUDALM v0.6 Phase C — dynamic continuous-batching benchmark
+# (reproducible; correctness-first; NO performance pass threshold)
+
+environment:
+  gpu: NVIDIA GeForce RTX 2080 Ti
+  cuda_runtime: 11.8
+  cuda_driver: 12.8
+  checkpoint: /root/models/Qwen3.5-0.8B-Base
+  model: /root/code/cudalm-agent/build/data/qwen35_08b_full.cudalm
+  stream: single (prefill stays serial; decode cohort is batched)
+
+workload (SAME for both modes; all four complete, no cancellation in the timed run):
+  requests: 4 (A greedy; B/C/D seeded)
+  prompt_tokens: 14
+  generated_tokens: 17
+  logical_sequence_token_forwards: 27  (sum over requests of N + m - 1)
+  arrival: A,B first; C after 1 step; D after 2 steps (dynamic)
+timing:
+  warmup_runs (un-timed): 1
+  measured_runs: 5 (each bracketed by cudaStreamSynchronize; steady_clock wall)
+  mode selector (--mode): both (default; v0.6 behavior)
+
+results (per-run metrics are identical across measured runs for this fixed workload; wall time is summarized):
+
+  mode A — independent / SERIAL (each request alone, one at a time):
+    wall_time_s mean:   0.130968
+    wall_time_s median: 0.130778
+    wall_time_s min:    0.130242
+    wall_time_s max:    0.131806
+    logical_tokens: 27
+    logical_tokens_per_s (mean): 206.157084
+    single_forward_calls: 27
+    successful_single_forward_calls: 27
+    batch_forward_calls: 0
+    model_traversal_calls: 27
+    avg_decode_batch_size: 0
+    max_decode_batch_size: 0
+
+  mode B — SCHEDULER CONTINUOUS BATCHED (dynamic arrivals):
+    wall_time_s mean:   0.117271
+    wall_time_s median: 0.116562
+    wall_time_s min:    0.114770
+    wall_time_s max:    0.120591
+    logical_tokens: 27
+    logical_tokens_per_s (mean): 230.236597
+    single_forward_calls: 19
+    successful_single_forward_calls: 19
+    batch_forward_calls: 3
+    model_traversal_calls: 22
+    batched_sequence_tokens: 8
+    avg_decode_batch_size: 2.666667
+    max_decode_batch_size: 3
+
+profile_totals (this process: warmup + all measured runs, BOTH modes;
+ties the whole run to the Nsight Systems kernel-launch count):
+  serial_mode_traversals: 162
+  batched_mode_single_attempts: 114
+  batched_mode_successful_singles: 114
+  batched_mode_committed_batches: 18
+  batched_mode_traversals: 132
+  batched_mode_logical_tokens: 162
+  batched_mode_batched_tokens: 48
+  total_completed_traversals: 294
+
+notes:
+  * logical_sequence_token_forwards == model-traversal calls only in the SERIAL mode; in the batched mode a committed batch of B is B logical tokens but ONE traversal (so batched traversals < logical tokens).
+  * NO speedup claim is made: the correctness-first batch kernels are untuned (tuning is v0.7). A batched time >= serial time in THIS environment is NOT a failure.
+  * Numbers are for THIS environment / checkpoint / workload only; they are not a general performance conclusion.
+
+per-measured-run wall_time_s:
+  run 1: serial=0.131806s batched=0.114944s
+  run 2: serial=0.130242s batched=0.116562s
+  run 3: serial=0.130778s batched=0.119487s
+  run 4: serial=0.131276s batched=0.114770s
+  run 5: serial=0.130738s batched=0.120591s

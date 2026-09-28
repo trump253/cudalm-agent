@@ -1,0 +1,13 @@
+# =============================================================================
+# CUDALM v0.7 Phase D (candidate 1) — batched-only Nsys profile: cand
+# SHA: 9edd9ef6aec84b8dcf66a262652c2e285ff73793
+# bench binary: /root/code/cudalm-wt-cand/build/benchmarks/bench_qwen35_continuous_batching
+# bench sha256: e6ce45174b69ad9a180bc74d76806e58e40cf676f0c952953bc43c8157231409
+# model: /root/code/cudalm-agent/build/data/qwen35_08b_full.cudalm
+# model sha256: 8637f987d0d59961c63c548e69ac8a75ff7c2a072e8d157f521bbff5b73822dd
+# checkpoint: /root/models/Qwen3.5-0.8B-Base
+# workload: 4 requests (prompts 2/5/3/4 tok; max_new 3/6/5/3; 1 greedy + 3 seeded);
+#           --mode batched, 1 warmup + 5 measured, CUDA_VISIBLE_DEVICES=0
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
+# date: 2026-09-28T06:25:45Z
+# =============================================================================

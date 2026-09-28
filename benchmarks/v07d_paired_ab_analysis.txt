@@ -1,0 +1,57 @@
+# =============================================================================
+# CUDALM v0.7 Phase D (candidate 1) — pre-specified PAIRED A/B E2E analysis
+# fused residual-add + zero-centered RMSNorm post-attention path.
+# design: 20 FIXED pairs, alternating (odd=base->cand, even=cand->base); independent
+# unit = fresh process invocation (2 warmup + 10 measured, --mode batched, canonical
+# workload); per-invocation value = mean of its 10 runs; paired diff = cand-base.
+# In-process runs are NOT independent samples.
+# ---------------------------------------------------------------------------
+======================================================================
+Paired A/B analysis  (n = 20 pairs, independent unit = invocation)
+======================================================================
+per-pair means (base / cand / delta ms):
+  pair  1: base  109.8683   cand  112.6141   d  +2.7458
+  pair  2: base  110.7657   cand  109.8049   d  -0.9608
+  pair  3: base  110.4922   cand  109.3323   d  -1.1599
+  pair  4: base  109.9479   cand  109.9249   d  -0.0230
+  pair  5: base  113.0465   cand  111.0539   d  -1.9926
+  pair  6: base  110.7418   cand  111.1967   d  +0.4549
+  pair  7: base  111.8516   cand  114.4108   d  +2.5592
+  pair  8: base  113.5548   cand  112.9102   d  -0.6446
+  pair  9: base  113.2402   cand  110.8684   d  -2.3718
+  pair 10: base  112.9790   cand  109.2775   d  -3.7015
+  pair 11: base  113.8018   cand  109.8148   d  -3.9870
+  pair 12: base  110.2438   cand  110.1037   d  -0.1401
+  pair 13: base  111.1185   cand  109.5108   d  -1.6077
+  pair 14: base  113.1174   cand  109.4900   d  -3.6274
+  pair 15: base  110.1639   cand  112.5418   d  +2.3779
+  pair 16: base  112.7040   cand  110.3548   d  -2.3492
+  pair 17: base  110.6280   cand  111.7326   d  +1.1046
+  pair 18: base  117.4167   cand  109.4197   d  -7.9970
+  pair 19: base  112.1010   cand  109.6283   d  -2.4727
+  pair 20: base  110.4338   cand  109.4599   d  -0.9739
+----------------------------------------------------------------------
+paired mean delta   = -1.2383 ms   (SE 2.5616)
+paired median delta = -1.0669 ms
+paired t            = -2.1619   (df = 19)   two-sided p = 0.0436
+95% CI of paired mean = [-2.4372, -0.0395] ms   (tcrit=2.0930)
+  -> CI EXCLUDES 0
+pairs with delta < 0 : 15 / 20
+----------------------------------------------------------------------
+Wilcoxon signed-rank:
+  W+ = 54   W- = 156   (ties: 0)
+  EXACT two-sided p  = 0.05826
+  normal approx p    = 0.05691   (z = -1.9040)
+======================================================================
+KEEP criterion (mean<0 AND median<0 AND 95%CI excludes 0): KEEP
+
+# =============================================================================
+# DECISION: KEEP
+#   Pre-specified KEEP criterion (mean<0 AND median<0 AND 95%CI of paired mean
+#   excludes 0) is MET: mean=-1.238ms, median=-1.067ms, CI=[-2.437,-0.040]ms
+#   excludes 0. Paired t p=0.0436 (significant). 15/20 pairs faster. Wilcoxon
+#   exact p=0.058 (supplemental, borderline). Nsys independently confirms the
+#   mechanism: -24 launches/traversal (442.6->418.6), -125us/traversal host
+#   cudaLaunchKernel, no important kernel regression. Production runtime KEEPS
+#   the fused kernel (CANDIDATE SHA 9edd9ef).
+# =============================================================================

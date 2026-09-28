@@ -1,0 +1,22 @@
+# =============================================================================
+# CUDALM v0.7 FINAL — compute-sanitizer memcheck (Phase D candidate 1 KEEP)
+# SHA: 9edd9ef6aec84b8dcf66a262652c2e285ff73793
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
+# tests: test_qwen35_fused_add_rmsnorm (new fused kernel), test_qwen35_full_model (in-context)
+# date: 2026-09-28T06:51:43Z
+# =============================================================================
+========= COMPUTE-SANITIZER
+fused add+rmsnorm qwen35: ALL PASS
+========= ERROR SUMMARY: 0 errors
+=== full_model under sanitizer ===
+========= COMPUTE-SANITIZER
+usage: /root/code/cudalm-agent/build/./tests/test_qwen35_full_model <out.cudalm> <checkpoint_dir> <python> <src_dir> [--no-gen]
+========= Error: Target application terminated before first instrumented API call
+========= Tracking kernels launched by child processes requires the --target-processes all option.
+
+=== test_qwen35_full_model (in-context, full logits EXACT) under sanitizer ===
+========= COMPUTE-SANITIZER
+  $ /root/py311/venv/bin/python3 /root/code/cudalm-agent/tools/convert_qwen35.py --checkpoint-dir /root/models/Qwen3.5-0.8B-Base --out data/qwen35_08b_full.cudalm --full-model
+wrote data/qwen35_08b_full.cudalm: 766205632 bytes, 506 tensors, layers=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+[PASS] qwen35_full_model (structure + ownership + reset-all-24)
+========= ERROR SUMMARY: 0 errors
