@@ -10,6 +10,10 @@
 //     (length + input + max_new > max_seq_len — exact boundary accepted),
 //     and BUSY session (one live request per session) all fail loud with
 //     no half-request, no consumed RequestId, no session state change;
+//   * INSTANCE IDENTITY GATE: a SessionManager bound to a DIFFERENT
+//     Qwen35StateManager than the scheduler's is rejected (fail loud,
+//     zero mutation on BOTH managers) — a numerical SequenceId
+//     coincidence across managers must never be silently driven;
 //   * NO SEQUENCE IS CREATED at session-turn admission (the request is
 //     bound to the session's existing bound sequence);
 //   * TERMINAL == NOT RETIRED: after Finished / Cancelled / Failed the
@@ -294,6 +298,59 @@ if (      check_snapshot("context overflow (62+2+1 > 64)", b62,
       CHECK(!s.ok);
       CHECK(s.message.find("no session manager") != std::string::npos);
       std::printf("  [ok] scheduler without session manager: fail loud\n");
+    }
+
+    // ===================================================================
+    // 1b. INSTANCE IDENTITY GATE: a SessionManager bound to a DIFFERENT
+    //     Qwen35StateManager must be rejected (zero mutation on both).
+    // ===================================================================
+    {
+      // Two independent managers; the FIRST session on each is bound to
+      // the SAME numeric SequenceId (1) — exactly the collision the gate
+      // guards: without it, driving sb through a scheduler over mgrA
+      // would silently operate on mgrA's pools (SequenceId 1 there is a
+      // DIFFERENT sequence).
+      Qwen35StateManager mgrA(cfg, 4, 4, 4, stream);
+      Qwen35StateManager mgrB(cfg, 4, 4, 4, stream);
+      SessionManager smA(mgrA);
+      SessionManager smB(mgrB);
+      SessionId sa = 0, sb = 0;
+      CHECK(smA.create_session(&sa).ok);
+      CHECK(smB.create_session(&sb).ok);
+      const SequenceId seqA_id = smA.lookup(sa)->sequence_id;
+      const SequenceId seqB_id = smB.lookup(sb)->sequence_id;
+      CHECK_EQ(seqA_id, seqB_id);  // the numerical coincidence
+
+      // A scheduler over mgrA given a SessionManager bound to mgrB:
+      FakeForwarder fwdX;
+      Scheduler wrong(fwdX, mgrA, stream, &smB);
+      // Snapshot BOTH managers + the (mismatched) scheduler BEFORE the
+      // (rejected) admission:
+      const int a_pages = mgrA.kv_pool().used_pages();
+      const int a_slots = mgrA.delta_pool().used_slots();
+      const int a_len = mgrA.lookup(seqA_id)->length;
+      const int b_pages = mgrB.kv_pool().used_pages();
+      const int b_slots = mgrB.delta_pool().used_slots();
+      const int b_len = mgrB.lookup(seqB_id)->length;
+      const int nreq = wrong.num_requests();
+      const RequestId nid = wrong.next_request_id();
+
+      RequestId r = 0;
+      Status s = wrong.admit_session_turn(sb, {50}, 1, -1, kGreedy, &r);
+      CHECK(!s.ok);
+      CHECK(s.message.find("DIFFERENT") != std::string::npos);
+      // ZERO MUTATION: no request registered, no RequestId consumed, and
+      // NEITHER manager changed (length / KV pages / Delta slots):
+      CHECK_EQ(wrong.num_requests(), nreq);
+      CHECK_EQ(wrong.next_request_id(), nid);
+      CHECK_EQ(mgrA.kv_pool().used_pages(), a_pages);
+      CHECK_EQ(mgrA.delta_pool().used_slots(), a_slots);
+      CHECK_EQ(mgrA.lookup(seqA_id)->length, a_len);
+      CHECK_EQ(mgrB.kv_pool().used_pages(), b_pages);
+      CHECK_EQ(mgrB.delta_pool().used_slots(), b_slots);
+      CHECK_EQ(mgrB.lookup(seqB_id)->length, b_len);
+      std::printf("  [ok] instance identity: wrong-manager session manager "
+                  "rejected, zero mutation on both\n");
     }
 
     // ===================================================================
