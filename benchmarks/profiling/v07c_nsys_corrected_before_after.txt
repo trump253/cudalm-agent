@@ -1,0 +1,50 @@
+# =============================================================================
+# CUDALM v0.7 Phase C — CORRECTED batched-only Nsys before/after
+#
+# The Phase-C docs originally attributed the baseline to
+# benchmarks/profiling/v07b_batched_nsys.* (a Phase-B candidate-era profile).
+# The true exact-SHA Phase-B final baseline is:
+#   benchmarks/profiling/v07b_final_batched_nsys.*
+#   benchmarks/profiling/v07b_final_kernel_families.txt
+#   SHA: 46a59984a70a42b8baedf017d4bdcaa14edc91e1  (V07B_FINAL_FUNCTIONAL_SHA)
+# This file recomputes the DeltaNet family / delta-rule / total / launch-count
+# before/after from that true baseline rep (v07b_final_batched_nsys.nsys-rep)
+# vs the candidate rep (v07c_candidate_batched_nsys.nsys-rep). No Nsys re-run;
+# existing exact-SHA artifacts only.
+#
+# Definitions:
+#   DeltaNet family = every kernel whose name contains "deltanet"
+#                     (delta-rule + gbeta + conv + gated_rmsnorm, B=1 + batch).
+#   delta-rule      = every kernel whose name contains "deltanet_delta"
+#                     (the state-update kernels).
+# Both reps cover 132 traversals (2376 logical delta-rule calls = 6 batched
+# runs x 22 traversals), so all totals and per-call figures are comparable.
+#
+# baseline  SHA : 46a59984a70a42b8baedf017d4bdcaa14edc91e1
+# candidate SHA : 4f4395eb8e2c83e7a7e03fb4b6fb8619fa6b8530
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
+# =============================================================================
+
+metric                                   baseline(46a5998) candidate(4f4395e)   delta
+total GPU kernel time (ms)                          525.986            505.701   -20.284
+DeltaNet family (ms)                                 81.211             64.579   -16.631
+DeltaNet family (% of total)                         15.44              12.77     -2.67
+delta-rule kernels (ms)                              60.801             44.432   -16.369
+delta-rule (% of total)                              11.56               8.79     -2.77
+delta-rule per logical call (us)                     25.59              18.70     -6.89
+DeltaNet family launches                             9828              11880    +2052
+delta-rule launches                                  2376               4428    +2052
+
+delta-rule per kernel:
+  baseline    52.299 ms  n= 2052  deltanet_delta_kernel                 (25.49 us/call)
+  baseline     8.503 ms  n=  324  batch_deltanet_delta_kernel           (26.24 us/call)
+  candidate   30.899 ms  n= 2052  deltanet_delta_vchunk_s_kernel
+  candidate    6.298 ms  n= 2052  deltanet_delta_vchunk_red_kernel      (B=1 = 18.13 us/call)
+  candidate    7.236 ms  n=  324  batch_deltanet_delta_vvec_kernel      (batch = 22.33 us/call)
+
+# Note: the DeltaNet family reduction here (-16.63 ms of GPU kernel time) is a
+# kernel-duration sum, NOT a wall-clock gain. The binding wall-clock question
+# is answered by the pre-specified paired A/B E2E (docs/v07_deltanet_optimization.md
+# section 7), which did NOT clearly favor the candidate (95% CI includes 0) ->
+# the candidate was REJECTED for production.
+# =============================================================================
