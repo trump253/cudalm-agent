@@ -577,3 +577,41 @@ conv / Delta recurrent / position **全部保留**（只有 `reset_session` /
 §12：四个 phase 的 contract、测试与验收证据）与
 [`docs/provenance.md`](docs/provenance.md)（逐 phase 的 SHA 绑定
 证据）。
+
+## v0.9：Serving Hardening
+
+### Phase A：Serving Admission / Backpressure / Resource Guardrails
+
+**状态：Phase A 完成（等待 external review）**（分支
+`v0.9-serving-hardening`，从 `1d6c83a`（v0.8 merge）创建；**不**在
+main 开发，**不** merge）。
+
+在冻结的 v0.8 persistent Session + Scheduler 之上增加一个**独立薄
+控制层** `ServingController`（policy / quota / admission /
+observability；frozen runtime 仍负责 correctness，零 frozen code
+改动）：
+
+- **Serving limits**（`ServingLimits`）：`max_sessions`（live session
+  配额）、`max_live_requests`（live request 配额）、
+  `max_context_tokens_per_session`（可选 per-session policy cap，0 =
+  禁用；构造时钳制到模型 `max_seq_len`——只能收紧、不能突破）；
+- **reject early / fail loud / zero mutation**：limit rejection 发生
+  在触碰 frozen runtime **之前**——no SessionId / RequestId
+  consumed、no sequence created、no KV page / Delta slot / logical-
+  length mutation；frozen Phase C preflight（identity / busy / model
+  overflow 等）仍由 scheduler 执行并原样透传，不重复实现；
+- **quota 生命周期**：request 终态（Finished / Cancelled / Failed）
+  恰好一次释放 request 配额（live 计数从 tracked id + scheduler
+  status 推导，结构上无 double-decrement 路径）；`destroy_session`
+  释放 session 配额；`reset_session` 不释放；
+- **serving stats**（刻意轻量）：`live_sessions` / `live_requests` /
+  `total_admitted_sessions` / `total_admitted_requests` /
+  `rejected_session_limit` / `rejected_request_limit` /
+  `rejected_context_limit`。
+
+Phase A **不做**：streaming、deadline / timeout、TTL / LRU、eviction、
+HTTP server、OpenAI API、multi-stream、CUDA Graph、kernel 优化、chat
+template、动态 quota 系统（属后续 Phase）。
+
+详见 [`docs/v09_serving_hardening.md`](docs/v09_serving_hardening.md)
+与 [`docs/provenance.md`](docs/provenance.md)（SHA 绑定证据）。

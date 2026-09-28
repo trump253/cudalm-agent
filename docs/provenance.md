@@ -1748,3 +1748,107 @@ template，无 special token，无 separator，用户输入原样 append）；v0
   `cudalm-chat` demo（Phase D）。明确限制见 README v0.8 章节（base
   模型、无 official chat template、无 HTTP/OpenAI API、无 streaming、
   无 eviction、单 stream、同 session 至多一个 live turn）。
+
+---
+
+# CUDALM v0.9 — Serving Hardening
+
+> 基线：`main` @ `1d6c83a8c5b64c92a8f4a8df4d750411dab3f36f`（v0.8
+> merge，tag `v0.8`）。开发分支：`v0.9-serving-hardening`。v0.8 已
+> DONE / FROZEN——**不修改** frozen Session / Scheduler / CUDA model
+> semantics（本 phase 全部为 additive 新文件 + 测试 + 文档，零
+> frozen code 改动）。
+
+## CUDALM v0.9 Phase A（serving admission / backpressure / resource guardrails）
+
+**目标**：在冻结的 v0.8 persistent Session + Scheduler 之上增加一个
+明确的 **serving admission layer**——服务在资源不足时 **reject
+early / fail loud / zero mutation**，而不是先接收 request、最后在 GPU
+state allocation / forward 时才失败。
+
+**Commit**（分支 `v0.9-serving-hardening`，基于
+`1d6c83a8c5b64c92a8f4a8df4d750411dab3f36f`）：
+
+- Functional: `1bfe0f6cbe427a968ed4e262874046cecca969d2`
+  （`include/cudalm/serving_controller.h` +
+  `src/runtime/serving_controller.cpp`——**全新**薄 policy 层：
+  `ServingLimits` / `ServingStats` / `ServingController`；非拥有组合
+  frozen `Scheduler` + `SessionManager`；**零** frozen code 改动）
+- Tests: `c5934318578b80434bd148d47687d640dca49098`（新 CPU contract
+  gate `tests/cpu/test_serving_admission.cpp` + 新真实 checkpoint
+  integration regression `tests/cuda/test_serving_integration.cpp` +
+  `tests/CMakeLists.txt` 注册）
+
+**Contract**（详见 `docs/v09_serving_hardening.md`）：
+
+- **Serving limits**（`ServingLimits`）：`max_sessions`（live session
+  配额，`<` allow / `==` reject）；`max_live_requests`（live request
+  配额，`<` allow / 达到 reject；live == 经本 controller 准入且未终态
+  的 request）；`max_context_tokens_per_session`（**可选** policy
+  cap，0 = 禁用；与 scheduler model overflow 相同的投影
+  `length + input + max_new_tokens > cap`；构造时**钳制到模型
+  `max_seq_len`**——只能收紧、不能突破；不引入动态 quota 系统）；
+- **Zero mutation**：serving-layer 的每个 limit rejection 发生在
+  触碰 frozen runtime **之前**——create_session 被拒 = NO SessionId
+  consumed（create 根本不被调用）、no sequence created、no slot/page
+  mutation；admit_turn 被拒 = NO RequestId consumed、no sequence
+  created、no KV page / Delta slot / logical-length mutation。frozen
+  Phase C preflight（instance identity / sampling / vocab / non-empty /
+  max_new / eos / token range / session live / **busy** / **model
+  overflow**）仍由 `Scheduler::admit_session_turn` 下方执行并原样
+  透传——**不重复实现**；
+- **Quota 生命周期**：request terminal（Finished / Cancelled /
+  Failed）→ live_requests 释放**恰好一次**（live 计数**不是计数器**
+  ——从 tracked request id + 其 scheduler status **推导**；`sync()`
+  幂等，结构上无 double-decrement 路径）；`destroy_session` →
+  live_sessions 减少；`reset_session` → live_sessions **不变**；
+- **Stats**（刻意轻量，非 telemetry 系统）：`live_sessions` /
+  `live_requests`（读取时推导）/ `total_admitted_sessions` /
+  `total_admitted_requests` / `rejected_session_limit` /
+  `rejected_request_limit` / `rejected_context_limit`（**只有**
+  serving-layer limit 拒绝计入 `rejected_*`；frozen preflight 拒绝
+  透传、不计数）。
+
+**测试**：
+
+- `test_serving_admission`（CPU contract gate：Phase C/D
+  deterministic fake forwarder + 真实池 + 真实 SessionManager +
+  Scheduler + `ServingController`）：
+  - max_sessions：limit 处 reject（zero mutation、无 SessionId
+    消耗）；reset 不释放 session 配额；destroy 释放 + reuse；
+  - max_live_requests：limit 处 reject（zero mutation、无 RequestId
+    消耗、scheduler request 计数 / next id / length / 池 accounting
+    全不变）；**terminal 释放 + reuse**（limit reached → reject →
+    existing request finishes → new admission succeeds——计数不永久
+    卡死）；重复 `sync()` 幂等（无 double-decrement）；
+  - context policy cap（12 < 模型 64）：低于模型上限处 reject、精确
+    边界 `==` 接受、构造钳制 999999 → 64；
+  - **cancel 与 forward failure 释放 request 配额**（failure 后
+    session 从 committed boundary 重试）。
+- `test_serving_integration`（真实 Qwen3.5-0.8B-Base checkpoint
+  integration regression）：controller 驱动 A（greedy）/ B（seeded）
+  各两 turn（两个 live 同时——batched 路径）与**直接 raw Scheduler
+  参考**（独立 manager）逐 turn 比较——generated ids + turn 边界 /
+  最终 length 全部相同（final A 10 / B 9——serving 层**不改变**
+  token/state correctness）；真实 runtime 上 session/request limit
+  强制 + reuse；context cap（8 << 262144）边界接受 / 超限 reject
+  （zero mutation）；clean teardown（所有 manager 池 accounting 归
+  零）。
+
+**验收**（本地验证，非 CI）：
+
+- `test_serving_admission` → **PASS**（全部 [ok] 用例）；
+- `test_serving_integration`（真实 checkpoint）→ **PASS**（part 1 /
+  2 / 3 全过）；
+- targeted `ctest -R "serving|scheduler|session"
+  --output-on-failure` → **14/14 PASS**（0 failed；Total 17.55
+  s；含 2 个新 gate + 全部既有 scheduler/session 回归）；
+- 未修改 CUDA / model state path（全部 additive 新文件）→ 按 Phase
+  A 验收标准**不**需要 compute-sanitizer / full ctest / profiling
+  （full ctest 留到 v0.9 最终阶段）。
+
+**Phase A 明确不做**（non-goals，属后续 Phase）：streaming、deadline
+/ timeout、TTL / LRU、eviction、HTTP server、OpenAI API、multi-
+stream、CUDA Graph、kernel 优化、chat template、动态 quota 系统。
+
+**本阶段不 merge 进 main**——待 external review 签核。
