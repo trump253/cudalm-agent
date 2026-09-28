@@ -111,6 +111,16 @@ cudalm_add_test(test_int4_gemv_bf16 test_int4_gemv_bf16 cuda/test_int4_gemv_bf16
 # parity vs the frozen entry points).
 cudalm_add_test(test_w4a16_qwen35_optimized test_w4a16_qwen35_optimized
                 cuda/test_w4a16_qwen35_optimized.cpp)
+# v0.7 Phase C: DeltaNet delta-rule state-update variants + experimental
+# dispatcher — BIT-EXACT kernel-level hard gate (BF16 core_out + FP32
+# recurrent state) vs the frozen deltanet_delta / batch_deltanet_delta
+# baselines, n_heads=16 hd=128, B=1/2/3, multiple seeds,
+# zero/small/mixed-sign/g-extreme/beta-extreme/S-kind inputs, multi-step
+# state chains, plus the vvec 16B-alignment fallback + row-parity contracts.
+# No checkpoint (pure kernel parity vs the frozen entry points).
+cudalm_add_test(test_deltanet_delta_qwen35_optimized
+                test_deltanet_delta_qwen35_optimized
+                cuda/test_deltanet_delta_qwen35_optimized.cpp)
 # Plain BF16 GEMV (the tied-LM-head matmul, v0.3 Phase B) — standalone numeric
 # hard gate: vec4 (K%8==0, aligned) + scalar (K%8!=0 / misaligned) + zero-row,
 # vs a CPU FP32-accumulate -> BF16 RNE reference. No checkpoint needed.

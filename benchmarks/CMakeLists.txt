@@ -38,3 +38,8 @@ target_link_libraries(bench_qwen35_continuous_batching PRIVATE cudalm)
 # deterministic fixtures — no checkpoint needed.
 add_executable(bench_w4a16_qwen35_shapes bench_w4a16_qwen35_shapes.cpp)
 target_link_libraries(bench_w4a16_qwen35_shapes PRIVATE cudalm)
+
+# v0.7 Phase C: DeltaNet delta-rule microbenchmark (n_heads=16 hd=128,
+# B=1/2/3; frozen vs vreg/vvec/vchunk + weighted production score).
+add_executable(bench_deltanet_delta_qwen35 bench_deltanet_delta_qwen35.cpp)
+target_link_libraries(bench_deltanet_delta_qwen35 PRIVATE cudalm)

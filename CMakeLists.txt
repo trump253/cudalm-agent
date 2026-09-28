@@ -130,6 +130,11 @@ target_link_libraries(tool_dump_w4a16_shape_census PRIVATE cudalm)
 add_executable(tool_ncu_w4a16_target tools/ncu_w4a16_target.cpp)
 target_link_libraries(tool_ncu_w4a16_target PRIVATE cudalm)
 
+# v0.7 Phase C: NCU target harness — runs ONE (B,variant) DeltaNet delta-rule
+# update repeatedly for controlled single-shape NCU profiling (no model).
+add_executable(tool_ncu_deltanet_target tools/ncu_deltanet_target.cpp)
+target_link_libraries(tool_ncu_deltanet_target PRIVATE cudalm)
+
 # --------------------------------------------------------------------------
 # User-facing CLI (v0.4 Phase C): raw UTF-8 prompt -> generated text.
 # Single request, serial, no streaming / chat template / batching (docs §21).
