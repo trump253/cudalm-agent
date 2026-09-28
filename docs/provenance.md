@@ -1970,6 +1970,49 @@ commit-then-stop 语义。
   full ctest / compute-sanitizer / profiling（full ctest 留到 v0.9
   最终阶段）。
 
+### Phase B review fix（streaming 生命周期解耦）
+
+**External review blocker**：`step_drive_()` 总在最后 `sync()`，而
+`sync()` 无条件 reap 所有 terminal request——`step()` 把最后 token
+commit 并使 request terminal 后（无 draining drive），
+`poll(request_id)` 无法再取得已 committed 的最后 token 和 terminal
+event：**terminal == streaming bookkeeping 立即销毁**，违反
+exactly-once / commit-before-visible 生命周期。
+
+**修复 contract**：解耦 **live/quota 生命周期** 与 **stream drain
+生命周期**——terminal → live quota **立即释放**（derived live
+count）；BUT 未 drain 的 committed tokens / terminal event **继续
+保留**直到被 drain exactly once（reap 移到 fully-drained 路径；
+`sync()` 不再 reap terminal；`run` / `run_stream` 先 drain pending
+terminal events 再退出；`drain_(nullptr)` = drain-and-discard；
+drain 循环遍历快照防迭代器失效；poll unknown / already-fully-
+drained → error）。零 frozen Scheduler / SessionManager / CUDA /
+model 改动。
+
+**Commit**：
+
+- Functional: `add3620b0cc63ec5b59d4225865d6016f0bd118c`
+- Tests: `95296c84f86aee73f67fc8e3aff86cdf373612bd`
+  （`test_serving_streaming` 新增 2 个边界 case：Case A——terminal
+  `step()` → `poll()`：最后 committed token + terminal event 可
+  poll（token-before-terminal、exactly once）、re-poll error
+  （already fully drained）、`live_requests == 0`、session length
+  精确、quota（max_live = 1）**立即可复用**；Case B——terminal-
+  but-undrained + `run_stream()`：pending events 不因
+  `live_requests == 0` 丢失、按序返回、r2 正常驱动完成）
+
+**验收**（本地验证，非 CI）：
+
+- `test_serving_streaming` → **PASS**（8 个 [ok] 用例）；
+- 回归（新生命周期下重跑）：`test_serving_admission` /
+  `test_serving_integration` / `test_serving_stream_integration`
+  → **PASS**；
+- targeted `ctest -R "stream|serving|scheduler|session"
+  --output-on-failure` → **16/16 PASS**（Total 19.65 s）；
+- 修改仍在 serving control plane（零 frozen code 改动）→ 按验收
+  标准**不**需要 full ctest / compute-sanitizer / profiling / v0.8
+  historical hard gates。
+
 **Phase B 明确不做**（non-goals，属后续 Phase）：text-byte
 streaming / incremental UTF-8 decoder、HTTP / OpenAI API、threads /
 async runtime、multi-stream、TTL / LRU、eviction、chat template、

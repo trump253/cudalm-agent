@@ -631,7 +631,10 @@ template、动态 quota 系统（streaming / deadline 已在 Phase B 做入，
   emit；**pending token 永不 emit**；每个 committed token
   **exactly once、按序**；**EOS / max-new 最后 token 先 emit 再
   报告 terminal**；继续驱动 frozen `Scheduler::step()`（不复制
-  generation loop）；
+  generation loop）；**streaming 生命周期与 quota 解耦**——request
+  terminal 时 quota 立即释放，但未 drain 的 committed token /
+  terminal event 保留到被 drain exactly once（`step()` + `poll()`
+  可用；`run_stream()` 不遗失 pending events）；
 - **explicit cancellation**：cancel 后不再 forward；committed 且未
   emit 的 prefix 可正常 drain；pending 不 emit；**Session 保持
   live**（context / KV / Delta 停在最后 committed boundary）；quota

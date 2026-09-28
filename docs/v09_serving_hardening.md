@@ -208,6 +208,25 @@ request 各自产生新的 committed token，serving 层**分别 drain**；每�
 request 的事件连续、有序，`RequestTerminal` 事件在该 request 的**所有
 Token 事件之后**；**无重复 / 无跨 request contamination**。
 
+**Streaming 生命周期（review fix：解耦 live/quota 与 stream drain）**：
+
+- **`terminal != streaming state destroyed`**：request terminal 时
+  **live request quota 立即释放**（derived live count，terminal-but-
+  undrained 永不计 live），**但**未 drain 的 committed tokens /
+  terminal event **继续保留**，直到被 drain exactly once——reap 只
+  发生在 fully-drained 之后（`sync()` 不再无条件 reap terminal）；
+- **`step()` + `poll()`**：用普通 `step()`（不 drain）驱动到
+  terminal 后，`poll(rid)` 必须返回**所有未 emit 的 committed Token
+  events + RequestTerminal**（顺序正确、exactly once）；
+- **poll 的 pinned 语义**：一个 request 的事件在 poll / step_stream /
+  run_stream 之间**至多 emit 一次**；poll unknown 或 **already
+  fully-drained** 的 id → **error**（明确且一致）；
+- **`run_stream()`**：controller 中已存在 terminal-but-undrained
+  request 时，**不会**仅因 `live_requests == 0` 直接返回而遗失
+  pending events——先/按序 drain 再驱动 live request；
+- 不修改 frozen `Scheduler` 的 Request 生命周期（controller 只管
+  自己的 bookkeeping）。
+
 ## 8. Phase B：Cancellation（cancel preserves Session）
 
 `ServingController::cancel(request_id)` 透传 frozen scheduler
@@ -284,7 +303,11 @@ threads / async runtime（留给后续 Phase）。
   clock：deadline 前正常推进、过期后 next step 前 cancel、不多
   commit 一个 token、terminal 事件 `deadline_exceeded = true`）；
   **A/B interleaving**（per-request 事件流 == 各自 final committed
-  ids、无跨 request contamination）；
+  ids、无跨 request contamination）；**review fix 生命周期
+  边界**：terminal `step()` → `poll()`（最后 committed token +
+  terminal event 可 poll、exactly once、re-poll error、quota 已释放
+  且立即可复用）；terminal-but-undrained + `run_stream()`（pending
+  events 不因 `live_requests == 0` 丢失）；
 - **`test_serving_stream_integration`**（Phase B 真实 Qwen3.5-0.8B-
   Base checkpoint integration gate）：A（greedy）/ B（seeded）两
   Session **一起**经 `step_stream` 驱动（batched decode 路径——一次
