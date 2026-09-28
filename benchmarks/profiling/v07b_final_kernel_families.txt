@@ -1,0 +1,64 @@
+# =============================================================================
+# CUDALM v0.7 Phase B (W4A16 GEMV optimization) — kernel-family aggregation (Phase-B batched) from nsys kernel summary CSV
+# V07B_FINAL_FUNCTIONAL evidence (tag: final) at exact SHA: 46a59984a70a42b8baedf017d4bdcaa14edc91e1
+# tree state: tracked tree CLEAN at generation (no modified/deleted
+#             tracked files; untracked = evidence outputs of this run)
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
+# checkpoint: /root/models/Qwen3.5-0.8B-Base
+# model: /root/code/cudalm-agent/build/data/qwen35_08b_full.cudalm
+# workload: 4 requests (prompts 2/5/3/4 tok; max_new 3/6/5/3;
+#           1 greedy + 3 seeded); dynamic arrival A,B -> C -> D;
+#           serial prefill, true batched decode, single stream
+# date: 2026-09-28T01:09:51Z
+# =============================================================================
+# nsys CSV: /root/code/cudalm-agent/benchmarks/profiling/v07b_final_batched_nsys_kernel_summary_gpukernsum.csv
+# completed model traversals over the whole profiled process (batched_mode_traversals): 132
+
+units: per-kernel numbers in the CSV were ns; normalized to ns here
+
+== kernel-family table (sorted by total GPU time) ==
+family | total GPU time (ms) | %% kernel time | calls | avg latency (us/call)
+w4a16/int4 projection | 225.292 | 42.83% | 24552 | 9.176
+bf16 lm head | 149.945 | 28.51% | 132 | 1135.945
+deltanet | 81.211 | 15.44% | 9828 | 8.263
+elementwise/residual/swiglu | 28.689 | 5.45% | 11088 | 2.587
+rmsnorm | 22.495 | 4.28% | 8052 | 2.794
+paged attention | 14.495 | 2.76% | 3168 | 4.576
+rope | 3.809 | 0.72% | 1584 | 2.405
+embedding | 0.049 | 0.01% | 18 | 2.720
+
+TOTAL: 525.986 ms over 58422 kernel launches
+
+== top 10 kernels by TOTAL GPU time ==
+kernel | family | total (ms) | %% of kernel time | calls | avg (us)
+cudalm::<unnamed>::bf16_gemv_vec4_row_kernel(const cudalm::<unnamed>::U16 *, const cudalm::<unnamed>::U16 *, __nv_bfloat16 *, int, int) | bf16 lm head | 106.275 | 20.20% | 114 | 932.240
+cudalm::<unnamed>::int4gemv_rowtile4_bf16_kernel(const uint4 *, const __half *, const uint4 *, __nv_bfloat16 *, int, int) | w4a16/int4 projection | 57.202 | 10.88% | 5472 | 10.454
+cudalm::kernels::<unnamed>::deltanet_delta_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, const __nv_bfloat16 *, float *, __nv_bfloat16 *, int, int, float) | deltanet | 52.299 | 9.94% | 2052 | 25.487
+cudalm::<unnamed>::int4gemv_rowtile4_bf16_kernel(const uint4 *, const __half *, const uint4 *, __nv_bfloat16 *, int, int) | w4a16/int4 projection | 42.986 | 8.17% | 5472 | 7.856
+cudalm::kernels::<unnamed>::batch_bf16_gemv_vec4_row_kernel(const cudalm::kernels::<unnamed>::U16 *, const cudalm::kernels::<unnamed>::U16 *, __nv_bfloat16 *, int, int) | bf16 lm head | 32.743 | 6.23% | 12 | 2728.567
+cudalm::<unnamed>::int4gemv_rowtile4_bf16_kernel(const uint4 *, const __half *, const uint4 *, __nv_bfloat16 *, int, int) | w4a16/int4 projection | 29.725 | 5.65% | 2052 | 14.486
+cudalm::<unnamed>::int4gemv_rowtile4_bf16_kernel(const uint4 *, const __half *, const uint4 *, __nv_bfloat16 *, int, int) | w4a16/int4 projection | 20.388 | 3.88% | 4104 | 4.968
+void cudalm::kernels::<unnamed>::qwen35_rmsnorm_zc_kernel<(int)4>(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, float) | rmsnorm | 15.747 | 2.99% | 5586 | 2.819
+cudalm::<unnamed>::int4gemv_rowtile4_bf16_kernel(const uint4 *, const __half *, const uint4 *, __nv_bfloat16 *, int, int) | w4a16/int4 projection | 13.738 | 2.61% | 2052 | 6.695
+cudalm::kernels::<unnamed>::qwen35_add_kernel(const cudalm::kernels::<unnamed>::Bf16x8 *, const cudalm::kernels::<unnamed>::Bf16x8 *, cudalm::kernels::<unnamed>::Bf16x8 *, int) | elementwise/residual/swiglu | 13.380 | 2.54% | 5472 | 2.445
+
+== top 10 kernels by INVOCATION count ==
+kernel | family | calls | total (ms) | avg (us)
+void cudalm::kernels::<unnamed>::qwen35_rmsnorm_zc_kernel<(int)4>(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, float) | rmsnorm | 5586 | 15.747 | 2.819
+cudalm::<unnamed>::int4gemv_rowtile4_bf16_kernel(const uint4 *, const __half *, const uint4 *, __nv_bfloat16 *, int, int) | w4a16/int4 projection | 5472 | 57.202 | 10.454
+cudalm::<unnamed>::int4gemv_rowtile4_bf16_kernel(const uint4 *, const __half *, const uint4 *, __nv_bfloat16 *, int, int) | w4a16/int4 projection | 5472 | 42.986 | 7.856
+cudalm::kernels::<unnamed>::qwen35_add_kernel(const cudalm::kernels::<unnamed>::Bf16x8 *, const cudalm::kernels::<unnamed>::Bf16x8 *, cudalm::kernels::<unnamed>::Bf16x8 *, int) | elementwise/residual/swiglu | 5472 | 13.380 | 2.445
+cudalm::<unnamed>::int4gemv_rowtile4_bf16_kernel(const uint4 *, const __half *, const uint4 *, __nv_bfloat16 *, int, int) | w4a16/int4 projection | 4104 | 20.388 | 4.968
+cudalm::kernels::<unnamed>::qwen35_silu_mul_kernel(const cudalm::kernels::<unnamed>::Bf16x8 *, const cudalm::kernels::<unnamed>::Bf16x8 *, cudalm::kernels::<unnamed>::Bf16x8 *, int) | elementwise/residual/swiglu | 2736 | 7.889 | 2.883
+cudalm::kernels::<unnamed>::deltanet_delta_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, const __nv_bfloat16 *, float *, __nv_bfloat16 *, int, int, float) | deltanet | 2052 | 52.299 | 25.487
+cudalm::<unnamed>::int4gemv_rowtile4_bf16_kernel(const uint4 *, const __half *, const uint4 *, __nv_bfloat16 *, int, int) | w4a16/int4 projection | 2052 | 29.725 | 14.486
+cudalm::<unnamed>::int4gemv_rowtile4_bf16_kernel(const uint4 *, const __half *, const uint4 *, __nv_bfloat16 *, int, int) | w4a16/int4 projection | 2052 | 13.738 | 6.695
+cudalm::kernels::<unnamed>::deltanet_gated_rmsnorm_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, const float *, __nv_bfloat16 *, int, int, float) | deltanet | 2052 | 5.795 | 2.824
+
+== short-duration kernels (avg < 100 us) ==
+kinds: 76/79 | launches: 58290/58422 (99.77%) | time: 376.041 ms (71.49% of kernel time)
+
+== kernels per completed model traversal ==
+completed traversals (whole profiled process, both modes): 132
+total kernel launches: 58422
+kernels per traversal: 442.59

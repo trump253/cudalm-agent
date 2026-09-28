@@ -103,6 +103,31 @@ cudalm_add_test(test_int4_gemv test_int4_gemv cuda/test_int4_gemv.cpp)
 # Qwen3.5 kernel family (zero-centered RMSNorm, fused q/gate split, partial
 # rotate-half RoPE, bf16 KV write/decode attention, bf16 elementwise).
 cudalm_add_test(test_int4_gemv_bf16 test_int4_gemv_bf16 cuda/test_int4_gemv_bf16.cpp)
+# v0.7 Phase B: W4A16 adaptive-N-row-tile variants + production dispatcher —
+# BIT-EXACT kernel-level hard gate vs the frozen v0.6 rowtile4 baseline, all
+# production census shapes (N,K) x B=1/2/3 + edge shapes, multiple seeds,
+# zero/small/mixed-sign/boundary-INT4/zero-group-scale inputs, plus the
+# alignment/K%128/fallback/row-parity contracts. No checkpoint (pure kernel
+# parity vs the frozen entry points).
+cudalm_add_test(test_w4a16_qwen35_optimized test_w4a16_qwen35_optimized
+                cuda/test_w4a16_qwen35_optimized.cpp)
+# v0.7 Phase C: DeltaNet delta-rule state-update variants + experimental
+# dispatcher — BIT-EXACT kernel-level hard gate (BF16 core_out + FP32
+# recurrent state) vs the frozen deltanet_delta / batch_deltanet_delta
+# baselines, n_heads=16 hd=128, B=1/2/3, multiple seeds,
+# zero/small/mixed-sign/g-extreme/beta-extreme/S-kind inputs, multi-step
+# state chains, plus the vvec 16B-alignment fallback + row-parity contracts.
+# No checkpoint (pure kernel parity vs the frozen entry points).
+cudalm_add_test(test_deltanet_delta_qwen35_optimized
+                test_deltanet_delta_qwen35_optimized
+                cuda/test_deltanet_delta_qwen35_optimized.cpp)
+# v0.7 Phase D (candidate 1): fused residual-add + zero-centered RMSNorm —
+# BIT-EXACT kernel-level hard gate (BF16 residual AND BF16 norm output) vs the
+# frozen 2-launch sequence qwen35_add_bf16 -> qwen35_rmsnorm_zc_bf16, M=1/2/3,
+# H=256/1024 (PER=1/4), production + alternate eps, multi-seed random +
+# zero/small/large edge classes. No checkpoint (pure kernel parity).
+cudalm_add_test(test_qwen35_fused_add_rmsnorm test_qwen35_fused_add_rmsnorm
+                cuda/test_qwen35_fused_add_rmsnorm.cpp)
 # Plain BF16 GEMV (the tied-LM-head matmul, v0.3 Phase B) — standalone numeric
 # hard gate: vec4 (K%8==0, aligned) + scalar (K%8!=0 / misaligned) + zero-row,
 # vs a CPU FP32-accumulate -> BF16 RNE reference. No checkpoint needed.

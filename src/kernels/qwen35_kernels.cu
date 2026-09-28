@@ -108,6 +108,118 @@ __global__ void qwen35_rmsnorm_zc_kernel(const __nv_bfloat16* __restrict__ x,
 }
 
 // ---------------------------------------------------------------------------
+// Fused residual-add + zero-centered RMSNorm (v0.7 Phase D, candidate 1).
+//
+// Replaces the 2-launch post-attention residual sequence
+//     qwen35_add_bf16(a, b, res, ...)           // res = bf16(f32(a)+f32(b))
+//     qwen35_rmsnorm_zc_bf16(res, w, norm, ...) // norm = zc-rmsnorm(res)
+// with ONE kernel. BIT-EXACT by construction:
+//   * the residual is computed per-element as a SINGLE bf16 RNE of the fp32
+//     sum (identical to qwen35_add_kernel) and STORED to `res` (the MLP
+//     residual used by the later final add);
+//   * the RMSNorm is computed from the BF16-ROUNDED residual (its fp32
+//     conversion), reusing the frozen qwen35_rmsnorm_zc_kernel<PER> reduction
+//     tree and per-element op order verbatim;
+//   * the norm output is a SINGLE bf16 RNE per element (frozen boundary).
+// No numeric reordering vs the frozen add->rmsnorm pipeline.
+// ---------------------------------------------------------------------------
+template <int PER>
+__global__ void qwen35_fused_add_rmsnorm_zc_kernel(
+    const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
+    const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ res,
+    __nv_bfloat16* __restrict__ norm, int H, float eps) {
+  static_assert(PER == 1 || PER == 4, "PER");
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const __nv_bfloat16* __restrict__ arow =
+      a + static_cast<std::size_t>(row) * H;
+  const __nv_bfloat16* __restrict__ brow =
+      b + static_cast<std::size_t>(row) * H;
+  __nv_bfloat16* __restrict__ resrow =
+      res + static_cast<std::size_t>(row) * H;
+  __nv_bfloat16* __restrict__ normrow =
+      norm + static_cast<std::size_t>(row) * H;
+  const int base = tid * PER;  // first element owned by this thread
+
+  // 1) residual = per-element bf16(f32(a)+f32(b)) (frozen add contract);
+  //    vals[j] = the BF16-ROUNDED residual as fp32 (the frozen norm input).
+  float vals[PER];
+  if (PER == 1) {
+    const float s = __bfloat162float(arow[base]) +
+                    __bfloat162float(brow[base]);
+    const __nv_bfloat16 r = __float2bfloat16_rn(s);
+    resrow[base] = r;
+    vals[0] = __bfloat162float(r);
+  } else {
+    const __nv_bfloat162* pa =
+        reinterpret_cast<const __nv_bfloat162*>(arow + base);
+    const __nv_bfloat162* pb =
+        reinterpret_cast<const __nv_bfloat162*>(brow + base);
+    __nv_bfloat162* pr = reinterpret_cast<__nv_bfloat162*>(resrow + base);
+#pragma unroll
+    for (int i = 0; i < PER / 2; ++i) {
+      const float2 fa = bf162_to_float2(pa[i]);
+      const float2 fb = bf162_to_float2(pb[i]);
+      const __nv_bfloat162 r =
+          __floats2bfloat162_rn(fa.x + fb.x, fa.y + fb.y);
+      pr[i] = r;
+      const float2 fr = bf162_to_float2(r);
+      vals[2 * i] = fr.x;
+      vals[2 * i + 1] = fr.y;
+    }
+  }
+
+  // 2) sum of squares — same per-thread partial order as the frozen norm.
+  float ss = 0.f;
+  if (PER == 1) {
+    ss = vals[0] * vals[0];
+  } else {
+#pragma unroll
+    for (int i = 0; i < PER / 2; ++i) {
+      ss += vals[2 * i] * vals[2 * i] + vals[2 * i + 1] * vals[2 * i + 1];
+    }
+  }
+
+  // 3) frozen reduction tree (warp shuffle + smem warp_sums + rsqrtf).
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+    ss += __shfl_down_sync(0xffffffffu, ss, offset);
+  const int nwarp = (blockDim.x + 31) >> 5;
+  __shared__ float warp_sums[32];
+  __shared__ float s_inv_rms;
+  if ((tid & 31) == 0) warp_sums[tid >> 5] = ss;
+  __syncthreads();
+  if (tid < 32) {
+    float v = (tid < nwarp) ? warp_sums[tid] : 0.f;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+      v += __shfl_down_sync(0xffffffffu, v, offset);
+    if (tid == 0) s_inv_rms = rsqrtf(v / static_cast<float>(H) + eps);
+  }
+  __syncthreads();
+  const float inv_rms = s_inv_rms;
+
+  // 4) norm output — frozen per-element order, ONE bf16 RNE per element.
+  if (PER == 1) {
+    const float w1 = 1.0f + __bfloat162float(w[base]);
+    normrow[base] = __float2bfloat16_rn(vals[0] * inv_rms * w1);
+  } else {
+    const __nv_bfloat162* wp =
+        reinterpret_cast<const __nv_bfloat162*>(w + base);
+    __nv_bfloat162* q = reinterpret_cast<__nv_bfloat162*>(normrow + base);
+#pragma unroll
+    for (int i = 0; i < PER / 2; ++i) {
+      const float2 fw = bf162_to_float2(wp[i]);
+      const float w0 = 1.0f + fw.x;
+      const float w1 = 1.0f + fw.y;
+      const float o0 = vals[2 * i] * inv_rms * w0;
+      const float o1 = vals[2 * i + 1] * inv_rms * w1;
+      q[i] = __floats2bfloat162_rn(o0, o1);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Fused [q;gate] split (plain gather — bit-exact copies).
 // ---------------------------------------------------------------------------
 __global__ void qwen35_split_q_gate_kernel(const __nv_bfloat16* __restrict__ fused,
@@ -414,6 +526,39 @@ void qwen35_rmsnorm_zc_bf16(const __nv_bfloat16* x, const __nv_bfloat16* w,
     CUDA_CHECK_LAUNCH();
   } else {
     qwen35_rmsnorm_zc_kernel<4><<<grid, block, 0, stream>>>(x, w, y, H, eps);
+    CUDA_CHECK_LAUNCH();
+  }
+}
+
+void qwen35_fused_add_rmsnorm_zc_bf16(const __nv_bfloat16* a,
+                                      const __nv_bfloat16* b,
+                                      const __nv_bfloat16* w,
+                                      __nv_bfloat16* res, __nv_bfloat16* norm,
+                                      int M, int H, float eps,
+                                      cudaStream_t stream) {
+  CUDALM_PRECONDITION(M >= 1,
+                      "qwen35_fused_add_rmsnorm_zc_bf16 requires M >= 1");
+  CUDALM_PRECONDITION(H % kZcBlock == 0,
+                      "qwen35_fused_add_rmsnorm_zc_bf16 requires H % 256 == 0");
+  const int per = H / kZcBlock;
+  CUDALM_PRECONDITION(per == 1 || per == 4,
+                      "qwen35_fused_add_rmsnorm_zc_bf16 requires H in {256, "
+                      "1024}");
+  const std::size_t align = (per == 4) ? 8 : 4;
+  CUDALM_PRECONDITION(
+      ptr_aligned(a, align) && ptr_aligned(b, align) && ptr_aligned(w, align) &&
+          ptr_aligned(res, align) && ptr_aligned(norm, align),
+      "qwen35_fused_add_rmsnorm_zc_bf16 requires 4B-aligned (H=256) or 8B-"
+      "aligned (H=1024) base pointers");
+
+  dim3 grid(M), block(kZcBlock);
+  if (per == 1) {
+    qwen35_fused_add_rmsnorm_zc_kernel<1><<<grid, block, 0, stream>>>(
+        a, b, w, res, norm, H, eps);
+    CUDA_CHECK_LAUNCH();
+  } else {
+    qwen35_fused_add_rmsnorm_zc_kernel<4><<<grid, block, 0, stream>>>(
+        a, b, w, res, norm, H, eps);
     CUDA_CHECK_LAUNCH();
   }
 }

@@ -62,6 +62,10 @@ void batch_int4_gemv_bf16(const std::uint8_t* weight, const __half* scale,
                           const __nv_bfloat16* x, __nv_bfloat16* y, int N,
                           int K, int B, cudaStream_t stream);
 
+// v0.7 Phase B: register-count query for the frozen batch R4 kernel
+// (microbench reporting; no behavior change). -1 if unavailable.
+int batch_int4_gemv_bf16_rowtile4_regs();
+
 // ---------------------------------------------------------------------------
 // BF16 GEMV (tied LM head), B rows: y_b = W * x_b.
 // Batched counterpart of bf16_gemv_vec4_row_kernel (frozen bf16_gemv):

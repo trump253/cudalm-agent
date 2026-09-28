@@ -1,0 +1,247 @@
+# =============================================================================
+# CUDALM v0.7 Phase C — canonical E2E, candidate state, raw per-run samples
+# tag: candidate at exact SHA: 4f4395eb8e2c83e7a7e03fb4b6fb8619fa6b8530
+# tree state: tracked tree CLEAN at generation (untracked = evidence outputs of this run)
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA 
+# checkpoint: /root/models/Qwen3.5-0.8B-Base
+# model: build/data/qwen35_08b_full.cudalm
+# workload: canonical (4 requests; prompts 2/5/3/4 tok; max_new 3/6/5/3; 1 greedy
+#           + 3 seeded; dynamic arrival A,B -> C -> D; 27 logical tokens/run;
+#           22 traversals/run); single stream, serial prefill, true batched decode
+# schedule: 15 independent invocations x (2 warmup + 10 measured), --mode batched
+#           (each invocation = fresh process; per-run wall times below are the
+#           raw samples, steady_clock, each bracketed by cudaStreamSynchronize)
+# command (per invocation):
+#   cd build && ./benchmarks/bench_qwen35_continuous_batching \
+#     data/qwen35_08b_full.cudalm /root/models/Qwen3.5-0.8B-Base /root/py311/venv/bin/python3 \
+#     /root/code/cudalm-agent --no-convert <report> --measured-runs 10 --warmup-runs 2 --mode batched
+# date: 2026-09-28T03:03:01Z
+# =============================================================================
+# schedule note: collected as two halves (invocations 1-5 and 6-15), same
+#               exact SHA, same session; all 15 invocations fresh processes
+== invocation 1 (raw per-run wall times, seconds) ==
+  run 1: batched=0.106974s
+  run 2: batched=0.107753s
+  run 3: batched=0.107941s
+  run 4: batched=0.109370s
+  run 5: batched=0.106281s
+  run 6: batched=0.108124s
+  run 7: batched=0.118542s
+  run 8: batched=0.115974s
+  run 9: batched=0.106869s
+  run 10: batched=0.113302s
+  summary:    wall_time_s mean:   0.110113
+  summary:    wall_time_s median: 0.108033
+  summary:    wall_time_s min:    0.106281
+  summary:    wall_time_s max:    0.118542
+== invocation 2 (raw per-run wall times, seconds) ==
+  run 1: batched=0.111035s
+  run 2: batched=0.116448s
+  run 3: batched=0.117806s
+  run 4: batched=0.128578s
+  run 5: batched=0.111840s
+  run 6: batched=0.108935s
+  run 7: batched=0.118384s
+  run 8: batched=0.109399s
+  run 9: batched=0.109512s
+  run 10: batched=0.112015s
+  summary:    wall_time_s mean:   0.114395
+  summary:    wall_time_s median: 0.111927
+  summary:    wall_time_s min:    0.108935
+  summary:    wall_time_s max:    0.128578
+== invocation 3 (raw per-run wall times, seconds) ==
+  run 1: batched=0.110056s
+  run 2: batched=0.109986s
+  run 3: batched=0.110054s
+  run 4: batched=0.109556s
+  run 5: batched=0.113382s
+  run 6: batched=0.107499s
+  run 7: batched=0.107417s
+  run 8: batched=0.108484s
+  run 9: batched=0.108742s
+  run 10: batched=0.107790s
+  summary:    wall_time_s mean:   0.109297
+  summary:    wall_time_s median: 0.109149
+  summary:    wall_time_s min:    0.107417
+  summary:    wall_time_s max:    0.113382
+== invocation 4 (raw per-run wall times, seconds) ==
+  run 1: batched=0.171950s
+  run 2: batched=0.108773s
+  run 3: batched=0.106903s
+  run 4: batched=0.106640s
+  run 5: batched=0.114295s
+  run 6: batched=0.109504s
+  run 7: batched=0.108060s
+  run 8: batched=0.113484s
+  run 9: batched=0.107957s
+  run 10: batched=0.109526s
+  summary:    wall_time_s mean:   0.115709
+  summary:    wall_time_s median: 0.109138
+  summary:    wall_time_s min:    0.106640
+  summary:    wall_time_s max:    0.171950
+== invocation 5 (raw per-run wall times, seconds) ==
+  run 1: batched=0.106154s
+  run 2: batched=0.106086s
+  run 3: batched=0.105734s
+  run 4: batched=0.106303s
+  run 5: batched=0.111632s
+  run 6: batched=0.105953s
+  run 7: batched=0.106148s
+  run 8: batched=0.106464s
+  run 9: batched=0.111000s
+  run 10: batched=0.106125s
+  summary:    wall_time_s mean:   0.107160
+  summary:    wall_time_s median: 0.106151
+  summary:    wall_time_s min:    0.105734
+  summary:    wall_time_s max:    0.111632
+== invocation 6 (raw per-run wall times, seconds) ==
+  run 1: batched=0.106890s
+  run 2: batched=0.106702s
+  run 3: batched=0.106618s
+  run 4: batched=0.112490s
+  run 5: batched=0.107769s
+  run 6: batched=0.107907s
+  run 7: batched=0.112114s
+  run 8: batched=0.108047s
+  run 9: batched=0.108831s
+  run 10: batched=0.112491s
+  summary:    wall_time_s mean:   0.108986
+  summary:    wall_time_s median: 0.107977
+  summary:    wall_time_s min:    0.106618
+  summary:    wall_time_s max:    0.112491
+== invocation 7 (raw per-run wall times, seconds) ==
+  run 1: batched=0.106980s
+  run 2: batched=0.107410s
+  run 3: batched=0.107623s
+  run 4: batched=0.107453s
+  run 5: batched=0.109941s
+  run 6: batched=0.107648s
+  run 7: batched=0.107078s
+  run 8: batched=0.111414s
+  run 9: batched=0.107976s
+  run 10: batched=0.107696s
+  summary:    wall_time_s mean:   0.108122
+  summary:    wall_time_s median: 0.107636
+  summary:    wall_time_s min:    0.106980
+  summary:    wall_time_s max:    0.111414
+== invocation 8 (raw per-run wall times, seconds) ==
+  run 1: batched=0.106765s
+  run 2: batched=0.106726s
+  run 3: batched=0.108413s
+  run 4: batched=0.106059s
+  run 5: batched=0.111963s
+  run 6: batched=0.106582s
+  run 7: batched=0.106230s
+  run 8: batched=0.110805s
+  run 9: batched=0.106309s
+  run 10: batched=0.107536s
+  summary:    wall_time_s mean:   0.107739
+  summary:    wall_time_s median: 0.106746
+  summary:    wall_time_s min:    0.106059
+  summary:    wall_time_s max:    0.111963
+== invocation 9 (raw per-run wall times, seconds) ==
+  run 1: batched=0.106876s
+  run 2: batched=0.114801s
+  run 3: batched=0.108393s
+  run 4: batched=0.106974s
+  run 5: batched=0.115531s
+  run 6: batched=0.111385s
+  run 7: batched=0.106707s
+  run 8: batched=0.110027s
+  run 9: batched=0.106539s
+  run 10: batched=0.106638s
+  summary:    wall_time_s mean:   0.109387
+  summary:    wall_time_s median: 0.107683
+  summary:    wall_time_s min:    0.106539
+  summary:    wall_time_s max:    0.115531
+== invocation 10 (raw per-run wall times, seconds) ==
+  run 1: batched=0.108603s
+  run 2: batched=0.109269s
+  run 3: batched=0.108770s
+  run 4: batched=0.109363s
+  run 5: batched=0.113476s
+  run 6: batched=0.107455s
+  run 7: batched=0.107681s
+  run 8: batched=0.111487s
+  run 9: batched=0.107766s
+  run 10: batched=0.107878s
+  summary:    wall_time_s mean:   0.109175
+  summary:    wall_time_s median: 0.108686
+  summary:    wall_time_s min:    0.107455
+  summary:    wall_time_s max:    0.113476
+== invocation 11 (raw per-run wall times, seconds) ==
+  run 1: batched=0.108009s
+  run 2: batched=0.107310s
+  run 3: batched=0.113440s
+  run 4: batched=0.107498s
+  run 5: batched=0.108935s
+  run 6: batched=0.110348s
+  run 7: batched=0.107901s
+  run 8: batched=0.110414s
+  run 9: batched=0.109559s
+  run 10: batched=0.110455s
+  summary:    wall_time_s mean:   0.109387
+  summary:    wall_time_s median: 0.109247
+  summary:    wall_time_s min:    0.107310
+  summary:    wall_time_s max:    0.113440
+== invocation 12 (raw per-run wall times, seconds) ==
+  run 1: batched=0.106458s
+  run 2: batched=0.106432s
+  run 3: batched=0.106353s
+  run 4: batched=0.106262s
+  run 5: batched=0.111004s
+  run 6: batched=0.106404s
+  run 7: batched=0.106453s
+  run 8: batched=0.106326s
+  run 9: batched=0.106850s
+  run 10: batched=0.106440s
+  summary:    wall_time_s mean:   0.106898
+  summary:    wall_time_s median: 0.106436
+  summary:    wall_time_s min:    0.106262
+  summary:    wall_time_s max:    0.111004
+== invocation 13 (raw per-run wall times, seconds) ==
+  run 1: batched=0.107365s
+  run 2: batched=0.116003s
+  run 3: batched=0.110314s
+  run 4: batched=0.109570s
+  run 5: batched=0.125365s
+  run 6: batched=0.110065s
+  run 7: batched=0.110935s
+  run 8: batched=0.109279s
+  run 9: batched=0.114363s
+  run 10: batched=0.108877s
+  summary:    wall_time_s mean:   0.112214
+  summary:    wall_time_s median: 0.110189
+  summary:    wall_time_s min:    0.107365
+  summary:    wall_time_s max:    0.125365
+== invocation 14 (raw per-run wall times, seconds) ==
+  run 1: batched=0.111008s
+  run 2: batched=0.114252s
+  run 3: batched=0.116374s
+  run 4: batched=0.120279s
+  run 5: batched=0.115198s
+  run 6: batched=0.119645s
+  run 7: batched=0.109041s
+  run 8: batched=0.129411s
+  run 9: batched=0.114562s
+  run 10: batched=0.115828s
+  summary:    wall_time_s mean:   0.116560
+  summary:    wall_time_s median: 0.115513
+  summary:    wall_time_s min:    0.109041
+  summary:    wall_time_s max:    0.129411
+== invocation 15 (raw per-run wall times, seconds) ==
+  run 1: batched=0.108780s
+  run 2: batched=0.107646s
+  run 3: batched=0.108816s
+  run 4: batched=0.109225s
+  run 5: batched=0.110045s
+  run 6: batched=0.107550s
+  run 7: batched=0.107235s
+  run 8: batched=0.111171s
+  run 9: batched=0.110197s
+  run 10: batched=0.109126s
+  summary:    wall_time_s mean:   0.108979
+  summary:    wall_time_s median: 0.108971
+  summary:    wall_time_s min:    0.107235
+  summary:    wall_time_s max:    0.111171
+# =============================================================================

@@ -1,0 +1,13 @@
+# =============================================================================
+# CUDALM v0.7 Phase B (W4A16 GEMV optimization) — nsys — CONTINUOUS-BATCHED-ONLY serving profile AFTER the Phase-B dispatcher freeze (--mode batched, 1 warmup + 5 measured; Phase-A-comparable schedule)
+# V07B evidence at exact SHA: d9c2f85e7e000c1fb60b7c91e650d78c72bef285
+# tree state: tracked tree CLEAN at generation (no modified/deleted
+#             tracked files; untracked = evidence outputs of this run)
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
+# checkpoint: /root/models/Qwen3.5-0.8B-Base
+# model: /root/code/cudalm-agent/build/data/qwen35_08b_full.cudalm
+# workload: 4 requests (prompts 2/5/3/4 tok; max_new 3/6/5/3;
+#           1 greedy + 3 seeded); dynamic arrival A,B -> C -> D;
+#           serial prefill, true batched decode, single stream
+# date: 2026-09-27T14:24:38Z
+# =============================================================================

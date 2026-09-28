@@ -117,6 +117,31 @@ add_executable(tool_qwen35_tokenizer_dump
                tools/dump_qwen35_tokenizer.cpp)
 target_link_libraries(tool_qwen35_tokenizer_dump PRIVATE cudalm)
 
+# v0.7 Phase B: authoritative W4A16 production shape census (host-only).
+# Cross-checks the call-site projection list (model config loaded from the
+# .cudalm file) against the Phase-A batched-only Nsys gpukernsum CSV on the
+# rowtile4 grid; aborts nonzero on any reconciliation mismatch.
+add_executable(tool_dump_w4a16_shape_census
+               tools/dump_w4a16_shape_census.cpp)
+target_link_libraries(tool_dump_w4a16_shape_census PRIVATE cudalm)
+
+# v0.7 Phase B: NCU target harness — runs ONE (N,K,B,variant) W4A16 GEMV
+# repeatedly for controlled single-shape NCU profiling (no model).
+add_executable(tool_ncu_w4a16_target tools/ncu_w4a16_target.cpp)
+target_link_libraries(tool_ncu_w4a16_target PRIVATE cudalm)
+
+# v0.7 Phase C: NCU target harness — runs ONE (B,variant) DeltaNet delta-rule
+# update repeatedly for controlled single-shape NCU profiling (no model).
+add_executable(tool_ncu_deltanet_target tools/ncu_deltanet_target.cpp)
+target_link_libraries(tool_ncu_deltanet_target PRIVATE cudalm)
+
+# v0.7 Phase D (candidate 1): microbenchmark — stream-elapsed GPU time/call of
+# the frozen 2-launch (add -> rmsnorm) post-attention residual sequence vs the
+# fused single kernel, production H=1024, M=1/2/3 (no model, no checkpoint).
+add_executable(tool_microbench_fused_add_rmsnorm
+               tools/microbench_fused_add_rmsnorm.cpp)
+target_link_libraries(tool_microbench_fused_add_rmsnorm PRIVATE cudalm)
+
 # --------------------------------------------------------------------------
 # User-facing CLI (v0.4 Phase C): raw UTF-8 prompt -> generated text.
 # Single request, serial, no streaming / chat template / batching (docs §21).

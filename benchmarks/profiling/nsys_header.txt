@@ -1,0 +1,13 @@
+# =============================================================================
+# CUDALM v0.7 Phase A profiling — nsys — COMPARISON-HARNESS / MIXED-MODE profile (--mode both, 5 measured runs)
+# V07A evidence at exact SHA: 0a952879da6e6cbb26a4aca181e184f26d2a0eef
+# tree state: tracked tree CLEAN at generation (no modified/deleted
+#             tracked files; untracked = evidence outputs of this run)
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
+# checkpoint: /root/models/Qwen3.5-0.8B-Base
+# model: /root/code/cudalm-agent/build/data/qwen35_08b_full.cudalm
+# workload: 4 requests (prompts 2/5/3/4 tok; max_new 3/6/5/3;
+#           1 greedy + 3 seeded); dynamic arrival A,B -> C -> D;
+#           serial prefill, true batched decode, single stream
+# date: 2026-09-27T12:05:03Z
+# =============================================================================

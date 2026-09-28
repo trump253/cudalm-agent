@@ -1,0 +1,20 @@
+========= COMPUTE-SANITIZER
+deltanet delta qwen35 optimized: register counts
+  vreg=46 vvec=59 vchunk(s-pass)=50
+  [PASS] vreg     B=1 single-step bit-exact: 240 combos
+  [PASS] vreg     B=1 32-step chain bit-exact: 96 steps
+  [PASS] vvec     B=1 single-step bit-exact: 240 combos
+  [PASS] vvec     B=1 32-step chain bit-exact: 96 steps
+  [PASS] vchunk   B=1 single-step bit-exact: 240 combos
+  [PASS] vchunk   B=1 32-step chain bit-exact: 96 steps
+  [PASS] vreg     B=2 batch + row parity: 6 combos
+  [PASS] vreg     B=3 batch + row parity: 6 combos
+  [PASS] vvec     B=2 batch + row parity: 6 combos
+  [PASS] vvec     B=3 batch + row parity: 6 combos
+  [PASS] vchunk   B=2 batch + row parity: 6 combos
+  [PASS] vchunk   B=3 batch + row parity: 6 combos
+  [PASS] vvec state-offset +32B (16B-aligned, float4 path) bit-exact
+  [PASS] vvec state-offset +4B (16B-unaligned, frozen fallback) bit-exact
+  [PASS] experimental dispatcher bit-exact vs frozen
+deltanet delta qwen35 optimized: ALL PASS (1047 checks)
+========= ERROR SUMMARY: 0 errors

@@ -304,16 +304,11 @@ void Qwen35FullAttentionLayer::forwardImpl(int position,
                  stream);
   rec(events, 27, stream);
   rec(events, 28, stream);
-  kernels::qwen35_add_bf16(
+  // 10) Fused residual-add + zero-centered RMSNorm 2 — Phase D candidate 1
+  //     (one BIT-EXACT kernel, saves 1 launch/layer).
+  kernels::qwen35_fused_add_rmsnorm_zc_bf16(
       input_.data<__nv_bfloat16>(), o_proj_.data<__nv_bfloat16>(),
-      res1_.data<__nv_bfloat16>(), H, stream);
-  rec(events, 29, stream);
-
-  // 10) zero-centered RMSNorm 2
-  rec(events, 30, stream);
-  kernels::qwen35_rmsnorm_zc_bf16(
-      res1_.data<__nv_bfloat16>(),
-      w_->post_attention_ln.data<__nv_bfloat16>(),
+      w_->post_attention_ln.data<__nv_bfloat16>(), res1_.data<__nv_bfloat16>(),
       rms2_.data<__nv_bfloat16>(), 1, H, cfg_.eps, stream);
   rec(events, 31, stream);
 
@@ -531,16 +526,13 @@ void Qwen35FullAttentionLayer::forward_batch_with_paged_state(
                        b_attn_gated_.data<__nv_bfloat16>(),
                        b_o_proj_.data<__nv_bfloat16>(), w_->o_proj.N,
                        w_->o_proj.K, B, stream);
-  kernels::qwen35_add_bf16(
+  // 10) Fused residual-add + zero-centered RMSNorm 2 (M = B rows) — Phase D
+  //     candidate 1 (one BIT-EXACT kernel, saves 1 launch/layer).
+  kernels::qwen35_fused_add_rmsnorm_zc_bf16(
       b_input_.data<__nv_bfloat16>(), b_o_proj_.data<__nv_bfloat16>(),
-      b_res1_.data<__nv_bfloat16>(), static_cast<std::size_t>(B) * H,
-      stream);
-
-  // 10) zero-centered RMSNorm 2 (M = B rows).
-  kernels::qwen35_rmsnorm_zc_bf16(
-      b_res1_.data<__nv_bfloat16>(),
       w_->post_attention_ln.data<__nv_bfloat16>(),
-      b_rms2_.data<__nv_bfloat16>(), B, H, cfg_.eps, stream);
+      b_res1_.data<__nv_bfloat16>(), b_rms2_.data<__nv_bfloat16>(), B, H,
+      cfg_.eps, stream);
 
   // 11) gate / up (W4A16, batched) + silu_mul (frozen, flat).
   batch_int4_gemv_bf16(w_->gate_proj.weight.data<std::uint8_t>(),

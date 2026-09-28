@@ -42,6 +42,22 @@ void qwen35_rmsnorm_zc_bf16(const __nv_bfloat16* x, const __nv_bfloat16* w,
                             __nv_bfloat16* y, int M, int H, float eps,
                             cudaStream_t stream);
 
+// Fused residual-add + zero-centered RMSNorm (v0.7 Phase D, candidate 1).
+// Computes, for M rows of width H:
+//   res[r]  = bf16(f32(a[r]) + f32(b[r]))            (per-element, frozen add)
+//   norm[r] = zc-rmsnorm(res[r]) with weight w        (frozen reduction tree)
+// where the RMSNorm consumes the BF16-ROUNDED residual. Both `res` (the MLP
+// residual) and `norm` are BF16 and BIT-EXACT to the frozen 2-launch
+// sequence qwen35_add_bf16 -> qwen35_rmsnorm_zc_bf16 on the same inputs.
+// Same preconditions as qwen35_rmsnorm_zc_bf16 (H in {256, 1024}, 4B/8B
+// aligned), plus M rows for the add.
+void qwen35_fused_add_rmsnorm_zc_bf16(const __nv_bfloat16* a,
+                                      const __nv_bfloat16* b,
+                                      const __nv_bfloat16* w,
+                                      __nv_bfloat16* res, __nv_bfloat16* norm,
+                                      int M, int H, float eps,
+                                      cudaStream_t stream);
+
 // Split the fused q_proj output (rows h*2*head_dim .. h*2*head_dim+head_dim-1
 // = query head h, rows h*2*head_dim+head_dim .. h*2*head_dim+2*head_dim-1
 // = gate head h, h = 0..n_heads-1 — the official `chunk(2, dim=-1)` layout)

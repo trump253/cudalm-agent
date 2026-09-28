@@ -1,0 +1,115 @@
+# =============================================================================
+# CUDALM v0.7 Phase D (candidate 1) — batched-only Nsys before/after
+# fused residual-add + zero-centered RMSNorm post-attention residual path.
+# Both profiles: 1 warmup + 5 measured, --mode batched, canonical workload,
+# CUDA_VISIBLE_DEVICES=0, RTX 2080 Ti, driver 570.172.08, CUDA 11.8.
+# Directly comparable: delta-rule = 2052 + 324 = 2376 logical calls = 132
+# traversals in BOTH (same workload). 6 runs (1 warmup + 5 measured) x 22.
+# ---------------------------------------------------------------------------
+===== BASE (v07d batched nsys) =====
+total GPU kernel time :    518.078 ms
+total kernel launches :    58422   (442.6 / traversal, TRANS=132)
+host launch APIs      :    58422   (442.6 / traversal)
+host launch time      :    296.174 ms   (2243.740 us / traversal)
+--- key families (GPU time ms / launches) ---
+  qwen35_add_kernel                            15.132 ms /   6336 launches
+  qwen35_rmsnorm_zc_kernel                     22.233 ms /   8052 launches
+  deltanet_delta_kernel                        51.040 ms /   2052 launches
+  deltanet_gated_rmsnorm_kernel                 6.630 ms /   2376 launches
+  int4gemv_rowtile4_bf16_kernel               175.819 ms /  21204 launches
+  batch_int4gemv_rowtile4_bf16_kernel          46.060 ms /   3348 launches
+  bf16_gemv_vec4_row_kernel                   104.516 ms /    114 launches
+  batch_bf16_gemv_vec4_row_kernel              43.430 ms /     18 launches
+--- all families (GPU time ms) ---
+  int4gemv_rowtile4_bf16_kernel                 175.819 ms /  21204
+  bf16_gemv_vec4_row_kernel                     104.516 ms /    114
+  deltanet_delta_kernel                          51.040 ms /   2052
+  batch_int4gemv_rowtile4_bf16_kernel            46.060 ms /   3348
+  batch_bf16_gemv_vec4_row_kernel                43.430 ms /     18
+  qwen35_rmsnorm_zc_kernel                       22.233 ms /   8052
+  qwen35_add_kernel                              15.132 ms /   6336
+  qwen35_silu_mul_kernel                          9.017 ms /   3168
+  batch_deltanet_delta_kernel                     8.523 ms /    324
+  deltanet_gated_rmsnorm_kernel                   6.630 ms /   2376
+  qwen35_paged_attention_scores_kernel            6.210 ms /    684
+  deltanet_conv_kernel                            5.578 ms /   2052
+  deltanet_gbeta_kernel                           5.354 ms /   2052
+  qwen35_partial_rope_kernel                      3.249 ms /   1368
+  qwen35_gate_mul_kernel                          2.313 ms /    792
+  qwen35_paged_attention_pv_kernel                2.076 ms /    684
+  qwen35_paged_attention_softmax_kernel           1.991 ms /    684
+  qwen35_split_q_gate_kernel                      1.746 ms /    792
+  qwen35_paged_kv_write_kernel                    1.579 ms /    684
+  batch_paged_scores_kernel                       1.420 ms /    108
+  batch_deltanet_conv_kernel                      0.980 ms /    324
+  batch_deltanet_gbeta_kernel                     0.857 ms /    324
+  batch_deltanet_conv_split_kernel                0.728 ms /    324
+  batch_partial_rope_kernel                       0.519 ms /    216
+  batch_paged_pv_kernel                           0.417 ms /    108
+  batch_paged_softmax_kernel                      0.331 ms /    108
+  batch_paged_kv_write_kernel                     0.281 ms /    108
+  batch_embed_gather_kernel                       0.049 ms /     18
+--- host API counts ---
+  cudaLaunchKernel                  58422
+
+===== CAND (v07d batched nsys) =====
+total GPU kernel time :    518.819 ms
+total kernel launches :    55254   (418.6 / traversal, TRANS=132)
+host launch APIs      :    55254   (418.6 / traversal)
+host launch time      :    279.675 ms   (2118.749 us / traversal)
+--- key families (GPU time ms / launches) ---
+  qwen35_add_kernel                             7.710 ms /   3168 launches
+  qwen35_rmsnorm_zc_kernel                     13.637 ms /   4884 launches
+  qwen35_fused_add_rmsnorm_zc_kernel            9.829 ms /   3168 launches
+  deltanet_delta_kernel                        52.058 ms /   2052 launches
+  deltanet_gated_rmsnorm_kernel                 6.754 ms /   2376 launches
+  int4gemv_rowtile4_bf16_kernel               178.570 ms /  21204 launches
+  batch_int4gemv_rowtile4_bf16_kernel          46.273 ms /   3348 launches
+  bf16_gemv_vec4_row_kernel                   106.226 ms /    114 launches
+  batch_bf16_gemv_vec4_row_kernel              43.911 ms /     18 launches
+--- all families (GPU time ms) ---
+  int4gemv_rowtile4_bf16_kernel                 178.570 ms /  21204
+  bf16_gemv_vec4_row_kernel                     106.226 ms /    114
+  deltanet_delta_kernel                          52.058 ms /   2052
+  batch_int4gemv_rowtile4_bf16_kernel            46.273 ms /   3348
+  batch_bf16_gemv_vec4_row_kernel                43.911 ms /     18
+  qwen35_rmsnorm_zc_kernel                       13.637 ms /   4884
+  qwen35_fused_add_rmsnorm_zc_kernel              9.829 ms /   3168
+  qwen35_silu_mul_kernel                          9.190 ms /   3168
+  batch_deltanet_delta_kernel                     8.557 ms /    324
+  qwen35_add_kernel                               7.710 ms /   3168
+  deltanet_gated_rmsnorm_kernel                   6.754 ms /   2376
+  qwen35_paged_attention_scores_kernel            6.318 ms /    684
+  deltanet_conv_kernel                            5.632 ms /   2052
+  deltanet_gbeta_kernel                           5.431 ms /   2052
+  qwen35_partial_rope_kernel                      3.297 ms /   1368
+  qwen35_gate_mul_kernel                          2.332 ms /    792
+  qwen35_paged_attention_pv_kernel                2.114 ms /    684
+  qwen35_paged_attention_softmax_kernel           2.015 ms /    684
+  qwen35_split_q_gate_kernel                      1.777 ms /    792
+  qwen35_paged_kv_write_kernel                    1.599 ms /    684
+  batch_paged_scores_kernel                       1.431 ms /    108
+  batch_deltanet_conv_kernel                      0.991 ms /    324
+  batch_deltanet_gbeta_kernel                     0.866 ms /    324
+  batch_deltanet_conv_split_kernel                0.715 ms /    324
+  batch_partial_rope_kernel                       0.516 ms /    216
+  batch_paged_pv_kernel                           0.418 ms /    108
+  batch_paged_softmax_kernel                      0.326 ms /    108
+  batch_paged_kv_write_kernel                     0.280 ms /    108
+  batch_embed_gather_kernel                       0.049 ms /     18
+--- host API counts ---
+  cudaLaunchKernel                  55254
+
+# ---------------------------------------------------------------------------
+# DELTA (candidate - baseline):
+#   kernel launches / traversal : 442.6 -> 418.6  = -24.0 / traversal
+#   host cudaLaunchKernel       : 2243.7us -> 2118.7us = -125.0us / traversal (-5.6%)
+#   total GPU kernel time       : 518.078 -> 518.819 ms = +0.741 ms (+0.14%, run noise)
+#   add+rmsnorm family GPU time : 37.365 -> 31.176 ms = -6.19 ms (fused faster)
+#   fused kernel per-call       : 9.829ms/3168 = 3.103us vs replaced pair ~5.15us/2-launch
+# The -24 launches/traversal is EXACTLY the predicted -1 launch/layer x 24 layers.
+# GPU total is flat within noise: the fused family is faster but the dominant
+# GEMV families (int4gemv/bf16_gemv, ~80% of GPU time) vary run-to-run and offset
+# it. No important kernel regression: the fused kernel (3.10us/1-launch) is
+# faster than the replaced 2-launch pair (~5.15us) both per-call and per-pair.
+# =============================================================================

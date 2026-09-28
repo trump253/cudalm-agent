@@ -1,0 +1,22 @@
+# =============================================================================
+# CUDALM v0.7 Phase C — batched-only nsys summary (candidate, measured table)
+# tag: candidate at exact SHA: 4f4395eb8e2c83e7a7e03fb4b6fb8619fa6b8530
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
+# workload: canonical (4 requests; 22 traversals/run), 5 measured runs, --mode batched
+# command:
+#   nsys profile -o v07c_candidate_batched_nsys -f true \
+#     ./benchmarks/bench_qwen35_continuous_batching \
+#     data/qwen35_08b_full.cudalm /root/models/Qwen3.5-0.8B-Base /root/py311/venv/bin/python3 \
+#     /root/code/cudalm-agent --no-convert --measured-runs 5 --mode batched
+# =============================================================================
+Processing [v07c_candidate_batched_nsys.sqlite] with [/opt/nvidia/nsight-systems/2022.4.2/host-linux-x64/reports/gpumemtimesum.py]... 
+
+ ** GPU MemOps Summary (by Time) (gpumemtimesum):
+
+ Time (%)  Total Time (ns)  Count  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)      Operation     
+ --------  ---------------  -----  --------  --------  --------  --------  -----------  ------------------
+     76.8        114588399   1592   71977.6    1057.0       927  61895214    1555417.9  [CUDA memcpy HtoD]
+     13.6         20288541   9438    2149.7    1984.0      1760     13632        474.3  [CUDA memcpy DtoD]
+      6.9         10334423   2148    4811.2    2016.0       991    471457      34577.2  [CUDA memset]     
+      2.7          4010083     72   55695.6   38960.0     38432    137504      30065.0  [CUDA memcpy DtoH]
+

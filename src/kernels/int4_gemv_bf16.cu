@@ -242,4 +242,14 @@ void int4_gemv_bf16(const std::uint8_t* weight, const __half* scales,
   }
 }
 
+// v0.7 Phase B: register-count query for the frozen R4 kernel (microbench
+// reporting; no behavior change).
+int int4_gemv_bf16_rowtile4_regs() {
+  cudaFuncAttributes attr;
+  if (cudaFuncGetAttributes(&attr, int4gemv_rowtile4_bf16_kernel) !=
+      cudaSuccess)
+    return -1;
+  return attr.numRegs;
+}
+
 }  // namespace cudalm
