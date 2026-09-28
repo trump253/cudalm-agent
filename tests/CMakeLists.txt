@@ -72,6 +72,22 @@ cudalm_add_test(test_state_pool_formulas test_state_pool_formulas
 cudalm_add_test(test_session_manager test_session_manager
                 cpu/test_session_manager.cpp)
 
+# v0.8 Phase B: session turn PREFLIGHT contract gate (CPU test: NO
+# checkpoint, NO model — an unloaded Qwen35Model + the REAL state pools +
+# a small synthetic config). The turn preflight's model-independent checks
+# are fully gateable here; EVERY failing call must be ZERO-MUTATION
+# (length / block table / pool accounting / a pre-dirtied Delta slot
+# pattern all exactly unchanged). Gates: invalid SessionId; empty
+# new_input_tokens; max_new_tokens < 0; invalid sampling config; CONTEXT
+# OVERFLOW (length + input + max_new_tokens > max_seq_len -> the explicit
+# "context overflow" reject, no eviction / truncation); the EXACT boundary
+# (sum == max_seq_len) ACCEPTED by the capacity gate (the call proceeds
+# past it and fails later at the model gate, not the overflow gate);
+# stream mismatch (the v0.5 single-stream contract, preflighted);
+# model-not-loaded on a fully valid call.
+cudalm_add_test(test_session_turn_contract test_session_turn_contract
+                cpu/test_session_turn_contract.cpp)
+
 # v0.6 Phase A: request scheduler / control-plane gate (CPU test: NO
 # checkpoint, NO model — a deterministic fake forwarder over the REAL
 # Qwen35StateManager pools). Gates: request lifecycle (Waiting/Running/
@@ -226,6 +242,41 @@ add_test(NAME test_qwen35_session_runtime
                  ${CUDALM_TOOL_PYTHON3}
                  ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_qwen35_session_runtime PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# v0.8 Phase B: incremental multi-turn generation real-checkpoint hard gate
+# — the v0.8 Phase B sign-off test. Session A: turn 1 (append [a,b,c],
+# generate 2, greedy) + turn 2 (append [f,g], generate 2, seeded sampling)
+# vs the equivalent ONE-SHOT CONTINUOUS execution of the same token stream
+# on an independent fresh v0.5 sequence (manual token-by-token drive, same
+# per-phase sampler configs, no turn boundary). Gates (BIT-IDENTICAL):
+# every committed forward's FULL logits [248320] in order (turn 1 steps
+# 0..4 + turn 2 steps 0..3 == the reference's 9 forwards), generated token
+# IDs, logical length (5 / 9), and the full final hybrid state (18x Delta
+# conv+rec, 6x FA logical K/V rows through the block table) — proving the
+# COMMIT CONTRACT (the turn's LAST generated token, including a stop-
+# triggering one, is in the session state; no lagging). Plus: preflight on
+# the loaded model (invalid eos / invalid input token, zero mutation);
+# max_new_tokens == 0 (input-only append; state == a fresh 3-token
+# reference); EOS COMMIT (a turn gated by eos==the-first-greedy-token stops
+# Eos with that token committed, state == the M=1 no-gate turn); CONTEXT
+# OVERFLOW on the real model (length max_seq_len-2 + 2 + 1 rejected, zero
+# mutation, no eviction); RESET + RE-RUN (fresh under the SAME id; the same
+# two turns bit-identical to the original run == the one-shot reference);
+# RUNTIME FAILURE (separate 3-page manager; KV OOM: the committed inputs /
+# the committed g0 STAY, the failing token is NOT committed; no rollback).
+# Self-skips (77) when the checkpoint is absent; the Phase B evidence
+# environment MUST actually run it.
+add_executable(test_qwen35_session_generation
+               cuda/test_qwen35_session_generation.cpp)
+target_link_libraries(test_qwen35_session_generation PRIVATE cudalm)
+add_test(NAME test_qwen35_session_generation
+         COMMAND test_qwen35_session_generation
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_session_generation PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 # --- Cross-language weight-file tests (Python tools -> C++ loader) ------------
