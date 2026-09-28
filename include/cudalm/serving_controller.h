@@ -54,7 +54,10 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
+#include <map>
+#include <set>
 #include <vector>
 
 #include "cudalm/scheduler.h"
@@ -62,6 +65,47 @@
 #include "cudalm/weight_format.h"  // Status
 
 namespace cudalm {
+
+// ---- v0.9 Phase B: committed-token streaming + cancellation/deadline ----
+
+// A MONOTONIC clock (the deadline checks use it exclusively). Inject a
+// FAKE clock in CPU tests (deterministic time); nullptr in the
+// controller constructor = the real system monotonic clock.
+class MonotonicClock {
+ public:
+  virtual ~MonotonicClock() = default;
+  virtual std::chrono::steady_clock::time_point now() const = 0;
+};
+
+// The real clock (std::chrono::steady_clock).
+class SystemMonotonicClock final : public MonotonicClock {
+ public:
+  std::chrono::steady_clock::time_point now() const override {
+    return std::chrono::steady_clock::now();
+  }
+};
+
+// One serving event (the output of step_stream / run_stream / poll).
+enum class ServingEventKind {
+  Token,            // one COMMITTED token id (exactly once, in order)
+  RequestTerminal,  // the request reached a terminal state — emitted
+                    // AFTER all of its committed tokens
+};
+
+struct ServingEvent {
+  ServingEventKind kind = ServingEventKind::Token;
+  RequestId request_id = 0;
+  SessionId session_id = 0;  // the bound session
+  int token_id = 0;  // Token events only
+  // RequestTerminal events only:
+  RequestStatus status = RequestStatus::Waiting;
+  FinishReason finish_reason = FinishReason::None;
+  // The SERVING-LAYER termination reason: the frozen FinishReason has
+  // no deadline reason, so a deadline-cancelled request reports
+  // (Cancelled, Cancelled) at the scheduler level AND
+  // deadline_exceeded = true here.
+  bool deadline_exceeded = false;
+};
 
 // The serving admission limits. For max_sessions / max_live_requests:
 // -1 = UNLIMITED, 0 = zero capacity (reject EVERY admission), N>0 = N.
@@ -99,15 +143,19 @@ struct ServingStats {
   std::uint64_t rejected_context_limit = 0;
 };
 
-// The serving admission layer (v0.9 Phase A). Thin, non-owning,
-// policy-only: see the file header for the pinned semantics.
+// The serving layer (v0.9 Phase A admission + Phase B committed-token
+// streaming / cancellation / deadline). Thin, non-owning: see the file
+// header for the pinned semantics.
 class ServingController {
  public:
   // sched/sessions are NON-OWNING (they outlive the controller). The
   // context policy cap is clamped to the model's max_seq_len (it can
-  // only restrict below the model limit, never exceed it).
+  // only restrict below the model limit, never exceed it). `clock` is
+  // NON-OWNING and optional (nullptr = the real system monotonic
+  // clock); it is used ONLY for the per-request deadline checks.
   ServingController(Scheduler& scheduler, SessionManager& sessions,
-                    ServingLimits limits);
+                    ServingLimits limits,
+                    MonotonicClock* clock = nullptr);
 
   // ---- session admission (policy) --------------------------------------
   // live sessions < max_sessions -> SessionManager::create_session;
@@ -125,25 +173,80 @@ class ServingController {
   // sampling / vocab / non-empty / max_new / eos / token range / session
   // live / BUSY / model overflow) is invoked and its Status is passed
   // through unchanged.
+  // `deadline` (monotonic) is the per-request deadline (v0.9 Phase B):
+  // the DEFAULT `time_point::max()` = NO deadline. Checked BEFORE every
+  // scheduler step (see step_stream / run_stream / step / run): once
+  // expired, the request is CANCELLED before its next forward (no
+  // additional token commit; the session stays live). A deadline is a
+  // COOPERATIVE BOUNDARY BETWEEN SCHEDULER STEPS — it never preempts
+  // in-flight CUDA work.
   Status admit_turn(SessionId session_id,
                     const std::vector<int>& new_input_tokens,
                     int max_new_tokens, int eos_token_id,
-                    const SamplingConfig& sampling, RequestId* out_request_id);
+                    const SamplingConfig& sampling, RequestId* out_request_id,
+                    std::chrono::steady_clock::time_point deadline =
+                        std::chrono::steady_clock::time_point::max());
 
   // ---- lifecycle (forwarding; no policy of its own) ---------------------
   Status reset_session(SessionId session_id);  // session STAYS live
   Status destroy_session(SessionId session_id);  // releases session quota
-  Status cancel(RequestId request_id);  // releases request capacity
-                                        // (synced immediately)
+  // Cancels a live request (Waiting/Running -> Cancelled; the
+  // already-terminal idempotent contract is the frozen scheduler's).
+  // The request capacity is released IMMEDIATELY (the live count is
+  // derived); the session STAYS live at its last committed boundary.
+  // Note (v0.9 Phase B): cancel does NOT reap the request's streaming
+  // bookkeeping — its COMMITTED-but-not-yet-emitted tokens can still be
+  // drained (poll / the next step_stream); the PENDING token (sampled,
+  // not committed) is never emitted.
+  Status cancel(RequestId request_id);
 
   // ---- driving (the frozen scheduler control plane) ---------------------
-  // After each drive the controller syncs its quota bookkeeping:
-  // terminal requests release their live-request capacity exactly once.
+  // Every drive runs the per-request DEADLINE CHECK first (cancel the
+  // expired requests BEFORE their next forward), then drives the frozen
+  // scheduler, then syncs the quota bookkeeping (terminal requests
+  // release their live-request capacity exactly once).
   Status step();
+  // Drive to quiescence (every tracked request terminal) via steps —
+  // the same per-iteration behavior as Scheduler::run, with the
+  // deadline check before each step.
   Status run();
 
+  // ---- committed-token streaming (v0.9 Phase B) -------------------------
+  // PULL-BASED: the controller never pushes; a token becomes
+  // stream-visible only when a drive / poll DRAINS it.
+  //
+  // COMMIT-BEFORE-VISIBLE (the hard constraint): a token is emitted
+  // only after a SUCCESSFUL forward committed it into the session
+  // state — i.e. only `generated[0 .. committed_generated)` is ever
+  // emitted; the pending tail (sampled, not committed) is NEVER
+  // emitted (including on failure and on cancel). Each committed
+  // token is emitted EXACTLY ONCE and IN ORDER (a per-request
+  // serving-layer emitted cursor); the final EOS / max_new token is
+  // committed (and therefore emitted) BEFORE the terminal report.
+  //
+  // Events per request are contiguous and in order; a request's
+  // RequestTerminal event follows ALL of its Token events. One
+  // Scheduler::step() may commit tokens for SEVERAL requests; the
+  // drain emits each request's own events separately (no cross-
+  // request contamination).
+  //
+  // Drive one scheduler step (deadline check first), then drain:
+  // returns the Token + RequestTerminal events of this step (possibly
+  // empty). A failed request surfaces as a RequestTerminal event with
+  // status Failed.
+  std::vector<ServingEvent> step_stream();
+  // Drive to quiescence (deadline check before each step), draining
+  // after every step; returns ALL events of the whole drive in order.
+  std::vector<ServingEvent> run_stream();
+  // WITHOUT driving: drain ONE tracked request's not-yet-emitted
+  // committed tokens (and its terminal event, if it is terminal).
+  // Errors for unknown / already-reaped request ids.
+  Status poll(RequestId request_id, std::vector<ServingEvent>* out);
+
   // Quota sync: reap tracked requests that reached a terminal state
-  // (idempotent; safe to call any number of times).
+  // (idempotent; safe to call any number of times). Reaping removes
+  // the request's streaming bookkeeping (cursor / deadline) — drain
+  // BEFORE the next sync if you still need its tokens.
   void sync();
 
   // Observability: a snapshot (live_* derived on read — read-only).
@@ -154,11 +257,30 @@ class ServingController {
   // The live-request count DERIVED from the tracked ids + their
   // current scheduler status (no counter, no double-decrement path).
   int live_request_count() const;
+  // The pre-step deadline check: cancel (and mark deadline_exceeded)
+  // every tracked live request whose deadline has expired.
+  void check_deadlines_();
+  // Drain ONE request: emit its not-yet-emitted COMMITTED tokens
+  // (exactly once, in order) and, if it is terminal, its ONE
+  // RequestTerminal event (after all its tokens).
+  void drain_(const Request* r, std::vector<ServingEvent>* out);
+  // One controller step: deadline check -> frozen step -> (optionally)
+  // drain ALL tracked requests (admission order) -> sync. Returns the
+  // frozen step's Status (the first error; failures also surface as
+  // RequestTerminal(Failed) events when draining).
+  Status step_drive_(std::vector<ServingEvent>* out);
 
   Scheduler& sched_;
   SessionManager& sessions_;
   ServingLimits limits_;
+  MonotonicClock* clock_ = nullptr;  // nullptr = use system_clock_
+  SystemMonotonicClock system_clock_;
   std::vector<RequestId> tracked_;  // admitted, not yet reaped
+  // ---- v0.9 Phase B streaming / deadline bookkeeping --------------------
+  std::map<RequestId, int> emitted_;  // per-request emitted cursor
+  std::set<RequestId> terminal_reported_;  // terminal event sent once
+  std::map<RequestId, std::chrono::steady_clock::time_point> deadline_;
+  std::set<RequestId> deadline_cancelled_;  // cancelled BY the deadline
   std::uint64_t total_admitted_sessions_ = 0;
   std::uint64_t total_admitted_requests_ = 0;
   std::uint64_t rejected_session_limit_ = 0;
