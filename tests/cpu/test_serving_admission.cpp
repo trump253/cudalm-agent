@@ -21,7 +21,11 @@
 //     terminal request is never double-decremented (repeated sync() is
 //     a no-op);
 //   * reset_session does NOT release the session quota;
-//   * stats counters carry the pinned semantics.
+//   * stats counters carry the pinned semantics;
+//   * QUOTA TRI-STATE (review fix): a quota of 0 = ZERO CAPACITY (the
+//     very first create_session / admit_turn is rejected, zero
+//     mutation), while -1 STILL means UNLIMITED (previously 0 was
+//     misread as unlimited).
 //
 // Provenance: CUDALM-native (v0.9 Phase A).
 
@@ -343,6 +347,79 @@ int main() {
     CHECK(ctrl.run().ok);
     std::printf("  [ok] forward failure releases the quota; the session "
                 "retries from its committed boundary\n");
+  }
+
+  // =========================================================================
+  // 5. Quota tri-state boundary (review fix): 0 = ZERO CAPACITY, -1 =
+  //    UNLIMITED (previously a quota of 0 was misread as unlimited)
+  // =========================================================================
+  {
+    Qwen35StateManager mgr(cfg, 4, 8, 4, stream);
+    SessionManager sm(mgr);
+    FakeForwarder fwd;
+    Scheduler sched(fwd, mgr, stream, &sm);
+
+    // max_sessions = 0: the FIRST create_session is REJECTED.
+    ServingController ctrl(sched, sm,
+                           ServingLimits{/*max_sessions=*/0, -1, 0});
+    SessionId s = 0;
+    const PoolSnapshot sp = snap(mgr);
+    Status st = ctrl.create_session(&s);
+    CHECK(!st.ok);
+    CHECK(st.message.find("session limit") != std::string::npos);
+    CHECK_EQ(s, static_cast<SessionId>(0));  // NO SessionId consumed
+    CHECK_EQ(sm.num_sessions(), 0);
+    CHECK(snap(mgr) == sp);  // no sequence / slot / page mutation
+    CHECK_EQ(static_cast<int>(ctrl.stats().rejected_session_limit), 1);
+    std::printf("  [ok] max_sessions = 0: zero capacity — first create "
+                "rejected, zero mutation\n");
+
+    // max_live_requests = 0: session creation is ALLOWED, but the
+    // FIRST admit_turn is REJECTED.
+    ServingController ctrl2(sched, sm,
+                            ServingLimits{-1, /*max_live_requests=*/0, 0});
+    SessionId s2 = 0;
+    CHECK(ctrl2.create_session(&s2).ok);  // unlimited sessions
+    // (session creation legitimately allocates a Delta slot — the
+    // zero-mutation baseline for the admit rejection is AFTER it)
+    const PoolSnapshot sp2 = snap(mgr);
+    RequestId r = 0;
+    const int reqs = sched.num_requests();
+    const RequestId next = sched.next_request_id();
+    const int len = mgr.lookup(sm.lookup(s2)->sequence_id)->length;
+    st = ctrl2.admit_turn(s2, {10, 20}, 2, -1, kGreedy, &r);
+    CHECK(!st.ok);
+    CHECK(st.message.find("live request limit") != std::string::npos);
+    CHECK_EQ(r, static_cast<RequestId>(0));  // NO RequestId consumed
+    CHECK_EQ(sched.num_requests(), reqs);
+    CHECK_EQ(sched.next_request_id(), next);
+    CHECK_EQ(mgr.lookup(sm.lookup(s2)->sequence_id)->length, len);
+    CHECK(snap(mgr) == sp2);  // no logical / KV / Delta mutation
+    CHECK_EQ(static_cast<int>(ctrl2.stats().rejected_request_limit), 1);
+    std::printf("  [ok] max_live_requests = 0: zero capacity — session "
+                "created, first admit rejected, zero mutation\n");
+  }
+
+  {
+    // -1 still means UNLIMITED (the tri-state fix did not change it).
+    Qwen35StateManager mgr(cfg, 4, 8, 4, stream);
+    SessionManager sm(mgr);
+    FakeForwarder fwd;
+    Scheduler sched(fwd, mgr, stream, &sm);
+    ServingController ctrl(sched, sm,
+                           ServingLimits{-1, -1, /*max_context=*/0});
+    SessionId s1 = 0, s2 = 0, s3 = 0;
+    CHECK(ctrl.create_session(&s1).ok);
+    CHECK(ctrl.create_session(&s2).ok);
+    CHECK(ctrl.create_session(&s3).ok);
+    RequestId r1 = 0, r2 = 0;
+    CHECK(ctrl.admit_turn(s1, {1, 2}, 2, -1, kGreedy, &r1).ok);
+    CHECK(ctrl.admit_turn(s2, {3, 4}, 2, -1, kGreedy, &r2).ok);
+    CHECK_EQ(ctrl.stats().live_requests, 2);  // two live at once, freely
+    CHECK_EQ(static_cast<int>(ctrl.stats().rejected_session_limit), 0);
+    CHECK_EQ(static_cast<int>(ctrl.stats().rejected_request_limit), 0);
+    std::printf("  [ok] -1 still unlimited (sessions + concurrent live "
+                "requests admitted freely)\n");
   }
 
   CUDA_CHECK(cudaStreamDestroy(stream));
