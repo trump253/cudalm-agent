@@ -130,6 +130,14 @@ add_test(NAME test_qwen35_session_text
 set_tests_properties(test_qwen35_session_text PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 300)
 
+# v0.8 Phase D review fix: cudalm-chat CLI LINE contract gate (tiny CPU
+# unit test — NO model, NO GPU, check.h only). Pins the CLI contract
+# blocker fix: EXACT WHOLE-LINE command matching (" reset " is raw
+# text, only "" is ignored, whitespace-only non-empty line = raw text)
+# + BINARY-SAFE output (embedded NULs byte-exact). See chat_cli.h.
+cudalm_add_test(test_cudalm_chat_cli test_cudalm_chat_cli
+                cpu/test_cudalm_chat_cli.cpp)
+
 # v0.6 Phase A: request scheduler / control-plane gate (CPU test: NO
 # checkpoint, NO model — a deterministic fake forwarder over the REAL
 # Qwen35StateManager pools). Gates: request lifecycle (Waiting/Running/
