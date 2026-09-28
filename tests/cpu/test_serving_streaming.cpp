@@ -19,7 +19,14 @@
 //     commit), the terminal event carries deadline_exceeded = true;
 //   * A/B INTERLEAVING: one step can commit for both requests; each
 //     request's event stream concatenates to exactly its own final
-//     committed generated ids (no cross-request contamination).
+//     committed generated ids (no cross-request contamination);
+//   * REVIEW FIX (streaming lifecycle): terminal != streaming state
+//     destroyed — a request driven to terminal with the plain step()
+//     (no drain) keeps its committed tokens + terminal event
+//     pollable (exactly once; a re-poll returns empty), the quota is
+//     released immediately and reusable; and run_stream() does not
+//     lose the pending events of a terminal-but-undrained request
+//     just because live_requests is already 0.
 //
 // Provenance: CUDALM-native (v0.9 Phase B).
 
@@ -412,6 +419,118 @@ int main() {
     CHECK_EQ(mgr.lookup(sb)->length, 3);
     std::printf("  [ok] A/B interleaving: per-request streams exact, no "
                 "cross-request contamination\n");
+  }
+
+  // =========================================================================
+  // 6. REVIEW FIX: terminal step() -> poll(): the final committed token +
+  //    the terminal event stay pollable; quota released + reusable
+  // =========================================================================
+  {
+    Qwen35StateManager mgr(cfg, 4, 8, 4, stream);
+    SessionManager sm(mgr);
+    FakeForwarder fwd;
+    Scheduler sched(fwd, mgr, stream, &sm);
+    ServingController ctrl(sched, sm,
+                           ServingLimits{-1, /*max_live=*/1, 0});
+    SessionId s = 0;
+    CHECK(ctrl.create_session(&s).ok);
+    const SequenceId seq = sm.lookup(s)->sequence_id;
+    // 1 input, max_new 1: fake pick g0 = (3*0+1) % 512 = 1.
+    RequestId r = 0;
+    CHECK(ctrl.admit_turn(s, {10}, 1, -1, kGreedy, &r).ok);
+    // Drive with the plain step() — NO step_stream (nothing drains):
+    CHECK(ctrl.step().ok);  // prefill the input + sample g0 (pending)
+    CHECK(ctrl.step().ok);  // decode: commit g0 (= max_new) -> TERMINAL
+
+    // The quota is released IMMEDIATELY (terminal-but-undrained is NOT
+    // live):
+    CHECK_EQ(ctrl.stats().live_requests, 0);
+    // poll() returns the final committed token THEN the terminal event:
+    std::vector<ServingEvent> pol;
+    CHECK(ctrl.poll(r, &pol).ok);
+    Collected c;
+    CHECK_EQ(collect(pol, r, &c), 0);
+    CHECK(c.tokens.size() == 1 && c.tokens[0] == 1);
+    CHECK(c.terminal);
+    CHECK(c.status == RequestStatus::Finished);
+    CHECK(c.reason == FinishReason::MaxNewTokens);
+    CHECK(c.terminal_position == 1);  // Token before Terminal
+    CHECK_EQ(mgr.lookup(seq)->length, 2);  // 1 input + 1 committed
+    // EXACTLY ONCE: a second poll ERRORS (already fully drained —
+    // the pinned exactly-once semantics):
+    std::vector<ServingEvent> pol2;
+    Status p2 = ctrl.poll(r, &pol2);
+    CHECK(!p2.ok);
+    CHECK(p2.message.find("already-fully-drained") != std::string::npos);
+    CHECK(pol2.empty());
+    std::printf("  [ok] terminal step() -> poll(): final token + terminal "
+                "pollable exactly once\n");
+
+    // The QUOTA is reusable (the terminal-but-undrained request never
+    // counted as live — max_live = 1):
+    RequestId r2 = 0;
+    CHECK(ctrl.admit_turn(s, {20}, 1, -1, kGreedy, &r2).ok);
+    std::vector<ServingEvent> all2 = ctrl.run_stream();
+    Collected c2;
+    CHECK_EQ(collect(all2, r2, &c2), 0);
+    CHECK(c2.tokens.size() == 1 && c2.terminal);
+    CHECK_EQ(mgr.lookup(seq)->length, 4);  // 2 + 1 + 1
+    std::printf("  [ok] quota reusable while the stream state was still "
+                "undrained\n");
+  }
+
+  // =========================================================================
+  // 7. REVIEW FIX: terminal-but-undrained + run_stream(): the pending
+  //    events are NOT lost just because live_requests == 0
+  // =========================================================================
+  {
+    Qwen35StateManager mgr(cfg, 4, 8, 4, stream);
+    SessionManager sm(mgr);
+    FakeForwarder fwd;
+    Scheduler sched(fwd, mgr, stream, &sm);
+    ServingController ctrl(sched, sm,
+                           ServingLimits{-1, /*max_live=*/1, 0});
+    SessionId s = 0;
+    CHECK(ctrl.create_session(&s).ok);
+    const SequenceId seq = sm.lookup(s)->sequence_id;
+    // r1: 1 input + 1 gen (fake pick g0 = 1), driven to terminal with
+    // the plain step() — terminal but UN drained:
+    RequestId r1 = 0;
+    CHECK(ctrl.admit_turn(s, {10}, 1, -1, kGreedy, &r1).ok);
+    CHECK(ctrl.step().ok);
+    CHECK(ctrl.step().ok);
+    CHECK(sched.get(r1)->status == RequestStatus::Finished);
+    CHECK_EQ(ctrl.stats().live_requests, 0);
+    // r2: 2 inputs + 1 gen (fake pick g0 = (3*3+1) % 512 = 10), still
+    // LIVE:
+    RequestId r2 = 0;
+    CHECK(ctrl.admit_turn(s, {30, 40}, 1, -1, kGreedy, &r2).ok);
+    // run_stream(): must return r1's PENDING events (token + terminal)
+    // AND drive r2 to completion:
+    std::vector<ServingEvent> all = ctrl.run_stream();
+    Collected c1, c2;
+    CHECK_EQ(collect(all, r1, &c1), 0);
+    CHECK_EQ(collect(all, r2, &c2), 0);
+    CHECK(c1.tokens.size() == 1 && c1.tokens[0] == 1);
+    CHECK(c1.terminal);  // r1's terminal event was NOT lost
+    CHECK(c2.tokens.size() == 1 && c2.tokens[0] == 10);
+    CHECK(c2.terminal);
+    // Order: r1's fully-drained events come before r2's first event:
+    int r2_first = -1, r1_terminal = -1;
+    for (std::size_t i = 0; i < all.size(); ++i) {
+      if (r2_first < 0 && all[i].request_id == r2) {
+        r2_first = static_cast<int>(i);
+      }
+      if (all[i].request_id == r1 &&
+          all[i].kind == ServingEventKind::RequestTerminal) {
+        r1_terminal = static_cast<int>(i);
+      }
+    }
+    CHECK(r1_terminal >= 0 && r2_first >= 0);
+    CHECK(r1_terminal < r2_first);
+    CHECK_EQ(mgr.lookup(seq)->length, 5);  // (1+1) + (2+1)
+    std::printf("  [ok] run_stream(): terminal-but-undrained events not "
+                "lost (live_requests == 0)\n");
   }
 
   CUDA_CHECK(cudaStreamDestroy(stream));
