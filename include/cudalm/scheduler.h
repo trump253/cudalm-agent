@@ -64,6 +64,20 @@
 // ALREADY-TERMINAL request is IDEMPOTENT (returns ok, no state change);
 // cancel(id) on an UNKNOWN id is a Status error (fail loud).
 //
+// PHASE C (v0.8, additive): SESSION-BOUND turn admission
+// (admit_session_turn) over a SessionManager. A session-bound request is
+// ONE TURN on a persistent session: it is bound to the session's
+// EXISTING bound sequence (no sequence is created, no history replay —
+// the input is appended from the session's current length), its terminal
+// transition NEVER retires the sequence (the Session lifecycle owns it),
+// and its COMMIT CONTRACT differs from the frozen legacy path ("sampled
+// != committed"): every generated token — including the stop-triggering
+// one (EOS / max_new_tokens) — is forwarded into the session state
+// BEFORE the request becomes terminal. Legacy admit() / execution
+// semantics are untouched (the two paths share the same FIFO snapshot
+// iteration and the same true batched decode cohort — a batch row
+// accesses its own SequenceId / KV / Delta slot).
+//
 // The caller passes the single CUDA stream; it must equal the manager
 // pools' stream (and the model's config must equal the manager's), which
 // the v0.5 compatibility gate inside forward_token_with_state enforces
@@ -84,6 +98,7 @@
 #include "cudalm/qwen35_state_manager.h"
 #include "cudalm/request.h"
 #include "cudalm/sampling.h"
+#include "cudalm/session.h"      // SessionId, SessionManager (Phase C)
 #include "cudalm/weight_format.h"  // Status
 
 namespace cudalm {
@@ -256,13 +271,65 @@ class Scheduler {
   // is the single stream and must equal the manager pools' stream (the
   // v0.5 compatibility gate inside forward_token_with_state enforces
   // this on the first forward, fail-loud).
+  //
+  // v0.8 Phase C: `sessions` (optional, NON-OWNING — must outlive the
+  // scheduler) enables SESSION-BOUND turn admission (admit_session_turn).
+  // nullptr (the default) keeps the scheduler in the frozen v0.6
+  // request-scoped mode: admit_session_turn fails loud, everything else
+  // is unchanged.
   Scheduler(SequenceForwarder& fwd, Qwen35StateManager& mgr,
-            cudaStream_t stream);
+            cudaStream_t stream, SessionManager* sessions = nullptr);
 
   // Transactional admission: validate -> create SequenceState -> register
   // -> issue the next (monotonic, never-reused) RequestId. On failure:
   // no RequestId issued, no half-request, no leaked sequence.
   Status admit(const Spec& spec, RequestId* out_request_id);
+
+  // v0.8 Phase C: SESSION-BOUND turn admission. Creates ONE new request
+  // that is a TURN on an EXISTING live session:
+  //   * the request is bound to the session's EXISTING bound sequence —
+  //     NO sequence is created, NO history is replayed: the turn's input
+  //     is APPENDED from the session's CURRENT logical length (the
+  //     v0.5 position-derivation discipline);
+  //   * the request's terminal transition (Finished / Cancelled /
+  //     Failed) NEVER retires the session's sequence — the Session
+  //     lifecycle (reset_session / destroy_session) is the ONLY thing
+  //     that can reset/release it;
+  //   * COMMIT CONTRACT (Phase B/C pinned — "sampled != committed"): a
+  //     sampled token becomes part of the session history only after a
+  //     SUCCESSFUL forward of it; the request becomes terminal (EOS /
+  //     max_new_tokens) only AFTER the stop-triggering generated token
+  //     has been committed. A turn committing m generated tokens
+  //     therefore forwards input_count + m tokens (legacy requests keep
+  //     the frozen N + m - 1 semantics — they are unaffected).
+  //   * max_new_tokens >= 0 (0 = an INPUT-ONLY turn: the input is
+  //     committed, nothing is generated — the Phase B input-only append);
+  //   * at most ONE live (non-terminal) request per session: admitting a
+  //     second turn while the first is still live is a Status error
+  //     (fail loud); the next turn can be admitted once the first is
+  //     terminal (it then continues from the first turn's committed
+  //     state).
+  // ZERO-MUTATION on ANY failure: a session manager bound to a DIFFERENT
+  // Qwen35StateManager than this scheduler's (INSTANCE IDENTITY gate —
+  // config / stream / SequenceId equality is NOT a substitute; a
+  // numerically equal SequenceId in another manager's pools would
+  // otherwise be silently driven), invalid SessionId (unknown/destroyed),
+  // busy session, empty new_input_tokens, max_new_tokens < 0, invalid
+  // eos/sampling/token ids, and CONTEXT OVERFLOW (session length +
+  // input + max_new_tokens > max_seq_len — the Phase A/B policy: explicit
+  // reject, the exact boundary is accepted, no eviction) all return an
+  // error with no RequestId issued, no half-request, and no session
+  // state change.
+  Status admit_session_turn(SessionId session_id,
+                            const std::vector<int>& new_input_tokens,
+                            int max_new_tokens, int eos_token_id,
+                            const SamplingConfig& sampling,
+                            RequestId* out_request_id);
+
+  // v0.8 Phase C: true iff the session currently has a live
+  // (non-terminal) request (a pure query; terminal requests do not
+  // keep a session busy).
+  bool session_busy(SessionId session_id) const;
 
   // Pinned contract: Waiting/Running -> Cancelled + retire (resources
   // reclaimed; the request is never advanced again); already-terminal ->
@@ -332,13 +399,26 @@ class Scheduler {
 
  private:
   // Advance `r` by EXACTLY one token: the next prompt token (prefill) or
-  // the last generated token (decode). After the forward, sample the
-  // next token ONLY when it is not yet known (after the LAST prompt
-  // forward -> g0, or after a decode forward -> g_k); no sampling on
-  // early prefill forwards. Completes the request (retire exactly once)
-  // on EOS / max_new_tokens. A forward Status failure marks the request
-  // Failed + retires and returns the error.
+  // the PENDING generated token (decode — the last sampled, not-yet-
+  // committed one). Legacy (frozen v0.4/v0.6 semantics): after the LAST
+  // prompt forward or a decode forward, sample the next token and check
+  // the stop conditions ON SAMPLING (the stop-triggering token is NOT
+  // forwarded). SessionBound (Phase C commit-then-stop): after the last
+  // prompt forward, sample g0 as PENDING (never terminal on sampling);
+  // after a decode forward, the just-forwarded token is COMMITTED and the
+  // stop conditions are checked ON THE COMMITTED token (terminal only
+  // after the stop-triggering token is in the session state); a
+  // max_new_tokens == 0 input-only turn completes right after the last
+  // input forward (no sampling). A forward Status failure marks the
+  // request Failed (and retires its sequence for legacy requests; a
+  // session-bound request's sequence STAYS LIVE) and returns the error.
   Status advance_one(Request& r);
+
+  // Phase C helper: D2H the last forward's full logits + sample the next
+  // PENDING token (no stop check — the stop check for a session-bound
+  // request happens only after the pending token is committed). A logits
+  // or sampler failure marks the request terminal (Failed).
+  Status sample_pending(Request& r);
 
   // v0.6 Phase B: advance the maximal decode cohort runnable[i..j) in ONE
   // batched forward (zero-mutation preflight; fallback to the frozen
@@ -347,18 +427,23 @@ class Scheduler {
   void advance_batch_run(const std::vector<RequestId>& runnable,
                          std::size_t i, std::size_t j, Status* first_error);
 
-  // Decode-ready: prefill complete AND at least one generated token (the
-  // next forward is a DECODE of the last generated token).
+  // Decode-ready: prefill complete AND a PENDING generated token exists
+  // (sampled, not yet committed — the next forward is its DECODE/commit).
+  // For legacy requests committed_generated is always 0, so this reduces
+  // to the frozen v0.6 condition (at least one generated token).
   static bool is_decode_ready(const Request& r);
 
-  // Terminal transition: set status/reason and retire the sequence
-  // EXACTLY ONCE (internal invariant: the sequence is live, so a retire
-  // failure is a logic bug -> fail loud).
+  // Terminal transition: set status/reason exactly once. Legacy requests
+  // RETIRE their sequence EXACTLY ONCE (internal invariant: the sequence
+  // is live, so a retire failure is a logic bug -> fail loud).
+  // SessionBound requests do NOT retire — the session's sequence (and all
+  // committed state) stays LIVE for the Session lifecycle.
   void finish(Request& r, RequestStatus status, FinishReason reason);
 
   SequenceForwarder& fwd_;
   Qwen35StateManager& mgr_;
   cudaStream_t stream_;
+  const SessionManager* sessions_ = nullptr;  // Phase C (non-owning)
   std::map<RequestId, Request> requests_;  // ascending order == FIFO
   RequestId next_id_ = 1;
   // v0.6 Phase B instrumentation.

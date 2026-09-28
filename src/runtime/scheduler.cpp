@@ -112,8 +112,8 @@ Status ModelForwarder::logits_batch_to_host(std::vector<__nv_bfloat16>* out,
 // ---------------------------------------------------------------------------
 
 Scheduler::Scheduler(SequenceForwarder& fwd, Qwen35StateManager& mgr,
-                     cudaStream_t stream)
-    : fwd_(fwd), mgr_(mgr), stream_(stream) {}
+                     cudaStream_t stream, SessionManager* sessions)
+    : fwd_(fwd), mgr_(mgr), stream_(stream), sessions_(sessions) {}
 
 Status Scheduler::admit(const Spec& spec, RequestId* out_request_id) {
   if (out_request_id == nullptr) {
@@ -172,12 +172,135 @@ Status Scheduler::admit(const Spec& spec, RequestId* out_request_id) {
   return Status::ok_status();
 }
 
+Status Scheduler::admit_session_turn(
+    SessionId session_id, const std::vector<int>& new_input_tokens,
+    int max_new_tokens, int eos_token_id, const SamplingConfig& sampling,
+    RequestId* out_request_id) {
+  if (out_request_id == nullptr) {
+    return Status::error("scheduler: admit_session_turn: null out_request_id");
+  }
+  if (sessions_ == nullptr) {
+    return Status::error(
+        "scheduler: admit_session_turn: this scheduler has no session "
+        "manager (constructed without one)");
+  }
+  // INSTANCE IDENTITY (the review gate): the session manager must be the
+  // one bound to THIS scheduler's state manager. Without this, a scheduler
+  // over mgrA given a SessionManager over mgrB (whose sessions carry
+  // numerically equal SequenceIds in mgrB's pools) would silently drive
+  // sequences in the WRONG manager's pools. Instance identity is the only
+  // valid check here — config / stream / SequenceId equality must NOT be
+  // substituted for it.
+  if (&sessions_->manager() != &mgr_) {
+    return Status::error(
+        "scheduler: admit_session_turn: the session manager is bound to a "
+        "DIFFERENT Qwen35StateManager than this scheduler (instance "
+        "identity mismatch)");
+  }
+  // ---- validation (fail loud; NOTHING is registered on failure) ----------
+  std::string serr;
+  if (!validate_sampling_config(sampling, &serr)) {
+    return Status::error("scheduler: admit_session_turn: invalid sampling "
+                         "config: " + serr);
+  }
+  const int vocab = fwd_.vocab_size();
+  if (vocab <= 0) {
+    return Status::error("scheduler: admit_session_turn: forwarder has no "
+                         "vocab");
+  }
+  if (new_input_tokens.empty()) {
+    return Status::error("scheduler: admit_session_turn: empty "
+                         "new_input_tokens");
+  }
+  if (max_new_tokens < 0) {
+    return Status::error("scheduler: admit_session_turn: max_new_tokens < 0 "
+                         "(0 = an input-only turn)");
+  }
+  if (eos_token_id < -1 || eos_token_id >= vocab) {
+    return Status::error(
+        "scheduler: admit_session_turn: eos_token_id must be -1 or in "
+        "[0, vocab_size)");
+  }
+  for (int t : new_input_tokens) {
+    if (t < 0 || t >= vocab) {
+      return Status::error("scheduler: admit_session_turn: invalid input "
+                           "token id " + std::to_string(t));
+    }
+  }
+  // The session must be LIVE ...
+  const Session* sess = sessions_->lookup(session_id);
+  if (sess == nullptr) {
+    return Status::error("scheduler: admit_session_turn: session " +
+                         std::to_string(session_id) +
+                         " is not live (never created or destroyed)");
+  }
+  // ... and NOT busy: at most ONE live (non-terminal) request per session
+  // (fail loud, zero mutation; a terminal request frees the session).
+  if (session_busy(session_id)) {
+    return Status::error("scheduler: admit_session_turn: session " +
+                         std::to_string(session_id) +
+                         " already has a live request (one live turn per "
+                         "session)");
+  }
+  // CONTEXT OVERFLOW (the Phase A/B policy): the turn commits at most
+  // input + max_new_tokens tokens; the exact boundary is accepted; no
+  // eviction / truncation.
+  const SequenceState* seq = mgr_.lookup(sess->sequence_id);
+  if (seq == nullptr) {
+    return Status::error("scheduler: admit_session_turn: bound sequence " +
+                         std::to_string(sess->sequence_id) +
+                         " not live (internal invariant violation)");
+  }
+  const int L = seq->length;  // the session's CURRENT logical position
+  const int max_seq = mgr_.config().max_seq_len;
+  const int N = static_cast<int>(new_input_tokens.size());
+  if (static_cast<long long>(L) + N + max_new_tokens > max_seq) {
+    return Status::error(
+        "scheduler: admit_session_turn: context overflow (length " +
+        std::to_string(L) + " + input " +
+        std::to_string(new_input_tokens.size()) + " + max_new_tokens " +
+        std::to_string(max_new_tokens) + " > max_seq_len " +
+        std::to_string(max_seq) + "); rejected (no eviction)");
+  }
+
+  // ---- transactional core: NO create_sequence ----------------------------
+  // The request is bound to the session's EXISTING bound sequence (append-
+  // only; no history replay). Only here is the request registered and the
+  // id issued — on any failure above there is no half-request and no
+  // consumed RequestId.
+  const RequestId id = next_id_++;  // monotonic, never reused (once, here)
+  Request r(id, sess->sequence_id, std::vector<int>(new_input_tokens),
+            max_new_tokens, eos_token_id, sampling,
+            RequestOwnership::SessionBound, session_id);
+  requests_.emplace(r.id, std::move(r));
+  *out_request_id = id;
+  return Status::ok_status();
+}
+
+bool Scheduler::session_busy(SessionId session_id) const {
+  for (const auto& kv : requests_) {
+    if (kv.second.session_id == session_id &&
+        !is_terminal(kv.second.status)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void Scheduler::finish(Request& r, RequestStatus status, FinishReason reason) {
   r.status = status;
   r.finish_reason = reason;
-  // Retire the sequence EXACTLY ONCE (on the terminal transition). The
-  // sequence is live (created at admission, never retired before), so a
-  // failure here is an internal invariant violation, not a user error.
+  if (r.ownership == RequestOwnership::SessionBound) {
+    // Phase C: a request terminal is NOT a session terminal. The
+    // session's sequence — and every token committed into its KV / Delta
+    // / position state — STAYS LIVE; only the Session lifecycle
+    // (reset_session / destroy_session) can reset/release it.
+    return;
+  }
+  // Legacy (frozen): retire the sequence EXACTLY ONCE (on the terminal
+  // transition). The sequence is live (created at admission, never retired
+  // before), so a failure here is an internal invariant violation, not a
+  // user error.
   Status s = mgr_.retire_sequence(r.sequence_id);
   if (!s.ok) {
     scheduler_fatal("terminal transition: retire_sequence failed", r.id,
@@ -214,13 +337,16 @@ Status Scheduler::advance_one(Request& r) {
     // prompt tokens, so the increment happens only after the forward
     // below succeeds (a failed forward leaves prefill_pos unchanged).
   } else {
-    // Decode only starts after the first generated token exists (it was
-    // sampled from the prefill-last forward); an empty `generated` here
-    // is an internal invariant violation.
-    if (r.generated.empty()) {
+    // Decode only starts with a PENDING generated token (sampled, not yet
+    // committed by a successful forward). For legacy requests
+    // committed_generated is always 0, so this is exactly the frozen
+    // v0.6 condition (generated non-empty); for session-bound requests
+    // it is generated.size() > committed_generated. Either way, reaching
+    // here without a pending token is an internal invariant violation.
+    if (r.generated.size() <= static_cast<std::size_t>(r.committed_generated)) {
       r.status = RequestStatus::Failed;
       r.finish_reason = FinishReason::Failed;
-      scheduler_fatal("decode advance with no generated token", r.id,
+      scheduler_fatal("decode advance with no pending generated token", r.id,
                       "state machine desync (logic bug)");
     }
     token = r.generated.back();
@@ -258,6 +384,52 @@ Status Scheduler::advance_one(Request& r) {
     r.status = RequestStatus::Running;
   }
 
+  if (r.ownership == RequestOwnership::SessionBound) {
+    // ---- v0.8 Phase C: COMMIT-THEN-STOP (sampled != committed) ----------
+    // A sampled token becomes session history only after a SUCCESSFUL
+    // forward of it; the stop conditions are checked ON THE COMMITTED
+    // token, never on sampling alone (the Phase B/C commit contract —
+    // no lagging state).
+    if (prefill) {
+      // Early prefill forwards: no sampling (the next token is the prompt
+      // token itself).
+      if (r.prefill_pos < prompt_len) {
+        return Status::ok_status();
+      }
+      // Last input forward:
+      if (r.max_new_tokens == 0) {
+        // INPUT-ONLY turn (Phase B contract): the input is fully
+        // committed; nothing is generated (no sampling, no RNG draw).
+        finish(r, RequestStatus::Finished, FinishReason::MaxNewTokens);
+        return Status::ok_status();
+      }
+      // Its logits produce g0 — PENDING: it is committed by the NEXT
+      // advance's forward. A sampled token NEVER ends the turn on
+      // sampling alone (in particular an EOS sample must still be
+      // committed first).
+      return sample_pending(r);
+    }
+    // Decode: the pending generated token was JUST committed by this
+    // forward.
+    r.committed_generated++;
+    const int committed_token =
+        r.generated[static_cast<std::size_t>(r.committed_generated - 1)];
+    if (committed_token == r.eos_token_id) {
+      // EOS: committed like every other generated token, then terminal
+      // (EOS takes priority over max_new_tokens, the v0.4 convention).
+      finish(r, RequestStatus::Finished, FinishReason::Eos);
+    } else if (r.committed_generated >= r.max_new_tokens) {
+      // max_new_tokens: the LAST generated token IS committed (no lag).
+      finish(r, RequestStatus::Finished, FinishReason::MaxNewTokens);
+    } else {
+      // Continue: the just-committed token's logits predict the next
+      // pending token.
+      return sample_pending(r);
+    }
+    return Status::ok_status();
+  }
+
+  // ---- LEGACY (frozen v0.4/v0.6 semantics — unchanged) ------------------
   // ---- sample the next token ONLY when it is not yet known -------------
   // v0.4 semantics (no off-by-one): NO sampling on early prefill
   // forwards; the LAST prompt forward's logits produce g0; each decode
@@ -290,6 +462,35 @@ Status Scheduler::advance_one(Request& r) {
       finish(r, RequestStatus::Finished, FinishReason::MaxNewTokens);
     }
   }
+  return Status::ok_status();
+}
+
+Status Scheduler::sample_pending(Request& r) {
+  // D2H the last forward's full logits and sample the next PENDING token
+  // (the Phase C session path — no stop check here: a session-bound
+  // request stops only AFTER the pending token is committed by a
+  // successful forward). A logits or sampler failure makes the request
+  // terminal (Failed); nothing is sampled, so the RNG is untouched.
+  std::vector<__nv_bfloat16> logits;
+  Status s = fwd_.logits_to_host(&logits, stream_);
+  if (!s.ok) {
+    r.status = RequestStatus::Failed;
+    r.finish_reason = FinishReason::Failed;
+    finish(r, RequestStatus::Failed, FinishReason::Failed);
+    return s;
+  }
+  const int next =
+      r.sampler.sample(logits.data(), static_cast<int>(logits.size()));
+  if (next < 0 || next >= fwd_.vocab_size()) {
+    // The sampler's contract is [0, vocab) for valid finite logits;
+    // anything else is an internal invariant violation.
+    r.status = RequestStatus::Failed;
+    r.finish_reason = FinishReason::Failed;
+    finish(r, RequestStatus::Failed, FinishReason::Failed);
+    return Status::error("scheduler: sampler returned token id " +
+                         std::to_string(next) + " outside [0, vocab_size)");
+  }
+  r.generated.push_back(next);  // PENDING (committed by the next forward)
   return Status::ok_status();
 }
 
@@ -354,11 +555,13 @@ Status Scheduler::step() {
 }
 
 bool Scheduler::is_decode_ready(const Request& r) {
-  // Prefill complete (all prompt tokens forwarded) AND at least one
-  // generated token exists (g0 came from the last-prompt forward): the
-  // next forward is a DECODE of the last generated token.
+  // Prefill complete (all input tokens forwarded) AND a PENDING generated
+  // token exists (sampled, not yet committed — g0 came from the last
+  // input forward): the next forward is a DECODE (commit) of that token.
+  // Legacy requests keep committed_generated == 0 forever, so this is
+  // exactly the frozen v0.6 condition (generated non-empty).
   return r.prefill_pos == static_cast<int>(r.prompt.size()) &&
-         !r.generated.empty();
+         r.generated.size() > static_cast<std::size_t>(r.committed_generated);
 }
 
 void Scheduler::advance_batch_run(const std::vector<RequestId>& runnable,
@@ -436,6 +639,32 @@ void Scheduler::advance_batch_run(const std::vector<RequestId>& runnable,
     }
   }
 
+  // v0.8 Phase C: the committed batch forward JUST COMMITTED each
+  // session-bound row's pending generated token (commit-then-stop, the
+  // Phase B/C contract): the stop conditions are checked ON THE COMMITTED
+  // token, before any further sampling. A row that becomes terminal here
+  // is skipped by the sampling loop below (and never consumes another RNG
+  // draw). Legacy rows are untouched (their frozen sampling-time stop
+  // check stays in the loop below).
+  for (std::size_t k = i; k < j; ++k) {
+    auto it = requests_.find(runnable[k]);
+    if (it == requests_.end() || is_terminal(it->second.status)) {
+      continue;
+    }
+    Request& r = it->second;
+    if (r.ownership != RequestOwnership::SessionBound) {
+      continue;
+    }
+    r.committed_generated++;
+    const int committed_token =
+        r.generated[static_cast<std::size_t>(r.committed_generated - 1)];
+    if (committed_token == r.eos_token_id) {
+      finish(r, RequestStatus::Finished, FinishReason::Eos);  // committed
+    } else if (r.committed_generated >= r.max_new_tokens) {
+      finish(r, RequestStatus::Finished, FinishReason::MaxNewTokens);
+    }
+  }
+
   // ONE D2H of the whole [B][vocab] logits, then per-row sampling with
   // each request's OWN Sampler (v0.4 per-request RNG isolation — the
   // sampling call order is the cohort order, as in Phase A).
@@ -489,11 +718,17 @@ void Scheduler::advance_batch_run(const std::vector<RequestId>& runnable,
       continue;
     }
     r.generated.push_back(next);
-    if (next == r.eos_token_id) {
-      finish(r, RequestStatus::Finished, FinishReason::Eos);  // EOS IS kept
-    } else if (static_cast<int>(r.generated.size()) >= r.max_new_tokens) {
-      finish(r, RequestStatus::Finished, FinishReason::MaxNewTokens);
+    if (r.ownership == RequestOwnership::SequenceOwned) {
+      // LEGACY (frozen): the stop check happens ON SAMPLING (the
+      // stop-triggering token is never forwarded — N + m - 1 semantics).
+      if (next == r.eos_token_id) {
+        finish(r, RequestStatus::Finished, FinishReason::Eos);  // EOS kept
+      } else if (static_cast<int>(r.generated.size()) >= r.max_new_tokens) {
+        finish(r, RequestStatus::Finished, FinishReason::MaxNewTokens);
+      }
     }
+    // Session-bound: `next` is PENDING — its commit (and the stop check)
+    // happen on the NEXT advance.
   }
 }
 
@@ -513,8 +748,18 @@ Status Scheduler::run() {
     if (is_terminal(r.status)) {
       continue;
     }
-    bound += static_cast<std::uint64_t>(r.prompt.size()) +
-             static_cast<std::uint64_t>(std::max(1, r.max_new_tokens)) - 1;
+    if (r.ownership == RequestOwnership::SessionBound) {
+      // Session turn: EVERY generated token is committed (forwarded) —
+      // input + max_new_tokens forwards total (max_new_tokens may be 0,
+      // an input-only turn).
+      bound += static_cast<std::uint64_t>(r.prompt.size()) +
+               static_cast<std::uint64_t>(r.max_new_tokens);
+    } else {
+      // Legacy (frozen): N + m - 1 forwards (the final sampled token is
+      // never forwarded).
+      bound += static_cast<std::uint64_t>(r.prompt.size()) +
+               static_cast<std::uint64_t>(std::max(1, r.max_new_tokens)) - 1;
+    }
   }
   Status first_error;
   for (std::uint64_t i = 0;; ++i) {

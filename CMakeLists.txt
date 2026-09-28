@@ -149,6 +149,13 @@ target_link_libraries(tool_microbench_fused_add_rmsnorm PRIVATE cudalm)
 add_executable(cudalm-generate tools/cudalm_generate.cpp)
 target_link_libraries(cudalm-generate PRIVATE cudalm)
 
+# v0.8 Phase D: persistent TEXT-SESSION demo CLI (multi-turn REPL). One
+# session; each user line is encoded verbatim (no chat template) and
+# appended to the same persistent session via the session-bound scheduler
+# (commit-then-stop; the response is fully committed before display).
+add_executable(cudalm-chat tools/cudalm_chat.cpp)
+target_link_libraries(cudalm-chat PRIVATE cudalm)
+
 add_subdirectory(tests)
 add_subdirectory(benchmarks)
 
