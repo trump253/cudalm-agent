@@ -1,4 +1,4 @@
-# CUDALM v0.8 Session Runtime — Phase A（Session abstraction + persistent-state lifecycle）+ Phase B（incremental multi-turn execution）
+# CUDALM v0.8 Session Runtime — Phase A（Session abstraction + persistent-state lifecycle）+ Phase B（incremental multi-turn execution）+ Phase C（scheduler + Session 集成 / 多 session interleaving）
 
 > **Phase A 目标**（§1–§7，已完成并冻结）：建立正确、清晰、可测试的
 > **Session abstraction**，并把现有 KV / DeltaNet state 的生命周期从
@@ -496,18 +496,211 @@ compute-sanitizer --tool memcheck ./build/tests/test_qwen35_session_generation \
 → PASS + ERROR SUMMARY: 0 errors
 ```
 
-**Phase C 尚未开始**：scheduler + Session 接入、多 session batching、
-chat template、HTTP/OpenAI API 等均不在本阶段（见 §9）。
+**Phase D 尚未开始**：chat template、CLI chat、HTTP/OpenAI API、
+streaming、eviction、multi-stream、CUDA Graph、新 kernel 等均不在
+v0.8 范围（见 §10）。
 
-## 9. 当前限制
+## 9. Phase C — scheduler + Session 集成（已实现）
 
-- **scheduler 尚未接入 session**：v0.6 `Scheduler` 仍是 request-scoped
-  （终态 retire sequence）；session-aware admission / 多 session
-  interleaving 属于 Phase C（**Phase C 尚未开始**）。Phase B 的
-  `SessionGenerator` 是**单 session、单 stream、同步** 的 turn 引擎
-  （correctness-first，与 v0.4/v0.6 同一纪律）；
-- **多 session batching 未做**：一个 turn 只驱动一个 session 的 bound
-  sequence；跨 session 的 batched decode 属 Phase C/D；
+### 9.1 核心关系与 additive API
+
+**Session = persistent model state owner；Request = one scheduled
+turn/job。** 三个独立 id 空间（单调、不复用、数值巧合无意义）：
+`RequestId`（Scheduler 发）≠ `SessionId`（SessionManager 发）≠
+`SequenceId`（StateManager 发）。**Request 终态（Finished / Cancelled
+/ Failed）≠ Session 销毁/重置**——只有 `reset_session()` /
+`destroy_session()` 能动 session 的 state。
+
+对 v0.6 `Scheduler`（frozen）的最小 additive 改动（legacy 行为
+byte-identical，现有 6 个 scheduler 测试全绿即回归门）：
+
+```cpp
+// 构造函数：可选的非持有 SessionManager（nullptr = 纯 legacy 模式）
+Scheduler(fwd, mgr, stream, SessionManager* sessions = nullptr);
+
+// session-bound turn 准入（绑定 session 的已有 bound sequence）
+Status admit_session_turn(SessionId session_id,
+                          const std::vector<int>& new_input_tokens,
+                          int max_new_tokens,   // >= 0（0 = 只追加输入的
+                                                //   input-only turn）
+                          int eos_token_id,     // -1 = 无 EOS gate
+                          const SamplingConfig& sampling,
+                          RequestId* out_request_id);
+
+bool session_busy(SessionId session_id) const;  // 纯查询
+```
+
+`Request` additive 字段（带默认值，v0.6 六参构造不变）：
+`RequestOwnership ownership`（`SequenceOwned` = legacy /
+`SessionBound` = session turn）、`SessionId session_id`、
+`int committed_generated`（SessionBound 专用：已 **commit** 的
+generated 数；legacy 恒为 0）。
+
+### 9.2 session-bound 准入（fail-loud，全失败路径 zero mutation）
+
+preflight 顺序（任何一步失败 = 不发 RequestId、无半 request、session
+state 零变化、无新 sequence）：
+
+1. `out_request_id` 非空；2. scheduler 持有 session manager；
+3. sampling config 合法；4. vocab > 0；5. 输入非空；
+6. `max_new_tokens >= 0`（允许 0，区别于 legacy 的 >= 1）；
+7. `eos ∈ {-1} ∪ [0, vocab)`；8. 所有 token ∈ `[0, vocab)`；
+9. **session live**（`lookup` 命中）；
+10. **session 不 busy**（同 session 至多一个 live request——第二个
+    live turn 直接 reject，fail loud；terminal 即释放）；
+11. **context overflow**：`L + N + M > max_seq_len` reject（`L` =
+    bound sequence 当前 live length；`==` 边界接受；无 eviction /
+    截断，继承 Phase A/B 策略）。
+
+注册时**不 `create_sequence`**：request 绑定 session 的**已有**
+bound sequence，输入从当前 `length` 追加，**不 replay 任何历史**。
+
+### 9.3 generated commit 语义（sampled != committed，hard gate）
+
+继承 Phase B commit contract：**Request 成功结束时，所有返回的
+generated token 都已 forward 进 Session KV / Delta / logical
+length。** 两条路径的 stop 时机不同（legacy 冻结不动）：
+
+```text
+legacy（frozen，N + m - 1 forwards）:
+  prefill… → 最后一次 prefill logits → sample g0 → 在【采样时】判 stop
+  decode: forward g_{k-1} → sample g_k → 在【采样时】判 stop
+  （终态 token 永远不 forward —— v0.4/v0.6 语义，不改）
+
+session-bound（Phase C，N + m forwards；max_new=0 → N forwards）:
+  forward 输入… → 最后一次输入 logits → sample g0（PENDING，不判 stop）
+  → 下一步 forward g0 → 成功 = committed（committed_generated++）
+  → 在【commit 后】判 stop：g0==eos → Finished(Eos)；
+     committed >= max_new → Finished(MaxNewTokens)；否则 sample g1…
+  （EOS token 与 max_new 的最后一个 token 都先 commit 再终态——
+    无 lagging state；max_new=0 的 input-only turn 不采样、不耗 RNG）
+```
+
+不变量：session request 的 pending 数
+`generated.size() - committed_generated ∈ {0,1}`；decode-ready =
+`prefill 完成 && generated.size() > committed_generated`（legacy
+`committed_generated == 0`，退化为原 `!generated.empty()`）。
+batch 路径（`forward_batch` cohort）按行同语义：batch forward 成功 →
+每 session 行 `committed++` → 在采样**前**对刚 commit 的 token 判
+stop（终态行不再采样、不耗 RNG）；legacy 行保持原采样时 stop。
+单次 `[B][vocab]` logits D2H 不变。
+
+### 9.4 终态 / cancel / failure 语义
+
+- **Finished**：session live、bound sequence live、state = 全部
+  committed（含 stop-triggering token）；下一 turn 从 commit 边界
+  继续；
+- **Cancelled**：已 commit 的保留；**pending（已采样未 commit）不
+  进入 session 历史**（它从未被 forward——session 停在最后一个
+  committed 边界，`committed_generated` 如实记录）；
+- **Failed**（forward 失败）：失败的 forward 零 commit（继承 v0.5
+  OOM/失败零 mutation 契约），无需 rollback；session live；下一
+  turn 同样从 committed 边界继续；
+- `finish()` 按 ownership 分支：`SessionBound` **永不 retire
+  sequence**（legacy 保持"终态恰好 retire 一次"不变）。
+
+### 9.5 多 session batching
+
+session-bound request 与 legacy request 共用现有控制面：FIFO
+snapshot、每 request 每迭代至多一个逻辑 token、consecutive
+decode-ready cohort、**true batched forward**（一次模型 traversal
+推进 B 行）、batch 失败 fallback（per-row 串行，frozen 路径）、
+per-request sampler 隔离（每 request 独立 SplitMix64 Sampler——
+每个 turn = 新 Request = 新 Sampler）。每个 batch 行访问**自己的**
+`SequenceId` / KV page / Delta slot（v0.5 `forward_batch_with_state`
+行独立性）。turn 终态后：Request Finished，Session live，Sequence
+live，KV/Delta 保留；下一 turn 从上一 turn 的最终 committed state
+继续。
+
+### 9.6 Phase C 测试
+
+**(A) CPU contract gate** `test_qwen35_scheduler_session`（deterministic
+fake forwarder + 真实池 + 真实 SessionManager + 真实 Scheduler；
+fake 成功 forward 时推进真实序列元数据，失败时零推进）：
+
+- 准入失败零 mutation：unknown SessionId / 空输入 / `max_new<0` /
+  非法 eos / 非法 token / 非法 sampling / context overflow（62+2+1>64
+  reject，**61+2+1==64 边界接受**）/ busy session / 无 session
+  manager 的 scheduler；
+- **准入不创建 sequence**（live sequence 数不变）；
+- **terminal != retired**：Finished 后 session + sequence 仍 live；
+- **commit contract**：2 输入 + 2 generated 的 turn `forward_count ==
+  4`（不是 legacy 的 3）、session length == 4；EOS turn 的 EOS token
+  **被 commit**（forward_count 4、length 4、reason Eos）；
+- cancel：session live、committed 保留、pending token 不在历史
+  （length 停在 committed 边界）；
+- forward 失败：session live、length == committed only、下一 turn
+  从 committed 边界继续；
+- **下一 turn 不 replay**：fake 的 per-sequence step 计数证明 turn 2
+  的 token 流从 step 4 继续（replay 会给出不同的 pick token）；
+- `max_new_tokens == 0` input-only turn（不采样）；
+- legacy 路径不变（N+m-1、终态 retire、`committed_generated == 0`）。
+
+**(B) 真实 checkpoint hard gate**
+`test_qwen35_scheduler_session_integration`：session A（greedy）与
+B（seeded sampling，turn 间换 seed）各跑两个 turn（A t1: 3 输入 + 3
+生成；B t1: 2 输入 + 3 生成；A t2: 2 输入 + 2 生成；B t2: 2 输入 +
+2 生成），t1 对跑完后验证 session 保留，再准入 t2 对（terminal 释放
+session）并跑完。对照**独立连续参考**（每 session 单独一条 fresh
+sequence、直接 `forward_token_with_state` 连续驱动、同 per-turn
+sampler 配置、无 turn 边界）：
+
+- **BIT-IDENTICAL**（memcmp atol 0）：A 全部 10 次 / B 全部 9 次
+  committed forward 的**完整 logits [248320]**（按序，**含 batched
+  decode 行**——RecordingForwarder 扩展记录 `forward_batch` +
+  `logits_batch_to_host` 每行）、每 turn 的 generated token ID、
+  turn 边界 logical length（A 6 / B 5）与最终 length（A 10 / B 9）、
+  turn 边界与最终的**完整 hybrid state**（18x Delta conv+rec + 6x FA
+  逻辑 K/V 行，经 block table 读物理页）；
+- 由此证明：commit contract 在 scheduler 路径成立（stop token 在
+  turn 终态时已在 session state）；**turn 2 不 replay turn 1**
+  （t2 的 per-step logits 匹配参考的后续 step——replay 会重置
+  position，RoPE 依赖的 logits 必然错位）；**A/B interleaving 无
+  污染**（各自匹配自己的 solo 参考，尽管共享 batched traversal）；
+  **batched == 独立参考**（行 parity）；
+- **batch 证据**：`batch_forward_calls == 4`、`max_batch_size == 2`、
+  `decode_cohort_trace == [1, 2, 2, 1, 2, 2]`、`single == 11`、
+  `batched_tokens == 8`；
+- 真实模型上的准入零 mutation：busy session（t1 live 时）与 context
+  overflow（`max_seq_len-2 + 2 + 1`）reject、精确边界
+  （`max_seq_len-3 + 2 + 1`）接受；
+- 干净拆除：destroy A/B + retire 参考 → 所有池 accounting 归零。
+
+### 9.7 验证证据（本签核）
+
+```text
+cmake --build build -j8        # 全量构建：clean（-Wall -Wextra -Werror）
+ctest -R "scheduler|session|state_parity" --output-on-failure
+→ 11/11 passed（2 个新 Phase C 测试 + 全部既有 scheduler/session
+    测试——共享 scheduler 代码的回归门）
+ctest --output-on-failure
+→ 见 §9.7 末尾（全量签核）
+compute-sanitizer --tool memcheck --leak-check full \
+    ./build/tests/test_qwen35_scheduler_session_integration \
+    build/data/qwen35_08b_full.cudalm /root/models/Qwen3.5-0.8B-Base \
+    /root/py311/venv/bin/python3 /root/code/cudalm-agent
+→ PASS + ERROR SUMMARY: 0 errors + LEAK SUMMARY: 0 bytes leaked
+```
+
+### 9.8 Phase C 边界（非目标）
+
+chat template、CLI chat demo、HTTP/OpenAI API、streaming、TTL/LRU/
+eviction、sliding window、multi-stream、CUDA Graph、新 kernel、
+同 session 并行 turn（§9.2 的 busy-reject 是 pinned 语义）——全部
+不在 Phase C。**Phase D 尚未开始。**
+
+## 10. 当前限制
+
+- **同 session 至多一个 live turn**：busy session 的第二个 live
+  request 直接 reject（fail loud，零 mutation）；同 session 并行
+  turn 不在 v0.8 范围（§9.2）；
+- **无 turn 内 streaming**：turn 的 generated token 在 Request 终态
+  后整体可见（`Request::generated`）；无逐 token 回调 / streaming
+  API；
+- **Phase B `SessionGenerator` 与 Phase C scheduler 路径并存**：
+  前者是单 session、同步、correctness-first 的 turn 引擎；scheduler
+  是 control plane 路径（FIFO / batching）。两条路径共享同一 commit
+  contract 与同一 v0.5 forward；选择由调用方决定；
 - **生成循环为 correctness-first**：每步 host 全量 logits D2H + host
   采样（与 v0.4 `Qwen35Generator` 同一路径）；无 CUDA Graph、无 kernel
   级 argmax、无流式输出；
@@ -523,7 +716,18 @@ chat template、HTTP/OpenAI API 等均不在本阶段（见 §9）。
   `delta_capacity_slots` 上限约束，KV pages 受 `kv_capacity_pages`
   约束（超限 = 明确 OOM Status，不静默）。
 
-## 10. 已知风险（诚实清单）
+## 11. 已知风险（诚实清单）
+
+- **scheduler 的 Session 查询**：`admit_session_turn` 的 preflight
+  读 session/sequence 元数据（`lookup` 指针），与 v0.5/v0.6 同
+  "mutation 前缓存、不跨 mutation 持指针"纪律；同步单线程下无
+  并发风险（v0.9 并发 scheduler 需重新评审此路径）；
+- **pending token 的语义边界**：cancel/failure 时 `Request::generated`
+  的尾部 pending token **不在 session 历史中**（从未 forward）；
+  `committed_generated` 是唯一权威的 committed 计数——消费者必须
+  以它（而非 `generated.size()`）判断 session 实际包含多少
+  generated token（legacy request 的 `committed_generated` 恒为 0，
+  其语义仍由 v0.4/v0.6 的 `generated` 完整表达）；
 
 - **生命周期风险**：`lookup()` 返回的 `Session*` 在下一次
   `destroy_session` 后悬垂（与 v0.5 `SequenceState*` 同纪律，已在头文件
@@ -533,5 +737,5 @@ chat template、HTTP/OpenAI API 等均不在本阶段（见 §9）。
 - **slot/page 复用风险**：继承 v0.5 zero-on-release；本阶段新增设备级
   复用门（destroy → recreate → 读回全零 → 真实模型 run 逐位一致），
   未新增风险面；
-- **未来 incremental append 的 API 限制**：无。唯一约束是 §9 的
-  overflow-reject 策略（这是 pinned 语义，不是 API 缺陷）。
+- **未来 incremental append 的 API 限制**：无。唯一约束是 §5 / §9.2
+  的 overflow-reject 策略（这是 pinned 语义，不是 API 缺陷）。

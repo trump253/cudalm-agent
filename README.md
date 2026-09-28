@@ -360,9 +360,9 @@ c5d20efe3424a82ac0c6e4b01849645c74a1aa40`（其后 commits 均为 docs/evidence-
 
 ## v0.8：Multi-turn / Session Runtime
 
-**状态：Phase A + Phase B 完成**（分支 `v0.8-session-runtime`，从
-`cf28abd`（v0.7 merge）创建；**不**在 main 开发，**不** merge —— 等待
-external reviewer）。
+**状态：Phase A + Phase B + Phase C 完成**（分支 `v0.8-session-runtime`，
+从 `cf28abd`（v0.7 merge）创建；**不**在 main 开发，**不** merge ——
+等待 external reviewer）。
 
 v0.8 把"一次性 Request 生命周期"升级为 **persistent Session + multiple
 Requests/turns**：**SessionId 与 RequestId 分离**；一个 Session 跨 turn
@@ -421,8 +421,49 @@ conv / Delta recurrent / position **全部保留**（只有 `reset_session` /
   bit-identical**；input-only、EOS commit、overflow、reset 后重执行 ==
   fresh、KV OOM partial-commit，全 memcmp）。
 
+### Phase C：scheduler + Session 集成 / 多 session interleaving
+
+- **核心关系**：**Session = persistent model state owner；Request = one
+  scheduled turn/job**；`RequestId != SessionId != SequenceId`；**request
+  终态 ≠ session 销毁/重置**（只有 `reset_session` / `destroy_session`
+  能动 session state）；
+- **additive API**（legacy `admit()` 行为 byte-identical，未动）：
+  `Scheduler(fwd, mgr, stream, SessionManager* sessions = nullptr)` +
+  `admit_session_turn(session_id, new_input_tokens, max_new_tokens,
+  eos_token_id, sampling, &request_id)` + `session_busy(session_id)`。
+  session-bound request **绑定 session 的已有 bound sequence**（不创建
+  新 sequence、不 replay 历史、从当前 length 追加）；preflight 失败
+  （unknown session / **busy session（每 session 至多一个 live
+  request）** / 非法 token・eos・sampling / `max_new < 0` / context
+  overflow（`length + input + max_new > max_seq_len`，精确边界接受，
+  无 eviction））= **zero mutation**；`max_new_tokens == 0` =
+  input-only turn；
+- **commit 语义（hard gate，sampled != committed）**：session turn 的
+  generated token **先 forward 成功（commit）才可能触发终态** ——
+  EOS / max_new 的 stop 判定在 commit **之后**（legacy 的"采样时判定、
+  末 token 不 forward、N+m-1"冻结不变）；一个 commit m 个 generated
+  的 turn forward 共 `input + m` 次；cancel/failure 时 pending
+  （已采样未 commit）token **不进入 session 历史**，committed 状态
+  保留、session live、无 rollback；
+- **多 session batching**：session-bound request 与 legacy 共用现有
+  FIFO snapshot / one logical token per request per iteration /
+  decode cohort / **true batched forward** / batch fallback / per-
+  request sampler 隔离；每个 batch 行访问自己的 SequenceId / KV /
+  Delta slot；turn 终态后 session + sequence + KV/Delta 保留，下一
+  turn 从上一 turn 的最终 committed state 继续；
+- **硬门**：`test_qwen35_scheduler_session`（CPU：准入零 mutation 全
+  路径、不创建 sequence、terminal != retired、commit 计数、cancel /
+  failure 保留 committed、next turn 不 replay、input-only turn、legacy
+  不变）+ `test_qwen35_scheduler_session_integration`（真实
+  Qwen3.5-0.8B-Base checkpoint：session A/B 各两 turn 交错执行 vs
+  独立连续参考 —— **每步全量 logits（含 batched 行）/ generated ID /
+  turn 边界与最终 length / paged KV / Delta conv+rec 全部
+  bit-identical**；batch 证据 `batch_forward_calls == 4`、
+  `max_batch_size == 2`、`decode_cohort_trace == [1,2,2,1,2,2]`；
+  busy / overflow 零 mutation；拆除后 accounting 归零）。
+
 ### 后续阶段（未开始）
 
-Phase C scheduler + Session 接入 / 多 session interleaving → Phase D
-text/chat 级 multi-turn demo + 最终 sign-off（**Phase C 尚未开始**）。
-详见 [`docs/v08_session_runtime.md`](docs/v08_session_runtime.md)。
+Phase D：text/chat 级 multi-turn demo + 最终 sign-off（**Phase D
+尚未开始**）。详见
+[`docs/v08_session_runtime.md`](docs/v08_session_runtime.md)。
