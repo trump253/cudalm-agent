@@ -55,6 +55,23 @@ cudalm_add_test(test_kv_block_table test_kv_block_table
 cudalm_add_test(test_state_pool_formulas test_state_pool_formulas
                 cpu/test_state_pool_formulas.cpp)
 
+# v0.8 Phase A: session abstraction lifecycle gate (CPU test: NO
+# checkpoint, NO model — SessionManager over the REAL Qwen35StateManager
+# pools, small synthetic config). Gates: create->valid / destroy->invalid
+# (SessionId monotone, never reissued; 1:1 session<->sequence binding
+# invariant after every op), TRANSACTIONAL create (Delta OOM: nothing
+# registered, ids stay monotone), A/B ISOLATION (distinct Delta slots;
+# dirtying A's conv+recurrent (every layer) and both KV pages (K+V) leaves
+# B ALL ZEROS with fresh metadata), RESET (A fresh under the SAME SessionId:
+# length 0, pages released, Delta slot zeroed IN PLACE, reset_count
+# metadata; B byte-for-byte unchanged; repeatable; unknown id fail-loud),
+# DESTROY + PHYSICAL REUSE (A's slot/pages reissued to C under a NEW id,
+# C reads back ALL ZEROS — no residue; B intact), and fits() the
+# context-capacity boundary matrix (length+n <= max_seq_len exact;
+# negative/unknown/destroyed -> false; pure query, no allocation).
+cudalm_add_test(test_session_manager test_session_manager
+                cpu/test_session_manager.cpp)
+
 # v0.6 Phase A: request scheduler / control-plane gate (CPU test: NO
 # checkpoint, NO model — a deterministic fake forwarder over the REAL
 # Qwen35StateManager pools). Gates: request lifecycle (Waiting/Running/
@@ -179,6 +196,36 @@ add_test(NAME test_qwen35_state_parity
                  ${CUDALM_TOOL_PYTHON3}
                  ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_qwen35_state_parity PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# v0.8 Phase A: session runtime real-checkpoint hard gate (real checkpoint)
+# — the v0.8 Phase A sign-off test. Sessions drive "requests" (token chunks)
+# on their bound sequences through the frozen forward_token_with_state
+# (exactly the path a future session-aware scheduler would issue). Gates:
+# create + 1:1 session<->sequence binding; PERSISTENCE ACROSS REQUEST
+# BOUNDARIES (request 1 on A completes and releases NOTHING: 3 KV pages
+# held, Delta slot live and dirty, position 6; request 2 on the SAME
+# session is an append-only continuation from position 6; the 8 per-step
+# FULL logits [248320] + final hybrid state BIT-IDENTICAL to a one-shot
+# continuous reference run — a request-boundary bug would break steps
+# 6..7); ISOLATION UNDER REAL USE (B's 4-token request == fresh independent
+# B run, bit-identical); RESET PARITY (reset_session(A): length 0, pages
+# released, Delta slot ALL ZEROS on device, SAME SessionId; re-run == first
+# run bit-identical); DESTROY + REUSE (A invalid, every op errors, a
+# forward on the retired sequence rejected, accounting back to EXACTLY B's
+# resources; C reuses A's physical resources under a NEW id and matches a
+# fresh reference bit-for-bit — no residue; B intact). Self-skips (77)
+# when the checkpoint is absent; the Phase A evidence environment MUST
+# actually run it.
+add_executable(test_qwen35_session_runtime cuda/test_qwen35_session_runtime.cpp)
+target_link_libraries(test_qwen35_session_runtime PRIVATE cudalm)
+add_test(NAME test_qwen35_session_runtime
+         COMMAND test_qwen35_session_runtime
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_session_runtime PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 # --- Cross-language weight-file tests (Python tools -> C++ loader) ------------
