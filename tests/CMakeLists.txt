@@ -121,6 +121,13 @@ cudalm_add_test(test_w4a16_qwen35_optimized test_w4a16_qwen35_optimized
 cudalm_add_test(test_deltanet_delta_qwen35_optimized
                 test_deltanet_delta_qwen35_optimized
                 cuda/test_deltanet_delta_qwen35_optimized.cpp)
+# v0.7 Phase D (candidate 1): fused residual-add + zero-centered RMSNorm —
+# BIT-EXACT kernel-level hard gate (BF16 residual AND BF16 norm output) vs the
+# frozen 2-launch sequence qwen35_add_bf16 -> qwen35_rmsnorm_zc_bf16, M=1/2/3,
+# H=256/1024 (PER=1/4), production + alternate eps, multi-seed random +
+# zero/small/large edge classes. No checkpoint (pure kernel parity).
+cudalm_add_test(test_qwen35_fused_add_rmsnorm test_qwen35_fused_add_rmsnorm
+                cuda/test_qwen35_fused_add_rmsnorm.cpp)
 # Plain BF16 GEMV (the tied-LM-head matmul, v0.3 Phase B) — standalone numeric
 # hard gate: vec4 (K%8==0, aligned) + scalar (K%8!=0 / misaligned) + zero-row,
 # vs a CPU FP32-accumulate -> BF16 RNE reference. No checkpoint needed.

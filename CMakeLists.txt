@@ -135,6 +135,13 @@ target_link_libraries(tool_ncu_w4a16_target PRIVATE cudalm)
 add_executable(tool_ncu_deltanet_target tools/ncu_deltanet_target.cpp)
 target_link_libraries(tool_ncu_deltanet_target PRIVATE cudalm)
 
+# v0.7 Phase D (candidate 1): microbenchmark — stream-elapsed GPU time/call of
+# the frozen 2-launch (add -> rmsnorm) post-attention residual sequence vs the
+# fused single kernel, production H=1024, M=1/2/3 (no model, no checkpoint).
+add_executable(tool_microbench_fused_add_rmsnorm
+               tools/microbench_fused_add_rmsnorm.cpp)
+target_link_libraries(tool_microbench_fused_add_rmsnorm PRIVATE cudalm)
+
 # --------------------------------------------------------------------------
 # User-facing CLI (v0.4 Phase C): raw UTF-8 prompt -> generated text.
 # Single request, serial, no streaming / chat template / batching (docs §21).
