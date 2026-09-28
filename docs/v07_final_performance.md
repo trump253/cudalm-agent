@@ -71,12 +71,15 @@ Stream-elapsed GPU time/call, H=1024, production shape:
 
 | M | frozen 2-launch (µs) | fused 1-launch (µs) | Δ (µs) |
 |---|---|---|---|
-| 1 | 4.716 | 2.822 | −1.894 |
-| 2 | 4.799 | 2.898 | −1.901 |
-| 3 | 4.801 | 2.900 | −1.901 |
+| 1 | 4.733 | 2.875 | −1.858 |
+| 2 | 4.908 | 2.921 | −1.986 |
+| 3 | 4.904 | 2.931 | −1.973 |
 
-(The fused family is also faster on pure GPU time: 3.10 µs/1-launch vs
-~5.15 µs for the replaced 2-launch pair.)
+Raw artifact (run at exact SHA `9db196e`, check-out-clean tree, with GPU /
+CUDA / binary-sha256 / command in the header):
+`benchmarks/v07d_fused_add_rmsnorm_microbench.txt`. (The fused family is also
+faster on pure GPU kernel time per Nsys: 3.10 µs/1-launch vs ~5.15 µs for the
+replaced 2-launch pair, §2.4.)
 
 ### 2.4 Nsys before/after (batched-only, 1 warmup + 5 measured, 132 traversals each)
 
@@ -108,7 +111,7 @@ both binary SHAs + sha256 + model hash: `benchmarks/v07d_paired_ab_raw.txt`.
 
 | statistic | value |
 |---|---|
-| **paired mean delta** | **−1.238 ms/run** (SE 2.562) |
+| **paired mean delta** | **−1.238 ms/run** (SD 2.562, SE 0.573) |
 | **paired median delta** | **−1.067 ms/run** |
 | **paired t** | **−2.162, df = 19, two-sided p = 0.0436** |
 | **95% CI of paired mean** | **[−2.437, −0.040] ms — EXCLUDES 0** |
@@ -243,6 +246,7 @@ in the v0.7 production runtime.
 
 - `benchmarks/v07d_paired_ab_raw.txt` — 20-pair paired E2E raw (both binary SHAs + sha256 + model hash).
 - `benchmarks/v07d_paired_ab_analysis.txt` — paired statistics + KEEP decision.
+- `benchmarks/v07d_fused_add_rmsnorm_microbench.txt` — fused add+rmsnorm microbench raw (exact SHA `9db196e`, clean tree; GPU/CUDA/command in header).
 - `benchmarks/v07d_final_timing.txt` — canonical timing at the final SHA.
 - `benchmarks/profiling/v07d_nsys_before_after.txt` — Nsys before/after (base vs cand).
 - `benchmarks/profiling/v07d_{base,cand}_batched_nsys.{nsys-rep,sqlite,*_summary.txt,*_summary_*.csv,header.txt}` — full batched Nsys artifacts.

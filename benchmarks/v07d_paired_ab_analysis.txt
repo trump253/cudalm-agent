@@ -31,7 +31,7 @@ per-pair means (base / cand / delta ms):
   pair 19: base  112.1010   cand  109.6283   d  -2.4727
   pair 20: base  110.4338   cand  109.4599   d  -0.9739
 ----------------------------------------------------------------------
-paired mean delta   = -1.2383 ms   (SE 2.5616)
+paired mean delta   = -1.2383 ms   (SD 2.5616, SE 0.5728)
 paired median delta = -1.0669 ms
 paired t            = -2.1619   (df = 19)   two-sided p = 0.0436
 95% CI of paired mean = [-2.4372, -0.0395] ms   (tcrit=2.0930)

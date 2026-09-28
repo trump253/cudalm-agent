@@ -1,0 +1,17 @@
+# =============================================================================
+# CUDALM v0.7 Phase D (candidate 1) — fused add+rmsnorm microbench RAW evidence
+# tool: tools/microbench_fused_add_rmsnorm (target tool_microbench_fused_add_rmsnorm)
+# exact SHA: 9db196e0dfc95c8fbf618f50c7149662bd6a0e53  (EXPERIMENT; runtime frozen == production 97c0c32)
+# tree: check-out-clean (git status empty) at 9db196e0dfc95c8fbf618f50c7149662bd6a0e53
+# binary sha256: d7daa0120e78e9192b42999a9b473f1e08039ebc379c33688f512bc805930366
+# GPU: NVIDIA GeForce RTX 2080 Ti | driver 570.172.08 | CUDA release 11.8
+# command: CUDA_VISIBLE_DEVICES=0 ./build/tool_microbench_fused_add_rmsnorm
+# method: stream-elapsed GPU us/call (CUDA events), H=1024, eps=1e-6, 3000 iters,
+#   50 warmup; deterministic random bf16; M=1/2/3 (production post-attention shape).
+# date: 2026-09-28T07:48:17Z
+# =============================================================================
+fused add+rmsnorm microbench (H=1024, eps=1e-6, 3000 iters, stream-elapsed us/call)
+M      frozen 2-launch (us)   fused 1-launch (us)    delta (us)    
+1      4.733                  2.875                  -1.858        
+2      4.908                  2.921                  -1.986        
+3      4.904                  2.931                  -1.973        
