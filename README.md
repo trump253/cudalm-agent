@@ -360,7 +360,7 @@ c5d20efe3424a82ac0c6e4b01849645c74a1aa40`（其后 commits 均为 docs/evidence-
 
 ## v0.8：Multi-turn / Session Runtime
 
-**状态：Phase A 完成**（分支 `v0.8-session-runtime`，从
+**状态：Phase A + Phase B 完成**（分支 `v0.8-session-runtime`，从
 `cf28abd`（v0.7 merge）创建；**不**在 main 开发，**不** merge —— 等待
 external reviewer）。
 
@@ -372,7 +372,7 @@ logical position + slot/page 所有权 + lifecycle metadata）；一个 Request
 conv / Delta recurrent / position **全部保留**（只有 `reset_session` /
 `destroy_session` 才执行明确的 reset/release）。
 
-### Phase A（本交付）：Session abstraction + persistent-state lifecycle
+### Phase A：Session abstraction + persistent-state lifecycle
 
 - **新控制面**：`SessionId` / `SessionState` / `Session` /
   `SessionManager`（`include/cudalm/session.h` + `src/runtime/session.cpp`）
@@ -392,9 +392,37 @@ conv / Delta recurrent / position **全部保留**（只有 `reset_session` /
   request 边界持久化 == 一次性连续 reference **bit-identical**、真实使用
   下隔离、reset parity、destroy + 复用，全 memcmp）。
 
+### Phase B：incremental multi-turn execution（单 Session 真多轮）
+
+- **新 API**：`SessionGenerator::generate_turn(session_id,
+  new_input_tokens, max_new_tokens, eos_token_id, sampling, stream,
+  observer)`（`include/cudalm/session_generator.h`）—— 薄引擎，只驱动
+  冻结的 `forward_token_with_state`，**append-only**：turn 只 forward
+  新 input（从 session 当前逻辑长度起），不 re-prefill 历史、不 reset
+  session、不拷贝/重建 KV 或 Delta state；随后从既有 KV + Delta
+  conv/recurrent + position 继续生成；per-turn 全新 `Sampler`
+  （RNG 不跨 turn）；`eos_token_id == -1` = 无 EOS gate（v0.6 约定）；
+- **commit 契约（pinned）**：turn 返回的每个 generated token（**包括**
+  触发停止的 EOS / max_new 最后一个）**都已提交**进 session state ——
+  turn 后 session 的 KV / Delta / logical length 与已提交 token history
+  完全一致（无"滞后最后一 token"语义；与冻结的 v0.4 one-shot 请求
+  `N + m - 1` 契约不同，v0.4 未改）；
+- **语义**：`max_new_tokens == 0` = input-only append；EOS token 提交后
+  停止；context overflow（`length + input + max_new_tokens >
+  max_seq_len`，精确边界相等 = 接受）= **明确 reject，无
+  eviction/truncation**；preflight 失败 = **zero mutation**；执行中
+  失败（如 KV OOM）= 已提交 token 保留、失败 token 不提交、停在最后
+  成功 token 边界（无 snapshot/rollback）；
+- **硬门**：`test_session_turn_contract`（CPU，无 checkpoint：preflight
+  全失败路径逐一 zero-mutation，含 overflow reject 与精确边界接受）+
+  `test_qwen35_session_generation`（真实 Qwen3.5-0.8B-Base checkpoint：
+  **turn 1 + turn 2 == 等价 one-shot continuous execution，逐步全量
+  logits / generated ID / 长度 / paged KV / Delta conv+rec 全部
+  bit-identical**；input-only、EOS commit、overflow、reset 后重执行 ==
+  fresh、KV OOM partial-commit，全 memcmp）。
+
 ### 后续阶段（未开始）
 
-Phase B incremental multi-turn execution（append-only 数值等价门）→
-Phase C scheduler 接入 + 多 session interleaving → Phase D text/chat 级
-multi-turn demo + 最终 sign-off。详见
-[`docs/v08_session_runtime.md`](docs/v08_session_runtime.md)。
+Phase C scheduler + Session 接入 / 多 session interleaving → Phase D
+text/chat 级 multi-turn demo + 最终 sign-off（**Phase C 尚未开始**）。
+详见 [`docs/v08_session_runtime.md`](docs/v08_session_runtime.md)。

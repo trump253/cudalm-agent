@@ -1,16 +1,24 @@
-# CUDALM v0.8 Phase A — Session Runtime（Session abstraction + persistent-state lifecycle）
+# CUDALM v0.8 Session Runtime — Phase A（Session abstraction + persistent-state lifecycle）+ Phase B（incremental multi-turn execution）
 
-> 本阶段**唯一目标**：建立正确、清晰、可测试的 **Session abstraction**，并把
-> 现有 KV / DeltaNet state 的生命周期从 **Request ownership 迁移到
-> Session ownership**（state 跨 request 持久化）。
+> **Phase A 目标**（§1–§7，已完成并冻结）：建立正确、清晰、可测试的
+> **Session abstraction**，并把现有 KV / DeltaNet state 的生命周期从
+> **Request ownership 迁移到 Session ownership**（state 跨 request 持久化）。
 >
-> 本阶段**不做**：chat template、HTTP server、OpenAI API、多轮文本对话
+> **Phase B 目标**（§8，已完成）：在冻结的 Phase A 生命周期之上实现
+> **真正的单 Session incremental multi-turn execution**——turn 1 append 新
+> 输入 → 生成；turn 2 同一 Session 只 append 新输入 → 从既有 KV + Delta
+> state + position 继续生成——并证明
+> **incremental multi-turn execution == 等价 one-shot continuous execution**
+> （bit-exact）。
+>
+> v0.8 **不做**：chat template、HTTP server、OpenAI API、多轮文本对话
 > 历史管理、context eviction / sliding window / TTL / LRU、multi-stream、
-> CUDA Graph、batched prefill、新 kernel 优化（见 §9 当前限制）。
+> CUDA Graph、batched prefill、新 kernel 优化、scheduler + Session 接入
+> （Phase C）、多 session batching（见 §9 当前限制）。
 >
 > 基线：`main` @ `cf28abd60b0d9f493149db68b0958ebb9c5214b5`
 > （v0.7 merge，`V07_FINAL_FUNCTIONAL_SHA = 9edd9ef6aec84b8dcf66a262652c2e285ff73793`）。
-> 开发分支：`v0.8-session-runtime`（不直接在 main 开发；本阶段不 merge）。
+> 开发分支：`v0.8-session-runtime`（不直接在 main 开发；v0.8 尚未 merge）。
 
 ---
 
@@ -321,44 +329,188 @@ compute-sanitizer --tool memcheck ./build/tests/test_qwen35_session_runtime \
 
 （`compute-sanitizer` = `/usr/local/cuda-11.8/bin/compute-sanitizer`。）
 
-## 8. Phase B future contract
+## 8. Phase B — incremental multi-turn execution（已实现）
 
-Phase B 要证明：
+### 8.1 目标与合同
+
+实现真正的单 Session incremental multi-turn execution：
 
 ```text
 turn 1: session A append [a,b,c]  → generate [d,e]
 turn 2: same session A append [f,g] → generate ...
 ```
 
-与等价的一次性连续执行在定义的 numerical contract 下保持一致
-（append-only incremental execution 的 bit-exact 数值等价）。
+并证明（§8.5 硬门）：**incremental multi-turn execution == 等价的
+one-shot continuous execution**（bit-exact 数值等价）。
 
-Phase A 为此留下的清晰路径（均已实现并被门住）：
+### 8.2 API
 
-1. **position 派生自 bound sequence 的 `length`**（单一事实来源）——
-   incremental append 就是"从当前 length 继续 forward 新 token"，
-   `forward_token_with_state` 今天已这样工作，session 层不引入第二个
-   position 计数器；
-2. **turn 边界零操作**——request 完成不触碰 state，因此 turn 2 天然
-   续写 turn 1 的 KV pages 与 Delta conv/recurrent（无重初始化、无拷贝）；
-3. **`sequence_id_of()` / `context_length_of()`** 暴露了 Phase B/C 驱动
-   模型所需的全部句柄；`fits()` 是 overflow reject 的策略入口；
-4. 本阶段 7.2 的"chunked-on-session == one-shot"门就是 Phase B 数值
-   等价门的**状态层前身**——Phase B 在其上加采样/生成循环与 EOS/
-   max_new_tokens 语义，等价性要求不变（同一 token 流、同一 kernel、
-   同一 op 顺序 → bit-identical）。
+`include/cudalm/session_generator.h`（实现 `src/runtime/session_generator.cpp`）：
 
-Phase A 的 API **不预设**任何阻碍 append-only incremental execution 的
-约束：没有 turn 计数、没有 prompt 快照、没有 state 拷贝/重放机制。
+```cpp
+struct TurnResult {
+  bool ok = false;
+  std::string error;            // 失败原因（if !ok）
+  std::vector<int> generated;   // 本 turn 已提交的 generated token（有序）
+  StopReason stop_reason;       // Eos / MaxNewTokens（仅 ok 时有意义）
+  int input_count;              // 本 turn 已提交的 input token 数
+  int forward_count;            // 本 turn 已提交的 forward 数（== input_count + generated.size()）
+  int context_length;           // turn 之后的 session 逻辑长度
+};
+
+class SessionGenerator {
+ public:
+  SessionGenerator(Qwen35Model& model, SessionManager& sessions);  // 均非拥有
+  TurnResult generate_turn(SessionId session_id,
+                           const std::vector<int>& new_input_tokens,
+                           int max_new_tokens, int eos_token_id,
+                           const SamplingConfig& sampling, cudaStream_t stream,
+                           const LogitsObserver* observer = nullptr);
+};
+```
+
+设计要点：
+
+- **薄引擎、零新状态**：只驱动冻结的 `Qwen35Model::forward_token_with_state`
+  在 session 的 bound sequence 上执行；无新 kernel、无新模型 state、无
+  session 层第二个 position 计数器（position 派生自 bound
+  `SequenceState::length`，单一事实来源，继承 v0.5 forward gate）；
+- **append-only**：一个 turn 只 forward `new_input_tokens`（每个恰好一次，
+  从 session **当前** 逻辑长度起）——不 re-prefill 历史、不 reset session、
+  不拷贝/重建 KV 或 Delta state；随后从既有 KV + Delta conv/recurrent +
+  position 继续生成至多 `max_new_tokens` 个 token；
+- **per-turn RNG 隔离**：每个 turn 构造**全新的** `Sampler`（seed =
+  `sampling.seed`）——RNG state 永不跨 turn（v0.4 per-request 纪律）；
+  greedy（temperature <= 0）走冻结的 `argmax_bf16`（bit-for-bit，零 RNG）；
+- **`eos_token_id == -1`** = 无 EOS gate（v0.6 `Request` 约定）；否则必须
+  在 `[0, vocab_size)`；
+- **observer**（可选）：本 turn **每个已提交 forward** 之后回调
+  （host 全量 logits + turn-local step 索引：input 步 0..N-1，generated
+  步 N..），供门测逐步比对。
+
+### 8.3 token commit 语义（pinned，反"滞后 state"）
+
+> **成功结束一个 turn 后，Session 的 KV / Delta conv / Delta recurrent /
+> logical length 必须与该 turn 已提交的 token history 一致。**
+
+Phase B 采用**完全提交契约**（默认，非滞后语义）：`generated` 中返回的
+**每一个** token——包括触发停止的那个（EOS / max_new_tokens 的最后一个）
+——在 turn 返回**之前**都已 forward（提交）进 session state。因此：
+
+- 一个生成 m 个 token 的 turn 共 forward `len(new_input) + m` 个 token。
+  注意这与**冻结的** v0.4 one-shot `Qwen35Generator` 不同（其契约为
+  `N + m - 1`，最后一个 generated token 不提交）；v0.4 一行未改，两个
+  契约各自被自己的门 pin 住；
+- turn 后 session 逻辑长度 == turn 前长度 + input + generated，**不存在**
+  "generated 已返回最后一个 token 但 Session state 还没有它"的滞后；
+- 后续 turn 天然从含**全部**已生成 token 的历史继续——"generated tokens
+  成为 Session 后续历史的一部分"由 §8.5 等价门直接证明（turn 2 的 logits
+  逐位命中把 turn 1 生成 token 计入历史的 one-shot reference）；
+- **`max_new_tokens == 0` = input-only append**：forward（提交）input，
+  不生成任何东西（`generated` 空，`stop_reason = MaxNewTokens`，
+  `forward_count == input_count`）。
+
+**增量 == one-shot**：同一 session 分 turn 驱动 vs 在独立 fresh sequence
+上做的一次性连续执行（相同 token 流、相同 per-phase sampler 配置、无
+turn 边界）——逐步全量 logits、generated token ID、逻辑长度、最终 hybrid
+state（paged KV + Delta conv + Delta recurrent）**全部 bit-identical**
+（同一 token 流、同一冻结 kernel、同一 op 顺序 → 无容差，memcmp）。
+
+### 8.4 EOS / max_new_tokens / context limit 语义
+
+- **EOS**：generated token 等于 `eos_token_id` 时，该 token **像其他
+  generated token 一样被提交**，turn 随即停止（`stop_reason = Eos`）；
+  EOS 优先于 max_new_tokens（v0.4 约定）；
+- **max_new_tokens**：已生成数 == `max_new_tokens` 时停止
+  （`MaxNewTokens`）；`== 0` 为 input-only append（§8.3）；
+- **context limit（overflow）**：继承 Phase A pinned 策略——**明确 reject，
+  绝不 eviction / truncation / 静默丢最早 token/page**。preflight 检查
+  `length + input + max_new_tokens <= max_seq_len`（**精确边界相等 =
+  接受**）；超限直接拒绝。由此保证一个**成功**的 turn 不可能在执行中
+  耗尽 context（最后一个提交 token 必在 position `<= max_seq_len - 1`，
+  构造性成立），所以成功 turn 的 `stop_reason ∈ {Eos, MaxNewTokens}`。
+  （KV 页池 OOM 是独立的运行时容量条件，见 §8.5。）
+
+### 8.5 失败语义（无 snapshot、无 rollback）
+
+- **preflight 失败**（非法 SessionId、空 input、`max_new_tokens < 0`、
+  非法 sampling config、context overflow、stream 不匹配、model 未加载 /
+  config 不匹配、非法 eos / input token）：返回 error，**Session state
+  完全不变**——无 forward、无 KV 分配、无 Delta mutation、length 不变
+  （contract test 对**每一个**失败调用逐一断言 zero-mutation，含预先
+  弄脏的 Delta slot pattern 完好）；
+- **执行中失败**（如已提交若干 token 后 forward 遭遇 KV OOM）：
+  **已提交的 token 保留，失败的 token 不提交**，Session 停留在最后成功
+  的 token 边界（`TurnResult::context_length` 给出精确位置），
+  `ok == false` + error。不 snapshot、不 rollback（by design，不做昂贵
+  拷贝）。
+
+### 8.6 正确性证据
+
+新增两个门（不重复 Phase A 的 isolation/reuse 覆盖）：
+
+**A. `tests/cpu/test_session_turn_contract.cpp`**（无 checkpoint、无
+model——未加载的 `Qwen35Model` + 真实设备池 + 小合成 config；preflight
+的前 6 项检查不依赖 model vocab，故全部可门）：
+
+| 门 | 覆盖 |
+|---|---|
+| invalid SessionId | 未知/已销毁 id → error，zero mutation |
+| 空 input / `max_new_tokens < 0` | 参数门，zero mutation |
+| 非法 sampling config | `validate_sampling_config` 消息透传，zero mutation |
+| **context overflow** | `62 + 2 + 1 > 64` → 明确 "context overflow" reject（无 eviction），zero mutation |
+| **精确边界** | `61 + 2 + 1 == 64` → capacity gate **接受**（调用越过 overflow 检查、在后面的 model 门失败而非 overflow 门），zero mutation |
+| stream 不匹配 | v0.5 单 stream 契约 preflight 化，zero mutation |
+| model 未加载（全合法调用） | model 门 fail loud，zero mutation |
+
+**B. `tests/cuda/test_qwen35_session_generation.cpp`**（真实
+Qwen3.5-0.8B-Base checkpoint；除注明外全部 **BIT-IDENTICAL**）：
+
+| 门 | 证明 |
+|---|---|
+| **incremental == one-shot（Phase B 核心）** | session A：turn 1（append 3 tokens，生成 2，greedy）+ turn 2（append 2 tokens，生成 2，seeded sampling）vs 独立 fresh v0.5 sequence 上的一次性连续执行（手动 token-by-token、相同 per-phase sampler 配置、无 turn 边界）：**9 个已提交 forward 的 FULL logits[248320] 逐步按序 + generated token ID + 逻辑长度（5 / 9）+ 最终完整 hybrid state（18×Delta conv/rec + 6×FA 逻辑 K/V 行经 block table 读回）逐位一致**——turn 边界数值不可见；且 turn 2 的首个 input 在 turn 1 的**最后一个生成 token** 之后继续（commit 契约：停止触发 token 已在 state 中，无滞后） |
+| preflight（真实 model） | 非法 eos / 非法 input token 被拒，session **完全不变** |
+| `max_new_tokens == 0` | input-only append（3 input、零生成）；state 与 fresh 3-token reference 逐位一致 |
+| **EOS commit** | eos = 首个 greedy 生成 token 的 turn：stop_reason = Eos、恰好生成 [该 token]、最终 state 与 M=1 无 gate turn 逐位一致（EOS token 已提交） |
+| **context overflow（真实 model）** | length = `max_seq_len - 2` 时 `+2+1 = 262145 > 262144` → 明确 reject，**zero mutation**（length / pages / block table 完全不变，无 eviction） |
+| **reset + re-run == fresh** | `reset_session(A)` 后（同 id fresh、Delta slot 设备级全零）重放同样两个 turn：逐步 logits / generated ID / 最终 state 与**原始 run 逐位一致**（== one-shot reference） |
+| **runtime failure（无 rollback）** | 独立 3-page manager：KV OOM 时 input 阶段（7 input 中 6 个已提交、第 7 个未提交）与 generation 阶段（g0 已提交、g1 未提交）的 partial-commit 边界精确；`context_length` == 最后成功 token 边界 |
+
+完整验证（functional + tests tree @ `83fd52cd5ca77bf40bec19dc9248f5650646273a`，clean tree）：
+
+```text
+cmake --build build -j8        # 全量构建：clean（-Wall -Wextra -Werror）
+ctest -R session --output-on-failure
+→ 4/4 passed（test_session_manager / test_session_turn_contract /
+    test_qwen35_session_runtime / test_qwen35_session_generation）
+ctest（generation / sampling 回归：test_qwen35_generation /
+    test_qwen35_generation_contract / test_qwen35_sampling）
+→ 3/3 passed
+ctest --output-on-failure
+→ 67/67 passed, 0 failed, 0 skipped（Total 793.48s）
+bash scripts/check_no_torch.sh
+→ forbidden_deps_check OK → no-torch CLEAN
+compute-sanitizer --tool memcheck ./build/tests/test_qwen35_session_generation \
+    build/data/qwen35_08b_full.cudalm /root/models/Qwen3.5-0.8B-Base \
+    /root/py311/venv/bin/python3 /root/code/cudalm-agent
+→ PASS + ERROR SUMMARY: 0 errors
+```
+
+**Phase C 尚未开始**：scheduler + Session 接入、多 session batching、
+chat template、HTTP/OpenAI API 等均不在本阶段（见 §9）。
 
 ## 9. 当前限制
 
-- **尚无完整 multi-turn generation**：Phase A 的"request"是测试内直接
-  的 token 驱动；带 generation config 的 session-bound 生成循环属于
-  Phase B；
 - **scheduler 尚未接入 session**：v0.6 `Scheduler` 仍是 request-scoped
   （终态 retire sequence）；session-aware admission / 多 session
-  interleaving 属于 Phase C；
+  interleaving 属于 Phase C（**Phase C 尚未开始**）。Phase B 的
+  `SessionGenerator` 是**单 session、单 stream、同步** 的 turn 引擎
+  （correctness-first，与 v0.4/v0.6 同一纪律）；
+- **多 session batching 未做**：一个 turn 只驱动一个 session 的 bound
+  sequence；跨 session 的 batched decode 属 Phase C/D；
+- **生成循环为 correctness-first**：每步 host 全量 logits D2H + host
+  采样（与 v0.4 `Qwen35Generator` 同一路径）；无 CUDA Graph、无 kernel
+  级 argmax、无流式输出；
 - **无 eviction**：context overflow = 明确 reject（§5），无 sliding
   window / TTL / LRU（v0.9 以后）；DeltaNet recurrent state 含压缩历史，
   任何"丢最早 token"策略都未实现也暂不设计；
