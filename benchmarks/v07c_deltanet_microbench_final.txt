@@ -1,0 +1,34 @@
+== CUDALM v0.7 Phase C DeltaNet delta-rule microbench ==
+config: n_heads=16 head_dim=128 (pinned Qwen3.5-0.8B); B=1/2/3
+variants: frozen (baseline), vreg (register-resident column), vvec (float4 x4 values), vchunk (2-kernel value-chunk)
+census (Phase A): 18 deltanet_delta calls/traversal; canonical B mix 19:1:2 (B1:B2:B3 of 22 traversals)
+
+== B=1 (n_heads=16, hd=128) ==
+variant     iters    mean_us  median_us     min_us     p90_us us_per_token    speedup     regs
+frozen      20000     23.385     22.528     20.864     22.720       23.385     1.000x       -1
+vreg        20000     14.599     17.888     16.512     18.432       14.599      1.602x       46
+vvec        20000     15.251     17.920     16.544     18.432       15.251      1.533x       59
+vchunk      20000     12.587     15.712     14.336     16.384       12.587      1.858x       50
+
+== B=2 (n_heads=16, hd=128) ==
+variant     iters    mean_us  median_us     min_us     p90_us us_per_token    speedup     regs
+frozen      20000     21.222     23.840     22.528     24.576       10.611     1.000x       -1
+vreg        20000     18.527     20.960     19.040     22.464        9.263      1.145x       46
+vvec        20000     15.974     18.432     17.376     18.720        7.987      1.329x       59
+vchunk      20000     20.593     24.352     20.480     25.184       10.296      1.031x       50
+
+== B=3 (n_heads=16, hd=128) ==
+variant     iters    mean_us  median_us     min_us     p90_us us_per_token    speedup     regs
+frozen      20000     21.559     24.224     22.560     24.576        7.186     1.000x       -1
+vreg        20000     29.429     31.296     30.400     32.448        9.810      0.733x       46
+vvec        20000     16.395     18.432     17.120     19.424        5.465      1.315x       59
+vchunk      20000     32.597     34.848     33.152     35.968       10.866      0.661x       50
+
+== weighted production score (18 calls/traversal x canonical B mix 19:1:2) ==
+W_Bx = 18 x mean_us(B=x);  overall = (19*W_B1 + 1*W_B2 + 2*W_B3) / 22 [us per traversal]
+
+variant         W_B1_us        W_B2_us        W_B3_us     overall_us    vs_frozen
+frozen          404.133        427.844        432.798        407.817         0.00%
+vreg            320.495        381.295        568.636        345.817       -15.20%
+vvec            321.771        333.346        334.737        323.476       -20.68%
+vchunk          283.792        428.351        630.455        321.878       -21.07%
