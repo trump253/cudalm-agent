@@ -322,15 +322,18 @@ binary SHAs/hashes: `benchmarks/v07c_paired_ab_raw.txt`.
 * paired t = **−1.318, df = 19, two-sided p = 0.203**
 * **95% CI of the paired mean = [−2.572, +0.585] ms — includes 0**
 
-**Supplemental:** Wilcoxon signed-rank W+ = 76, W− = 134, z = −1.505,
-two-sided **p = 0.132**. 14/20 pairs have Δ < 0.
+**Supplemental:** Wilcoxon signed-rank **W+ = 53, W− = 157**, exact
+two-sided **p = 0.0532** (normal approximation p ≈ 0.0522). 14/20 pairs
+have Δ < 0.
 
 The candidate is faster in the majority of pairs and in the median, but
-the improvement is not statistically distinguishable from zero: the 95% CI
-of the paired mean spans 0, the paired t is far from significant, and the
-Wilcoxon is not significant. A few high-noise candidate invocations
-(pairs 15, 17, 14, 9) are the main reason the mean is pulled toward zero,
-but the pre-specified decision rule does not allow cherry-picking them.
+the improvement is not statistically distinguishable from zero at the
+pre-specified level: the 95% CI of the paired mean spans 0 (the binding
+criterion), the paired t is far from significant, and the Wilcoxon
+signed-rank is only borderline (p = 0.0532, just above α = 0.05). A few
+high-noise candidate invocations (pairs 15, 17, 14, 9) are the main
+reason the mean is pulled toward zero, but the pre-specified decision
+rule does not allow cherry-picking them.
 
 ## 8. REJECT decision
 
