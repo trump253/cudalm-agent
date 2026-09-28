@@ -592,9 +592,11 @@ observability；frozen runtime 仍负责 correctness，零 frozen code
 改动）：
 
 - **Serving limits**（`ServingLimits`）：`max_sessions`（live session
-  配额）、`max_live_requests`（live request 配额）、
-  `max_context_tokens_per_session`（可选 per-session policy cap，0 =
-  禁用；构造时钳制到模型 `max_seq_len`——只能收紧、不能突破）；
+  配额）、`max_live_requests`（live request 配额）——**quota 三态**：
+  `-1 = unlimited`、`0 = zero capacity`（拒绝一切 admission）、
+  `N>0 = capacity N`；`max_context_tokens_per_session`（可选
+  per-session policy cap，`0 = 禁用`——它不是 quota；构造时钳制到
+  模型 `max_seq_len`——只能收紧、不能突破）；
 - **reject early / fail loud / zero mutation**：limit rejection 发生
   在触碰 frozen runtime **之前**——no SessionId / RequestId
   consumed、no sequence created、no KV page / Delta slot / logical-

@@ -48,16 +48,30 @@ ServingController          （v0.9 Phase A 新增——POLICY 层）
 
 ```cpp
 struct ServingLimits {
-  int max_sessions = -1;            // live session 配额（-1 = unlimited）
-  int max_live_requests = -1;       // live request 配额（-1 = unlimited）
+  int max_sessions = -1;            // live session 配额（三态，见下）
+  int max_live_requests = -1;       // live request 配额（三态，见下）
   int max_context_tokens_per_session = 0;  // 可选 policy cap（0 = 禁用）
 };
 ```
 
+**quota 三态语义**（`max_sessions` / `max_live_requests`）：
+
+```text
+-1  = unlimited        （不设限）
+0   = zero capacity    （拒绝一切 admission）
+N>0 = capacity N
+```
+
+> **Review fix（2025，SHA 见 §7 / provenance）**：最初实现用
+> `limit > 0` 判断，导致 `0` 被错误解释为 unlimited。已固定为上面的
+> 三态：判断改为 `limit >= 0`。`max_context_tokens_per_session` **不**
+> 是 quota（是可选 policy cap），保持 `0 = 禁用` 不变。
+
 - **max_sessions**：`create_session` 时 `live sessions < max_sessions`
-  → allow；`==` → **reject**；
+  → allow；`==` → **reject**（`0` → 第一次 create 即 reject）；
 - **max_live_requests**：turn admission 时 `live requests <
-  max_live_requests` → allow；达到 → **reject**。live == 经**本
+  max_live_requests` → allow；达到 → **reject**（`0` → 第一次
+  admit 即 reject，session 仍可创建）。live == 经**本
   controller** 准入且尚未终态的 request；
 - **max_context_tokens_per_session**（可选）：per-session **policy
   cap**（0 = 禁用）。用与 scheduler model overflow **相同的投影**
@@ -159,7 +173,13 @@ const ServingLimits& limits() const;
   admission succeeds，证明计数不永久卡死；重复 `sync()` 幂等）；
   context policy cap（低于模型上限处 reject、精确边界 `==` 接受、
   构造钳制 999999 → 64）；**cancel 与 forward failure 释放配额**
-  （failure 后 session 从 committed boundary 重试）；
+  （failure 后 session 从 committed boundary 重试）；**quota 三态
+  边界（review fix）**：`max_sessions = 0` → 第一次 create 即
+  reject（zero mutation、无 SessionId 消耗、`rejected_session_limit`
+  +1）；`max_live_requests = 0` → session 可创建、第一次 admit 即
+  reject（zero mutation、无 RequestId 消耗、`rejected_request_limit`
+  +1）；`-1` 仍 = unlimited（多 session + 并发 live request 自由
+  准入、零 limit 拒绝）；
 - **`test_serving_integration`**（真实 Qwen3.5-0.8B-Base checkpoint
   integration regression）：controller 驱动 A（greedy）/ B（seeded）
   各两 turn（两个 live 同时——batched 路径）与**直接 raw

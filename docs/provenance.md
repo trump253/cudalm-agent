@@ -1847,6 +1847,41 @@ state allocation / forward 时才失败。
   A 验收标准**不**需要 compute-sanitizer / full ctest / profiling
   （full ctest 留到 v0.9 最终阶段）。
 
+### Phase A review fix（quota 0 = zero capacity，非 unlimited）
+
+**External review blocker**：文档 contract 为
+`live < limit -> allow / live == limit -> reject` 且
+`-1 = unlimited`，但实现用 `limit > 0` 判断，导致 **quota=0 被错误
+解释为 unlimited**。
+
+**固定语义**（三态）：`-1 = unlimited`，`0 = zero capacity`（拒绝一
+切 admission），`N>0 = capacity N`。
+
+**Commit**：
+
+- Functional: `ccbfc0c948cd04058efb020173ab5ad8f007dac1`
+  （`ServingController::create_session` 判断 `max_sessions > 0` →
+  `>= 0`；`admit_turn` 判断 `max_live_requests > 0` → `>= 0`；
+  header 注释固定三态。`max_context_tokens_per_session` 是 policy
+  cap 非 quota，保持 `0 = disabled` 不变。无 SessionManager /
+  Scheduler / CUDA / runtime 核心改动）
+- Tests: `2f9fe5f58ddf635bf33716363e7c22bc888428c6`
+  （`test_serving_admission` 新增两个边界 case + unlimited 确认：
+  `max_sessions=0` → 第一次 create reject（zero mutation、无
+  SessionId 消耗、`rejected_session_limit` +1）；
+  `max_live_requests=0` → session 可创建、第一次 admit reject
+  （zero mutation、无 RequestId 消耗、`rejected_request_limit` +1）；
+  `-1` 仍 = unlimited）
+
+**验收**（本地验证，非 CI）：
+
+- `test_serving_admission` → **PASS**（12 个 [ok] 用例，含 2 个新
+  边界 + unlimited 确认）；
+- targeted `ctest -R "serving|scheduler|session"
+  --output-on-failure` → **14/14 PASS**；
+- 按 Phase A 验收标准**不**需要 full ctest / compute-sanitizer /
+  重跑 v0.8 hard gates（未修改 CUDA / model state path）。
+
 **Phase A 明确不做**（non-goals，属后续 Phase）：streaming、deadline
 / timeout、TTL / LRU、eviction、HTTP server、OpenAI API、multi-
 stream、CUDA Graph、kernel 优化、chat template、动态 quota 系统。
