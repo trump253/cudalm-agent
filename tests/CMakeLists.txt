@@ -88,6 +88,26 @@ cudalm_add_test(test_session_manager test_session_manager
 cudalm_add_test(test_session_turn_contract test_session_turn_contract
                 cpu/test_session_turn_contract.cpp)
 
+# v0.8 Phase C: scheduler + session integration CONTRACT gate (CPU test:
+# NO checkpoint, NO model — the deterministic fake forwarder over the REAL
+# state pools + a real SessionManager + a real Scheduler with a session
+# manager attached). Gates: ADMISSION FAILURES = ZERO MUTATION (invalid
+# SessionId, empty input, max_new_tokens < 0, invalid eos / token /
+# sampling, CONTEXT OVERFLOW (exact boundary accepted), BUSY session —
+# one live turn per session, and a scheduler without a session manager),
+# NO SEQUENCE CREATED at session-turn admission, TERMINAL != RETIRED
+# (session + bound sequence stay live after Finished / Cancelled /
+# Failed), the COMMIT CONTRACT (sampled != committed: forward_count and
+# the session length include the stop-triggering token; the EOS token IS
+# committed), CANCEL / FAILURE keep the committed state and leave the
+# PENDING token out of the session history, the NEXT turn CONTINUES from
+# the committed length (no replay — the fake's per-sequence step counter
+# proves the position derivation), max_new_tokens == 0 input-only turns
+# (no sampling), and the LEGACY path untouched (frozen N + m - 1 +
+# retire-once).
+cudalm_add_test(test_qwen35_scheduler_session test_qwen35_scheduler_session
+                cpu/test_qwen35_scheduler_session.cpp)
+
 # v0.6 Phase A: request scheduler / control-plane gate (CPU test: NO
 # checkpoint, NO model — a deterministic fake forwarder over the REAL
 # Qwen35StateManager pools). Gates: request lifecycle (Waiting/Running/
@@ -277,6 +297,48 @@ add_test(NAME test_qwen35_session_generation
                  ${CUDALM_TOOL_PYTHON3}
                  ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_qwen35_session_generation PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# v0.8 Phase C: scheduler + session integration HARD gate (real
+# checkpoint) — the v0.8 Phase C sign-off test. Sessions A (greedy) and
+# B (seeded sampling) run TWO turns each through the v0.6 scheduler
+# (session-bound admission over their EXISTING bound sequences — no
+# sequence created, no history replay) against INDEPENDENT REFERENCES
+# (one session alone on a fresh sequence, direct continuous forwards,
+# same per-turn sampler configs, no turn boundary). Gates (BIT-IDENTICAL,
+# memcmp): every committed forward's FULL logits [vocab] in order (A:
+# 10, B: 9 — including the BATCHED decode rows, recorded from
+# forward_batch + logits_batch_to_host), generated token IDs per turn,
+# logical length at the turn boundary (A 6 / B 5) and at the end
+# (A 10 / B 9), and the full hybrid state (18x Delta conv+rec, 6x FA
+# logical K/V rows through the block table) at the turn boundary AND at
+# the end — proving the COMMIT CONTRACT through the scheduler (sampled
+# != committed; the stop-triggering token IS in the session state when
+# the turn ends), TURN 2 DOES NOT REPLAY TURN 1 (per-step logits of the
+# t2 forwards match the reference's later steps — a replay would break
+# the RoPE-dependent logits), and A/B INTERLEAVING CAUSES NO
+# CONTAMINATION (each session matches its OWN solo reference while
+# sharing batched model traversals). Plus: BATCH EVIDENCE (two live
+# sessions form TRUE batched decode cohorts: batch_forward_calls == 4,
+# max_batch_size == 2, decode_cohort_trace == [1, 2, 2, 1, 2, 2], each
+# batch row bit-identical to its solo reference row); SESSION
+# PRESERVATION AFTER A TURN TERMINAL (requests terminal, sessions +
+# bound sequences live, state intact); ADMISSION ZERO-MUTATION (busy
+# session rejected mid-t1; CONTEXT OVERFLOW at max_seq_len - 2 on the
+# real model rejected; the EXACT boundary accepted); CLEAN TEARDOWN
+# (destroy + retire -> every pool accounting back to EXACTLY zero).
+# Self-skips (77) when the checkpoint is absent; the Phase C evidence
+# environment MUST actually run it.
+add_executable(test_qwen35_scheduler_session_integration
+               cuda/test_qwen35_scheduler_session_integration.cpp)
+target_link_libraries(test_qwen35_scheduler_session_integration PRIVATE cudalm)
+add_test(NAME test_qwen35_scheduler_session_integration
+         COMMAND test_qwen35_scheduler_session_integration
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen35_scheduler_session_integration PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 # --- Cross-language weight-file tests (Python tools -> C++ loader) ------------
