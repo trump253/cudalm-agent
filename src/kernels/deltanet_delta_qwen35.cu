@@ -609,20 +609,22 @@ inline bool state_16b_aligned(const float* p) {
 // profiling/v07c_candidate_batched_nsys_*). Anything not in the table
 // takes the FROZEN baseline path — the bit-compatible fallback.
 //
-// MEASURED ADAPTIVE TABLE (V07C_CANDIDATE_SHA; measured at the exact-SHA
-// microbench/NCU evidence, docs/v07_deltanet_optimization.md):
+// MEASURED ADAPTIVE TABLE — FINAL (V07C_FINAL_FUNCTIONAL_SHA). Production
+// uses this table; the KEEP decision and the full exact-SHA evidence chain
+// (parity 1047 checks, microbench x2, NCU before/after, batched-only nsys,
+// canonical E2E 150v150 Welch p=0.012 / Mann-Whitney p<0.0001) are recorded
+// in docs/v07_deltanet_optimization.md.
 //
-//   B=1:  n_heads=16 -> vchunk   (1.87~1.88x; 2-kernel value-chunk split,
-//                                    s pass 50 regs, no S reload)
+//   B=1:  n_heads=16 -> vchunk   (1.79~1.88x; 2-kernel value-chunk split,
+//                                    s pass 50 regs; nsys 24.5 -> 18.1us/call)
 //   B=2:  n_heads=16 -> vvec     (1.32~1.33x; float4 x4 values/thread)
 //   B=3:  n_heads=16 -> vvec     (1.31~1.33x; vreg measured 0.73x, vchunk
 //                                    0.66x at B=3 -> frozen would lose)
-//   else  -> frozen baseline (no measured data)
+//   else  -> frozen baseline (no measured data; bit-compatible fallback)
 //
 // Weighted production score (18 calls/traversal, canonical B mix 19:1:2):
-// mixed table ~ -42% delta-kernel time per traversal vs frozen (dev runs).
-// The KEEP/REJECT decision is recorded in docs/v07_deltanet_optimization.md
-// after the exact-SHA E2E acceptance check.
+// mixed table ~ -42% delta-kernel time per traversal vs frozen; nsys
+// batched-only delta-rule kernel time 58.70 -> 44.44 ms (-24.3%).
 // ---------------------------------------------------------------------------
 
 namespace {
