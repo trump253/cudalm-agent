@@ -1438,3 +1438,45 @@ streaming / batching。契约 + 硬门详见 `docs/qwen35_architecture.md` §20�
     beam search / priority scheduler；**v0.7 性能调优尚未开始**（Phase C
     batch kernel 为 correctness-first，无吞吐/提速声明）。本阶段**不** merge
     进 main、**不**自启 v0.7 —— 待 external reviewer 签核。
+
+## CUDALM v0.8 Phase A（Session abstraction + persistent-state lifecycle）
+
+v0.8 把"一次性 Request 生命周期"升级为 **persistent Session + multiple
+Requests/turns**：state 生命周期从 Request ownership 迁移到 Session
+ownership。Phase A 交付 Session 控制面 + 持久化语义 + lifecycle 硬门。
+
+### 上游核查（CUDALab `cb6a6a9`，只读参考）
+
+无 kernel 移植、无上游代码复用。本阶段全部为 CUDALM 原生控制面代码；
+**未改动任何 kernel / 模型数学语义**（v0.5 state 池、v0.6 scheduler
+全部冻结）。
+
+### CUDALM 原生（无上游）
+
+| CUDALM 文件 | 内容 | commit |
+|---|---|---|
+| `include/cudalm/session.h`、`src/runtime/session.cpp` | Session 控制面：`SessionId`（单调递增、永不复用；与 `SequenceId` / `RequestId` 三个独立 id 空间）/ `SessionState`（Phase A 仅 `Active`，同步单线程生命周期，枚举为未来扩展预留）/ `Session`（绑定 `sequence_id` + lifecycle metadata `reset_count`）/ `SessionManager`（冻结 `Qwen35StateManager` 之上的薄**非拥有**绑定层，一个 session == 一个 bound sequence）。`create_session`（事务式：sequence 创建失败则不登记任何东西）/ `lookup` / `sequence_id_of` / `context_length_of`（活读 bound sequence 的 `length` —— position 单一事实来源，不复制）/ `fits`（context 容量纯查询：`length + n <= max_seq_len`，overflow → reject 策略入口，无 eviction）/ `reset_session`（`reset_sequence` 就地清零：KV pages 释放+清零、Delta slot **就地**清零（同 slot id，不 release/re-acquire —— reset 不会 OOM）、length=0；**同一 SessionId 存活**）/ `destroy_session`（`retire_sequence` + 删记录 + SessionId 失效，永不复用）。**关键语义变化**：request 完成 = **无 state 操作**（v0.6 scheduler 的 `finish()` 会 `retire_sequence`；v0.8 session 路径不 retire）——KV pages / Delta conv / Delta recurrent / position 跨 request 保留。无新设备分配、无 kernel、无池改动（zero-on-release / zero-on-reset / 精确 byte accounting 全部继承 v0.5） | `c6c0458` |
+| `tests/cpu/test_session_manager.cpp` | Session lifecycle 硬门（真实设备池，小合成 config 8 层/2 full+6 linear/max_seq 64，无 checkpoint）：create→valid / destroy→invalid（所有操作对已销毁 id 均 Status error，含 double-destroy；id 永不复用）、1:1 session↔sequence 绑定不变量（每次 mutation 后 `num_sessions == num_live_sequences`）、create 事务式（Delta OOM 不登记任何东西）、**A/B 隔离**（slot 不相交；A 弄脏 conv+recurrent（所有层）+ 两块 KV page（K+V）后 B 读回全零、metadata 全新鲜）、**reset**（A 同 id 存活：length 0 / pages 释放 / slot 就地清零 / `reset_count`+1；B 逐字节不变；可重复；unknown id fail loud）、**destroy+复用**（C 以新 SessionId 复用 A 的 LIFO 物理 slot/pages 并读回全零——无残留；B 完好）、`fits` 精确边界矩阵（纯查询无分配）、unknown-id 全操作 fail loud 且池 accounting 不变 | `9b69c37` |
+| `tests/cuda/test_qwen35_session_runtime.cpp` | 真实 Qwen3.5-0.8B-Base checkpoint 会话运行时硬门（self-skip 77 当 checkpoint 缺失）："request" = 通过冻结 `forward_token_with_state` 对 session bound sequence 的 token 块驱动（未来 session-aware scheduler 每次 advance 的调用形状）。全部 **BIT-IDENTICAL**（memcmp）vs 独立一次性连续 reference run：create+binding；**request 边界持久化**（A 的 request 1 完成后释放任何：3 KV pages 保留 / Delta slot live 且脏 / position 6；request 2 同 session append-only 续写自 position 6；8 步 FULL logits[248320] + 最终 hybrid state（18×conv/rec + 6×逻辑 K/V 行经 block table）== 一次性 reference）；**真实使用下隔离**（B 的 4-token request == fresh 独立 B run）；**reset parity（真实模型）**（设备级 Delta slot 全零、同 SessionId、重放逐位一致）；**destroy+复用（真实模型）**（SessionId 失效 / 已 retire sequence 的 forward 被拒 / accounting 回到恰好 B 的资源 / C 新 id 复用 A 物理资源且 == fresh reference / B 完好） | `9b69c37` |
+| `tests/CMakeLists.txt` | 注册上述 2 个新门（`test_session_manager` 随 cpu 组；`test_qwen35_session_runtime` 与 `test_qwen35_state_parity` 同款真实 checkpoint 参数 + `SKIP_RETURN_CODE 77` + `TIMEOUT 1800`） | `9b69c37` |
+
+### 验收证据（RTX 2080 Ti / CUDA 11.8）
+
+- **基线**（`main` @ `cf28abd`，变更之前）：`ctest` **63/63，0 failed，
+  0 skipped**（843.67s）。
+- **最终**（functional+tests @ `9b69c375621f518d0fd7542e44ce9b72b85c4b54`，
+  clean tree）：`cmake --build build -j8` clean（`-Wall -Wextra
+  -Werror`）；`ctest --output-on-failure` **65/65，0 failed，0 skipped**
+  （784.65s = 基线 63 门全回归 + 新增 2 门真实运行）；
+  `bash scripts/check_no_torch.sh` **CLEAN**（forbidden_deps_check OK）。
+- **compute-sanitizer**（新增 device allocation/reset/reuse 路径）：
+  `--tool memcheck` 对 `test_session_manager` **PASS + 0 errors**、对
+  `test_qwen35_session_runtime` **PASS + 0 errors**。
+- **本阶段能力与限制（明说）**：Session abstraction + persistent-state
+  lifecycle（request 完成不释放 state；只有 reset/destroy 明确
+  reset/release）、A/B 隔离、reset/destroy/复用无残留、context overflow
+  = 明确 reject（无 eviction）。**明确限制**：无完整 multi-turn
+  generation（Phase B）、scheduler 未接入 session（Phase C，v0.6
+  request-scoped 模式冻结并存）、无 eviction/TTL/LRU、单 stream、无
+  HTTP/OpenAI API/chat template。本阶段**不** merge 进 main —— 待
+  external reviewer 签核。

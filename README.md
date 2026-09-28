@@ -358,6 +358,43 @@ c5d20efe3424a82ac0c6e4b01849645c74a1aa40`（其后 commits 均为 docs/evidence-
 
 **sign-off**：v0.7 正式 **DONE / FROZEN**，`v0.7-profile-opt` 已 merge 进 main。
 
-### 下一阶段（未开始）
+## v0.8：Multi-turn / Session Runtime
 
-**v0.8 — multi-turn / session runtime**（不在本任务实现）。
+**状态：Phase A 完成**（分支 `v0.8-session-runtime`，从
+`cf28abd`（v0.7 merge）创建；**不**在 main 开发，**不** merge —— 等待
+external reviewer）。
+
+v0.8 把"一次性 Request 生命周期"升级为 **persistent Session + multiple
+Requests/turns**：**SessionId 与 RequestId 分离**；一个 Session 跨 turn
+持有模型推理状态（Qwen3.5 hybrid：paged KV + DeltaNet conv/recurrent +
+logical position + slot/page 所有权 + lifecycle metadata）；一个 Request
+是绑定到 Session 的**临时操作** —— request 完成后 KV pages / Delta
+conv / Delta recurrent / position **全部保留**（只有 `reset_session` /
+`destroy_session` 才执行明确的 reset/release）。
+
+### Phase A（本交付）：Session abstraction + persistent-state lifecycle
+
+- **新控制面**：`SessionId` / `SessionState` / `Session` /
+  `SessionManager`（`include/cudalm/session.h` + `src/runtime/session.cpp`）
+  —— 冻结 v0.5 `Qwen35StateManager` 之上的**薄非拥有绑定层**（一个
+  session == 一个 bound sequence）；池的 zero-on-release / zero-on-reset /
+  精确 byte accounting 语义**全部继承**，**未改动任何模型数学语义**；
+- **所有权迁移**：state lifetime 从 request 迁到 session —— request 完成
+  = **无 state 操作**（v0.6 request-scoped 模式冻结并存；scheduler 接入
+  属 Phase C）；
+- **overflow policy**：`fits()` context 容量纯查询；
+  `context_length + new_tokens > max_context` → **明确 reject**（无
+  eviction、不静默丢最早 token/page）；
+- **硬门**：`test_session_manager`（CPU，真实设备池：create/destroy、
+  事务式 OOM、A/B 隔离、reset 不影响他者、destroy + slot/page 复用无
+  残留、fits 精确边界、unknown-id fail loud）+
+  `test_qwen35_session_runtime`（真实 Qwen3.5-0.8B-Base checkpoint：
+  request 边界持久化 == 一次性连续 reference **bit-identical**、真实使用
+  下隔离、reset parity、destroy + 复用，全 memcmp）。
+
+### 后续阶段（未开始）
+
+Phase B incremental multi-turn execution（append-only 数值等价门）→
+Phase C scheduler 接入 + 多 session interleaving → Phase D text/chat 级
+multi-turn demo + 最终 sign-off。详见
+[`docs/v08_session_runtime.md`](docs/v08_session_runtime.md)。
