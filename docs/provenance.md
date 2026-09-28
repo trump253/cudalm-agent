@@ -1585,8 +1585,8 @@ v0.4/v0.6 语义：采样时判 stop、末 token 不 forward、`N + m - 1`、终
 | CUDALM 文件 | 内容 | commit |
 |---|---|---|
 | `include/cudalm/request.h` | additive：`RequestOwnership {SequenceOwned, SessionBound}`、`Request::ownership` / `session_id` / `committed_generated`（带默认值，冻结的 v0.6 六参构造不变；`committed_generated` 仅 SessionBound 有意义，legacy 恒 0） | `dc96ef8` |
-| `include/cudalm/scheduler.h`、`src/runtime/scheduler.cpp` | additive：ctor `SessionManager* sessions = nullptr`（null = 纯 legacy 模式）+ `admit_session_turn` + `session_busy`；`admit_session_turn` preflight（zero mutation，顺序见上）+ 注册时**不 `create_sequence`**（绑定 session 已有 bound sequence）；`advance_one` / `advance_batch_run` 的 commit-then-stop 分支（SessionBound；legacy 路径 byte-identical）+ `sample_pending` helper；`finish()` 按 ownership 分支（SessionBound 不 retire）；`is_decode_ready` pending-token 泛化；`run()` bound 公式（session turn = input + max_new） | `dc96ef8` |
-| `tests/cpu/test_qwen35_scheduler_session.cpp` | Phase C 控制面契约门（CPU：deterministic fake forwarder——成功 forward 时推进真实序列元数据（页覆盖 + length+1）、失败时零推进——+ 真实池 + 真实 SessionManager + 真实 Scheduler）：准入失败零 mutation 全路径（unknown session / 空输入 / `max_new<0` / 非法 eos・token / 非法 sampling / overflow 62+2+1>64 reject **与** 61+2+1==64 精确边界接受 / busy session / 无 session manager 的 scheduler）；**准入不创建 sequence**；**terminal != retired**（Finished 后 session + sequence 仍 live）；**commit contract**（2 输入 + 2 generated 的 turn `forward_count == 4`、session length == 4；EOS turn 的 EOS token **被 commit**：forward_count 4、length 4、reason Eos）；cancel（session live、committed 保留、pending 不在历史）；forward 失败（session live、length == committed only、下一 turn 从 committed 边界继续）；**下一 turn 不 replay**（fake per-sequence step 计数证明 turn 2 从 step 4 继续）；`max_new_tokens == 0` input-only turn（不采样）；legacy 不变（N+m-1、终态 retire） | `685a644` |
+| `include/cudalm/scheduler.h`、`src/runtime/scheduler.cpp` | additive：ctor `SessionManager* sessions = nullptr`（null = 纯 legacy 模式）+ `admit_session_turn` + `session_busy`；`admit_session_turn` preflight（zero mutation，顺序见上）+ 注册时**不 `create_sequence`**（绑定 session 已有 bound sequence）；`advance_one` / `advance_batch_run` 的 commit-then-stop 分支（SessionBound；legacy 路径 byte-identical）+ `sample_pending` helper；`finish()` 按 ownership 分支（SessionBound 不 retire）；`is_decode_ready` pending-token 泛化；`run()` bound 公式（session turn = input + max_new）；**external review 修复**：preflight 新增 **INSTANCE IDENTITY gate**（`&sessions_->manager() == &mgr_`——session manager 必须绑定本 scheduler 的 state manager，不同则 fail loud、zero mutation；config / stream / SequenceId 相等**不是**替代检查：两个 manager 的 SequenceId 数值相同时，缺此 gate 会静默驱动错误 manager 池中的 sequence） | `dc96ef8` + `b20b1c0` |
+| `tests/cpu/test_qwen35_scheduler_session.cpp` | Phase C 控制面契约门（CPU：deterministic fake forwarder——成功 forward 时推进真实序列元数据（页覆盖 + length+1）、失败时零推进——+ 真实池 + 真实 SessionManager + 真实 Scheduler）：准入失败零 mutation 全路径（unknown session / 空输入 / `max_new<0` / 非法 eos・token / 非法 sampling / overflow 62+2+1>64 reject **与** 61+2+1==64 精确边界接受 / busy session / 无 session manager 的 scheduler）；**准入不创建 sequence**；**terminal != retired**（Finished 后 session + sequence 仍 live）；**commit contract**（2 输入 + 2 generated 的 turn `forward_count == 4`、session length == 4；EOS turn 的 EOS token **被 commit**：forward_count 4、length 4、reason Eos）；cancel（session live、committed 保留、pending 不在历史）；forward 失败（session live、length == committed only、下一 turn 从 committed 边界继续）；**下一 turn 不 replay**（fake per-sequence step 计数证明 turn 2 从 step 4 继续）；`max_new_tokens == 0` input-only turn（不采样）；legacy 不变（N+m-1、终态 retire）；**instance identity gate 契约用例**（`mgrA` / `mgrB` 各建 session，首个 bound sequence 数值 SequenceId 相同（1）；scheduler 用 `mgrA`、传入绑定 `mgrB` 的 SessionManager → `admit_session_turn` reject；RequestId / request count 不变；**两个 manager** 的 length / KV used_pages / Delta used_slots 全部零变化） | `685a644` + `4f42d0b` |
 | `tests/cuda/test_qwen35_scheduler_session_integration.cpp` | 真实 Qwen3.5-0.8B-Base checkpoint hard gate（self-skip 77；除注明外全部 **BIT-IDENTICAL**，memcmp atol 0）。核心门：session A（greedy）与 B（seeded sampling，turn 间换 seed）各两 turn（A t1: 3 输入 + 3 生成；B t1: 2 输入 + 3 生成；A t2: 2 输入 + 2 生成；B t2: 2 输入 + 2 生成）经 scheduler 交错执行 vs 独立连续参考（每 session 单独 fresh sequence、直接 `forward_token_with_state` 连续驱动、同 per-turn sampler 配置、无 turn 边界）——**A 全部 10 次 / B 全部 9 次 committed forward 的 FULL logits[248320] 按序逐位一致（含 batched decode 行：RecordingForwarder 扩展记录 `forward_batch` + `logits_batch_to_host` 每行）+ 每 turn generated token ID + turn 边界 length（A 6 / B 5）与最终 length（A 10 / B 9）+ turn 边界与最终的完整 hybrid state（18×Delta conv+rec、6×FA 逻辑 K/V 行经 block table）全部逐位一致**（证明：commit contract 经 scheduler 成立、**turn 2 不 replay turn 1**（t2 的 per-step logits 匹配参考后续 step——replay 会重置 position、RoPE 依赖 logits 必然错位）、**A/B interleaving 无污染**（各自匹配自己的 solo 参考，尽管共享 batched traversal）、**batched == 独立参考**（行 parity））。其余门：**batch 证据**（`batch_forward_calls == 4`、`max_batch_size == 2`、`decode_cohort_trace == [1,2,2,1,2,2]`、`single == 11`、`batched_tokens == 8`）；turn 终态后 session 保留（requests terminal、sessions + bound sequences live、state 完好）；真实模型准入零 mutation（busy session mid-t1；context overflow `max_seq_len-2 + 2 + 1` reject、精确边界 `max_seq_len-3 + 2 + 1` 接受）；干净拆除（destroy A/B + retire 参考 → 所有池 accounting 归零） | `685a644` |
 | `tests/CMakeLists.txt` | 注册上述 2 个新门（`test_qwen35_scheduler_session` 随 cpu 组；`test_qwen35_scheduler_session_integration` 与 Phase A/B 真实门同款 checkpoint 参数 + `SKIP_RETURN_CODE 77` + `TIMEOUT 1800`） | `685a644` |
 
@@ -1604,10 +1604,21 @@ v0.4/v0.6 语义：采样时判 stop、末 token 不 forward、`N + m - 1`、终
   `cmake --build build -j8` clean（`-Wall -Wextra -Werror`）；
   `ctest --output-on-failure` **69/69，0 failed，0 skipped**（基线 67
   门全回归 + 新增 2 门真实运行）。
+- **review 修复后 HEAD**：functional @ `b20b1c0` + tests @ `4f42d0b`
+  （gate 只收窄一个此前静默的错误配置面；legacy 路径与全部既有断言
+  未动，已通过门的预期不变）。
 - **compute-sanitizer**：`--tool memcheck --leak-check full` 对新真实
   硬门 `test_qwen35_scheduler_session_integration` **PASS + 0 errors
   + 0 bytes leaked**（本阶段唯一 sanitizer 运行）。
 - **no-torch**：`bash scripts/check_no_torch.sh` **CLEAN**。
+- **external review 修复**（correctness blocker：`admit_session_turn`
+  未验证 `sessions_` 绑定的 manager 就是 `mgr_`——跨 manager 的
+  SequenceId 数值相同时会静默操作错误 sequence）：preflight 新增
+  INSTANCE IDENTITY gate（`&sessions_->manager() == &mgr_`，fail
+  loud、zero mutation；`b20b1c0`）+ 契约用例（`4f42d0b`）。修复后
+  targeted 回归 `ctest -R "scheduler|session" --output-on-failure`
+  **10/10**（reviewer 指定范围；改动仅 preflight + CPU test，按评审
+  意见不重跑 full / sanitizer / 真实 gate）。
 - **本阶段能力与限制（明说）**：scheduler + Session 集成
   （session-bound 准入、每 session 至多一个 live turn、commit-then-
   stop、cancel/failure 保留 committed、多 session batched decode

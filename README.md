@@ -436,8 +436,10 @@ conv / Delta recurrent / position **全部保留**（只有 `reset_session` /
   （unknown session / **busy session（每 session 至多一个 live
   request）** / 非法 token・eos・sampling / `max_new < 0` / context
   overflow（`length + input + max_new > max_seq_len`，精确边界接受，
-  无 eviction））= **zero mutation**；`max_new_tokens == 0` =
-  input-only turn；
+  无 eviction）/ **instance identity（SessionManager 必须绑定本
+  scheduler 的 state manager，跨 manager 的 SequenceId 数值巧合不
+  会静默驱动错误 sequence）**）= **zero mutation**；
+  `max_new_tokens == 0` = input-only turn；
 - **commit 语义（hard gate，sampled != committed）**：session turn 的
   generated token **先 forward 成功（commit）才可能触发终态** ——
   EOS / max_new 的 stop 判定在 commit **之后**（legacy 的"采样时判定、

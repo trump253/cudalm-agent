@@ -542,13 +542,18 @@ preflight 顺序（任何一步失败 = 不发 RequestId、无半 request、sess
 state 零变化、无新 sequence）：
 
 1. `out_request_id` 非空；2. scheduler 持有 session manager；
-3. sampling config 合法；4. vocab > 0；5. 输入非空；
-6. `max_new_tokens >= 0`（允许 0，区别于 legacy 的 >= 1）；
-7. `eos ∈ {-1} ∪ [0, vocab)`；8. 所有 token ∈ `[0, vocab)`；
-9. **session live**（`lookup` 命中）；
-10. **session 不 busy**（同 session 至多一个 live request——第二个
+3. **INSTANCE IDENTITY**：`&sessions_->manager() == &mgr_`——
+   session manager 必须绑定**本 scheduler 的** state manager
+   （external review 修复：config / stream / SequenceId 相等**不**
+   是替代检查——两个 manager 的 SequenceId 数值相同时，缺此 gate
+   会静默驱动错误 manager 池中的 sequence）；
+4. sampling config 合法；5. vocab > 0；6. 输入非空；
+7. `max_new_tokens >= 0`（允许 0，区别于 legacy 的 >= 1）；
+8. `eos ∈ {-1} ∪ [0, vocab)`；9. 所有 token ∈ `[0, vocab)`；
+10. **session live**（`lookup` 命中）；
+11. **session 不 busy**（同 session 至多一个 live request——第二个
     live turn 直接 reject，fail loud；terminal 即释放）；
-11. **context overflow**：`L + N + M > max_seq_len` reject（`L` =
+12. **context overflow**：`L + N + M > max_seq_len` reject（`L` =
     bound sequence 当前 live length；`==` 边界接受；无 eviction /
     截断，继承 Phase A/B 策略）。
 
@@ -621,7 +626,9 @@ fake 成功 forward 时推进真实序列元数据，失败时零推进）：
 - 准入失败零 mutation：unknown SessionId / 空输入 / `max_new<0` /
   非法 eos / 非法 token / 非法 sampling / context overflow（62+2+1>64
   reject，**61+2+1==64 边界接受**）/ busy session / 无 session
-  manager 的 scheduler；
+  manager 的 scheduler / **instance identity（SessionManager 绑定
+  另一个 manager：两边 SequenceId 数值相同也 reject，两个 manager
+  的 length / KV pages / Delta slots 全部零变化）**；
 - **准入不创建 sequence**（live sequence 数不变）；
 - **terminal != retired**：Finished 后 session + sequence 仍 live；
 - **commit contract**：2 输入 + 2 generated 的 turn `forward_count ==
