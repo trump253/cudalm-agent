@@ -106,11 +106,12 @@ void batch_deltanet_delta_vchunk(const __nv_bfloat16* q,
                                  cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// EXPERIMENTAL / measured dispatcher (benchmark/test/profiling
-// infrastructure — NOT a production entry point). Selects the variant per
-// (n_heads[, B]) from the measured table in the .cu; any unrecognized legal
-// shape falls back to the frozen baseline path. NOT used by the production
-// runtime.
+// Measured dispatcher. Selects the variant per (n_heads[, B]) from the
+// measured table in the .cu; any unrecognized legal shape falls back to
+// the frozen baseline path (bit-compatible). From V07C_CANDIDATE_SHA the
+// production runtime uses these entry points for the DeltaNet delta-rule
+// update (B=1 and batch); the KEEP/REJECT outcome is recorded in docs/
+// v07_deltanet_optimization.md.
 // ---------------------------------------------------------------------------
 void deltanet_delta_rule_fp32_qwen35_experimental(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,

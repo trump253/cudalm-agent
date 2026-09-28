@@ -11,6 +11,7 @@
 #include "cudalm/cuda_check.h"
 #include "cudalm/kernels/int4_gemv_bf16.h"
 #include "cudalm/kernels/batch_decode.h"
+#include "cudalm/kernels/deltanet_delta_qwen35.h"
 #include "cudalm/kernels/qwen35_deltanet_kernels.h"
 #include "cudalm/kernels/qwen35_kernels.h"
 
@@ -205,8 +206,10 @@ void Qwen35DeltaNetLayer::forward_impl(int position,
       beta_.data<__nv_bfloat16>(), g_.data<float>(),
       static_cast<int>(n_heads), stream);
 
-  // 6) gated delta-rule recurrent update (in-place recurrent_state, fp32)
-  kernels::qwen35_deltanet_delta_rule_fp32(
+  // 6) gated delta-rule recurrent update (in-place recurrent_state, fp32).
+  //    Measured dispatcher (V07C_CANDIDATE_SHA): static per-shape table,
+  //    frozen fallback for any unrecognized shape (bit-compatible).
+  kernels::deltanet_delta_rule_fp32_qwen35_experimental(
       q_.data<__nv_bfloat16>(), k_.data<__nv_bfloat16>(),
       v_.data<__nv_bfloat16>(), g_.data<float>(),
       beta_.data<__nv_bfloat16>(), rec_state,
@@ -365,7 +368,9 @@ void Qwen35DeltaNetLayer::forward_batch_with_state(
       b_beta_.data<__nv_bfloat16>(), b_g_.data<float>(), n_heads, B, stream);
 
   // 6) gated delta-rule recurrent decode update (per-row slot, in place).
-  kernels::batch_deltanet_delta_rule_fp32(
+  //    Measured dispatcher (V07C_CANDIDATE_SHA): static per-shape table,
+  //    frozen fallback for any unrecognized shape (bit-compatible).
+  kernels::batch_deltanet_delta_rule_fp32_qwen35_experimental(
       b_q_.data<__nv_bfloat16>(), b_k_.data<__nv_bfloat16>(),
       b_v_.data<__nv_bfloat16>(), b_g_.data<float>(),
       b_beta_.data<__nv_bfloat16>(), rec_base, d_slots,

@@ -609,27 +609,38 @@ inline bool state_16b_aligned(const float* p) {
 // profiling/v07c_candidate_batched_nsys_*). Anything not in the table
 // takes the FROZEN baseline path — the bit-compatible fallback.
 //
-// AT THIS SHA (V07C_KERNEL_EXPERIMENT_SHA): the table is the IDENTITY
-// table — every shape takes the frozen baseline. The production runtime
-// still calls the frozen entry points directly. The measured table is
-// applied at V07C_CANDIDATE_SHA (candidate), and the KEEP/REJECT decision
-// is recorded in docs/v07_deltanet_optimization.md.
+// MEASURED ADAPTIVE TABLE (V07C_CANDIDATE_SHA; measured at the exact-SHA
+// microbench/NCU evidence, docs/v07_deltanet_optimization.md):
+//
+//   B=1:  n_heads=16 -> vchunk   (1.87~1.88x; 2-kernel value-chunk split,
+//                                    s pass 50 regs, no S reload)
+//   B=2:  n_heads=16 -> vvec     (1.32~1.33x; float4 x4 values/thread)
+//   B=3:  n_heads=16 -> vvec     (1.31~1.33x; vreg measured 0.73x, vchunk
+//                                    0.66x at B=3 -> frozen would lose)
+//   else  -> frozen baseline (no measured data)
+//
+// Weighted production score (18 calls/traversal, canonical B mix 19:1:2):
+// mixed table ~ -42% delta-kernel time per traversal vs frozen (dev runs).
+// The KEEP/REJECT decision is recorded in docs/v07_deltanet_optimization.md
+// after the exact-SHA E2E acceptance check.
 // ---------------------------------------------------------------------------
 
 namespace {
 
 // Variant ids: 0 = frozen baseline, 1 = vreg, 2 = vvec, 3 = vchunk.
 int pick_delta_variant_b1(int n_heads, int head_dim) {
-  (void)n_heads;
   (void)head_dim;
-  return 0;  // identity table: frozen baseline
+  if (n_heads == 16) return 3;  // vchunk: 1.87~1.88x (B=1 microbench)
+  return 0;  // frozen baseline (no measured data)
 }
 
 int pick_delta_variant_batch(int n_heads, int head_dim, int B) {
-  (void)n_heads;
   (void)head_dim;
-  (void)B;
-  return 0;  // identity table: frozen baseline
+  if (n_heads == 16) {
+    if (B == 2 || B == 3) return 2;  // vvec: 1.31~1.33x (B=2/3 microbench)
+    return 0;  // B>=4: no measured data -> frozen
+  }
+  return 0;  // frozen baseline (no measured data)
 }
 
 }  // namespace
