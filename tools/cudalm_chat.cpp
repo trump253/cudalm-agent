@@ -25,6 +25,7 @@
 
 #include <cudalm/qwen35_model.h>
 #include "cudalm/qwen35_state_manager.h"
+#include "cudalm/chat_cli.h"
 #include "cudalm/qwen35_tokenizer.h"
 #include "cudalm/sampling.h"
 #include "cudalm/scheduler.h"
@@ -87,8 +88,14 @@ const char* kUsage =
     "fully committed into the session's KV / Delta state before it is\n"
     "shown.\n"
     "\n"
-    "REPL commands (whole line): reset — reset the session (same\n"
-    "SessionId, state back to zero); quit / exit — destroy and leave.\n";
+    "REPL commands are EXACT whole-line matches (input is NEVER trimmed):\n"
+    "  reset — reset the session (same SessionId, state back to zero);\n"
+    "  quit / exit — destroy and leave.\n"
+    "A line like ' reset ' (with surrounding spaces) is RAW TEXT, not a\n"
+    "command. The empty line is ignored; a whitespace-only non-empty line\n"
+    "is a raw-text turn. Generated text is written binary-safe (embedded\n"
+    "NULs preserved); a trailing display newline is UX only (never enters\n"
+    "the session history).\n";
 
 bool parse_double(const char* s, double* out);
 bool parse_double(const char* s, double* out) {
@@ -163,14 +170,6 @@ bool parse_args(int argc, char** argv, ChatOptions* o, std::string* err) {
     }
   }
   return true;
-}
-
-std::string trim(const std::string& s) {
-  const char* ws = " \t\r\n";
-  const std::size_t b = s.find_first_not_of(ws);
-  if (b == std::string::npos) return "";
-  const std::size_t e = s.find_last_not_of(ws);
-  return s.substr(b, e - b + 1);
 }
 
 }  // namespace
@@ -256,7 +255,9 @@ int main(int argc, char** argv) {
   std::printf("  RAW TEXT contract: your input is appended VERBATIM — no\n"
               "  chat template, no special tokens, no separator. This is a\n"
               "  base-model text-completion session, not a chat API.\n"
-              "  Commands: reset | quit\n");
+    "  Commands are EXACT whole-line matches: reset | quit | exit\n"
+    "  (e.g. ' reset ' is RAW TEXT, not a command). The empty line is\n"
+    "  ignored; a whitespace-only line is a raw-text turn.\n");
 
   std::string line;
   int turns = 0;
@@ -264,11 +265,14 @@ int main(int argc, char** argv) {
     std::printf("user> ");
     std::fflush(stdout);
     if (!std::getline(std::cin, line)) break;  // EOF
-    const std::string text = line;  // VERBATIM (the pinned contract)
-    const std::string cmd = trim(text);
-    if (cmd.empty()) continue;
-    if (cmd == "quit" || cmd == "exit") break;
-    if (cmd == "reset") {
+    // VERBATIM (the pinned contract): the line is NEVER trimmed. Command
+    // recognition is EXACT whole-line matching (see chat_cli.h): " reset "
+    // is raw text, only the truly empty line is ignored, and a
+    // whitespace-only non-empty line is a raw-text turn.
+    const ChatLineKind kind = classify_chat_line(line);
+    if (kind == ChatLineKind::Ignored) continue;  // empty line only
+    if (kind == ChatLineKind::Quit) break;
+    if (kind == ChatLineKind::Reset) {
       s = gen.reset_session(sid);
       std::printf(s.ok ? "session reset (state zero, same session id)\n"
                        : "reset failed: %s\n",
@@ -277,12 +281,18 @@ int main(int argc, char** argv) {
     }
     ++turns;
     SessionTextTurnResult r =
-        gen.generate_turn(sid, text, opts.max_new_tokens, sampling);
+        gen.generate_turn(sid, line, opts.max_new_tokens, sampling);
     if (r.ok) {
-      std::printf("model> %s", r.generated_text.c_str());
+      // BINARY-SAFE output: the generated text may contain embedded NUL
+      // bytes, so it is written with a length-aware write (never %s).
+      std::fwrite("model> ", 1, 7, stdout);
+      write_binary_safe(r.generated_text.data(), r.generated_text.size(),
+                        stdout);
       if (r.generated_text.empty() ||
           r.generated_text.back() != '\n') {
-        std::printf("\n");
+        std::fwrite("\n", 1, 1, stdout);  // display-only newline (UX); it
+                                          // never enters the session /
+                                          // token history
       }
       std::printf("  [turn %d: +%d input, +%d generated, stop %s, "
                   "context %d]\n",
