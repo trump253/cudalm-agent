@@ -750,6 +750,74 @@ int test_turn_query_resolution() {
   return 0;
 }
 
+// ---- G. the turn-body Content-Type contract (v1.0 release
+// hygiene) -----------------------------------------------------------
+
+int test_content_type_contract() {
+  cudaStream_t stream0 = nullptr;
+  CUDA_CHECK(cudaStreamCreate(&stream0));
+  Runtime rt(stream0, ServingLimits{-1, -1, 0});
+  const http::HttpResponse cr = rt.api.handle(req("POST", "/v1/sessions"));
+  CHECK_EQ(cr.status, 201);
+  long sid = 0;
+  CHECK(json_int(cr.body, "session_id", &sid));
+
+  // A request builder that sets the Content-Type (the plain req()
+  // helper sends none):
+  auto req_ct = [](const std::string& method, const std::string& path,
+                   const std::string& body, const std::string& ct) {
+    http::HttpRequest r = req(method, path, body);
+    if (!ct.empty()) r.headers["content-type"] = ct;
+    return r;
+  };
+  auto turn_ct = [&](const std::string& ct) {
+    return rt.api.handle(req_ct(
+        "POST", "/v1/sessions/" + std::to_string(sid) +
+                    "/turn?max_new_tokens=2", "hi", ct));
+  };
+  auto turn_ct_stream = [&](const std::string& ct) {
+    std::string out;
+    bool ok = rt.api.handle_stream(
+        req_ct("POST",
+               "/v1/sessions/" + std::to_string(sid) + "/turn/stream" +
+                   "?max_new_tokens=2",
+               "hi", ct),
+        [&](const std::string& c) {
+          out += c;
+          return true;
+        });
+    return ok;
+  };
+
+  // ---- the ACCEPTED media types (the body is raw text either
+  //      way) -----------------------------------------------------------
+  CHECK_EQ(turn_ct("text/plain").status, 200);
+  CHECK_EQ(turn_ct("text/plain; charset=utf-8").status, 200);
+  CHECK_EQ(turn_ct("TEXT/PLAIN; CHARSET=UTF-8").status, 200);  // case-insensitive
+  CHECK_EQ(turn_ct("").status, 200);  // MISSING = text/plain (pinned)
+  CHECK_EQ(turn_ct("application/x-www-form-urlencoded").status,
+           200);  // the curl --data default (compatibility)
+  CHECK_EQ(turn_ct("application/octet-stream").status, 200);
+
+  // ---- the REJECTED media types (415 BEFORE any admission) ------------
+  CHECK_EQ(turn_ct("application/json").status, 415);
+  CHECK_EQ(turn_ct("application/json; charset=utf-8").status, 415);
+  CHECK_EQ(turn_ct("multipart/form-data; boundary=x").status, 415);
+  CHECK_EQ(turn_ct("text/html").status, 415);
+  // the streaming endpoint enforces the SAME contract:
+  CHECK_EQ(turn_ct_stream("text/plain"), true);
+  CHECK_EQ(turn_ct_stream("application/json"), true);  // the 415 was WRITTEN
+  // nothing was admitted by the 415 rejections:
+  const http::HttpResponse stt = rt.api.handle(req("GET", "/v1/stats"));
+  long admitted = -1;
+  CHECK(json_int(stt.body, "total_admitted_requests", &admitted));
+  CHECK_EQ(admitted, 7L);  // the 6 accepted sync turns + the 1 accepted
+                           // stream turn; the 415s admitted nothing
+
+  TEST_PASS("test_serving_http_content_type_contract");
+  return 0;
+}
+
 int main() {
   int rc = 0;
   rc |= test_create_turn_parity();
@@ -758,6 +826,7 @@ int main() {
   rc |= test_deadline();
   rc |= test_disconnect_cleanup();
   rc |= test_turn_query_resolution();
+  rc |= test_content_type_contract();
   if (rc != 0) {
     std::fprintf(stderr, "test_serving_http: FAILED\n");
     return rc;
