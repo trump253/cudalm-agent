@@ -675,8 +675,9 @@ zeroed、logical context gone。**不是** context truncation——v0.8
 - **TTL**（`idle_ttl`：`nullopt` = disabled，`0` = 一旦 idle 立即
   eligible，`> 0` = 正常 timeout；Phase B monotonic clock，无 wall
   clock、**无 background thread / timer**）：activity = successful
-  create / reset / admit / cancel / deadline terminal + 每个驱动该
-  session 非 terminal request 的 step（`poll` / drain 不刷新）；
+  create / reset / admit / cancel / **deadline terminal（TTL 从
+  deadline terminal 重新锚定）** + 每个驱动该 session 非 terminal
+  request 的 step（`poll` / drain 不刷新）；
   sweep 只在显式 maintenance point（`evict_expired_sessions()` +
   TTL 启用时 `create_session()` 前的 lightweight sweep）；
 - **LRU**：只在 eligible idle session 中选——oldest last activity
@@ -685,10 +686,13 @@ zeroed、logical context gone。**不是** context truncation——v0.8
   undrained**（Phase B 生命周期：stream 事件未消费完的 session）
   永不自动 evict；unmanaged session（不经 controller 创建）永不
   auto-evict；
-- **pressure admission**（仅启用 LRU pressure 后）：`max_sessions`
-  reached 时先 evict ONE eligible idle LRU session 再建；无
-  candidate → Phase A reject（no SessionId consumed、no partial
-  mutation）；`max_sessions == 0` 永远不能被 eviction 绕过；
+- **pressure admission**（仅启用 LRU pressure 后）：**严格**
+  `live_sessions == max_sessions` 时先 evict ONE eligible idle LRU
+  session 再建；无 candidate → Phase A reject（no SessionId
+  consumed、no partial mutation）；**已超限**（`live_sessions >
+  max_sessions`，如 unmanaged 占容量）→ 不 eviction、直接 Phase A
+  reject（over-limit fail-safe）；`max_sessions == 0` 永远不能被
+  eviction 绕过；
 - **transactional**：只有 frozen destroy 成功后才更新 metadata +
   stats（`evicted_sessions_ttl` / `evicted_sessions_lru` /
   `eviction_no_candidate`——只计 automatic，手工 destroy 不计）。

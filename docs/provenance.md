@@ -2137,6 +2137,60 @@ overflow contract REJECT 原样保持）。
   compute-sanitizer / profiling（v0.9 最终 Phase D 再跑 full
   suite）。
 
+### Phase C review fix（deadline activity 锚定 + over-limit
+fail-safe）
+
+**External review blockers**：
+
+1. `check_deadlines_` 的 deadline cancel 绕过 activity refresh
+   （显式 `cancel()` 有、这条路径没有）——deadline-cancelled
+   request 的 session last_activity 仍停留在旧 admission / drive
+   时间，TTL 可能过早回收；
+2. LRU pressure 触发条件是 `num_sessions() >= max_sessions`——已
+   超过 limit 时会先 destructively evict 一个 session，但仍可能
+   无法创建新 session。
+
+**修复**（仅 ServingController Phase C policy）：
+
+- Blocker 1：`check_deadlines_` 内 deadline 成功 cancel 后
+  `refresh_activity_(request.session_id)` + `deadline_cancelled_`
+  标记——TTL 从 deadline terminal 重新锚定。最小实现（不经 public
+  `cancel()`——无递归、无 Phase B 语义变化）；deadline check 仍在
+  scheduler step 前、no additional forward / commit、session
+  remains live；
+- Blocker 2：触发条件改**严格** `live_sessions == max_sessions`；
+  `live_sessions > max_sessions` → 不 eviction、直接 Phase A
+  session-limit reject（no SessionId consumed、no session
+  destroyed、no pool mutation；本 phase 不做 multi-eviction
+  recovery）。header 注释同步 pinned。
+
+**Commit**：
+
+- Functional: `11de742cb601a7214a3743b472d2742d798c9eea`
+- Tests: `d448e7758a0c1cdbb602a2400f3290f61f6b6cae`
+  - Case H：deadline t=500 的 request 长时间不 drive → t=1000
+    第一次 `step_stream()` deadline-cancel（zero forwards、no
+    commit、只有 RequestTerminal(Cancelled, deadline_exceeded)）
+    → t=1900（距 terminal idle 900ms < TTL 1000ms）sweep 不
+    evict → t=2000（`idle_age == TTL`）sweep evict——证明 TTL
+    从 deadline terminal 重新锚定；
+  - Case I（over-limit fail-safe gate）：max_sessions=2 + LRU
+    enabled；A = managed eligible idle，U1/U2 = 直接 unmanaged
+    （live 3 > 2）；`create_session()` → reject，A **不**被
+    evict、U1/U2 untouched、无新 SessionId / sequence、无
+    KV/Delta mutation、`evicted_sessions_lru` 不变、
+    `rejected_session_limit == 1`。
+
+**验收**（本地验证，非 CI）：
+
+- `test_serving_eviction` → **PASS**（12 个 [ok]）；
+- 回归：`test_serving_admission` / `test_serving_streaming` /
+  `test_serving_integration` / `test_serving_stream_integration`
+  → 全部 **PASS**；
+- targeted `ctest -R "evict|serving|stream|scheduler|session"
+  --output-on-failure` → **18/18 PASS**（Total 22.10 s）；
+- 零 frozen code 改动 → 免 full ctest / sanitizer / profiling。
+
 **Phase C 明确不做**（non-goals）：HTTP server、OpenAI-compatible
 API、text-byte streaming、async threads、background timer thread、
 distributed session store、session persistence to disk、KV swap-

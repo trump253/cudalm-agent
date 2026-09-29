@@ -394,6 +394,14 @@ clock）
 TTL 锚定在近期执行，而非 admit 时间）。`poll()` / event drain **不**
 刷新——消费输出不是新的推理活动。
 
+**deadline terminal 的锚定（review fix）**：`check_deadlines_`
+的 deadline cancel **也**刷新该 session 的 activity——TTL 从
+deadline terminal 重新锚定，而不是停留在旧的 admission / drive
+时间（与显式 `cancel()` 同一 contract；最小实现在
+`check_deadlines_` 内，不经 public `cancel()`，deadline check 仍
+在 scheduler step 前、无 additional forward / commit、session
+保持 live）。
+
 **unmanaged session**（直接经 SessionManager 创建、不经
 controller）：不猜 activity、**不**自动 eviction——仍占
 `live_sessions` / `max_sessions`；找不到 eligible managed session
@@ -430,10 +438,15 @@ protected（busy）。
 
 - **默认 policy**：`max_sessions` reached → reject（完全不变）；
 - **启用 LRU pressure 后**：`create_session()` 且
-  `live_sessions == max_sessions` → 先尝试 evict ONE eligible LRU
-  idle session；成功 → 建新 session；无 eligible candidate → 保持
-  Phase A reject（**no SessionId consumed、no partial
-  mutation**、`eviction_no_candidate++`）；
+  `live_sessions == max_sessions`（**严格等于**）→ 先尝试 evict
+  ONE eligible LRU idle session；成功 → 建新 session；无 eligible
+  candidate → 保持 Phase A reject（**no SessionId consumed、no
+  partial mutation**、`eviction_no_candidate++`）；
+- **over-limit fail-safe（review fix）**：`live_sessions >
+  max_sessions`（例如 unmanaged session 占掉了容量）→ **不**
+  eviction、直接走 Phase A session-limit reject（no SessionId
+  consumed、no session destroyed、no pool mutation；本 phase 不做
+  multi-eviction recovery）；
 - `max_sessions == 0` **永远**不能靠 eviction 绕过 zero-capacity
   contract。
 
@@ -466,6 +479,14 @@ fail loud、metadata 保留、不假装成功。SessionId never reused。
   consumed、no pool mutation、A/B untouched——pressure safety
   gate）；F. 默认 policy = 严格 Phase A（不自动 eviction）；
   G. unmanaged session 永不 auto-evict（仍占 limit）；
+  H. **review fix**：deadline terminal 刷新 activity（TTL 从
+  deadline terminal 重新锚定——deadline 后第一次 `step_stream`
+  cancel + drain，TTL 前 sweep 不 evict、`idle_age == TTL` 才
+  evict）；
+  I. **review fix（over-limit fail-safe）**：`live_sessions >
+  max_sessions`（unmanaged 占容量）→ create reject 且**不**
+  eviction（no id consumed、no pool mutation、eligible managed
+  session 存活）；
 - **`test_serving_eviction_integration`**（真实 Qwen3.5-0.8B-Base
   checkpoint，小型 gate——不做深度 KV/Delta memcmp）：B（2+2）
   先跑、A（3+2）后跑（A 更 recent）→ fake-clock TTL sweep 只 evict
