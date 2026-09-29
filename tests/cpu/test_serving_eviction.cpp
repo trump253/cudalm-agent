@@ -41,7 +41,15 @@
 //     controller is ALREADY OVER the limit (unmanaged sessions took
 //     the capacity) the create REJECTS without evicting anything
 //     (no SessionId consumed, no pool mutation, the eligible
-//     managed session survives).
+//     managed session survives);
+//   * J. REVIEW FIX (fail loud): a real destroy failure is
+//     PROPAGATED as a Status error — never downgraded to a no-
+//     candidate / silent skip: the TTL sweep + the LRU call +
+//     create_session all surface the original error; the failed
+//     session's metadata / session record / counters stay exactly as
+//     they were (the transactional invariant); and the error is
+//     distinguished from ok + no-candidate (eviction_no_candidate
+//     must NOT move on a destroy failure).
 //
 // Provenance: CUDALM-native (v0.9 Phase C).
 
@@ -263,7 +271,8 @@ int main() {
     clk.advance_ms(1000);
     CHECK(ctrl.reset_session(A).ok);
     clk.advance_ms(50);
-    const std::vector<SessionId> evicted = ctrl.evict_expired_sessions();
+    std::vector<SessionId> evicted;
+    CHECK(ctrl.evict_expired_sessions(&evicted).ok);
     CHECK(static_cast<int>(evicted.size()) == 1 && evicted[0] == B);
     // B is INVALIDATED FOREVER; A survives:
     CHECK(sm.lookup(B) == nullptr);
@@ -319,8 +328,8 @@ int main() {
     CHECK(ctrl.admit_turn(B, {21, 22}, 2, -1, kGreedy, &rb).ok);
     CHECK(sched.session_busy(B));
     clk.advance_ms(5000);  // WAY past the TTL
-    const std::vector<SessionId> evicted =
-        ctrl.evict_expired_sessions();
+    std::vector<SessionId> evicted;
+    CHECK(ctrl.evict_expired_sessions(&evicted).ok);
     CHECK(evicted.empty());
     CHECK(sm.lookup(B) != nullptr);  // PROTECTED (busy)
     CHECK_EQ(ctrl.stats().evicted_sessions_ttl, static_cast<std::uint64_t>(0));
@@ -355,8 +364,8 @@ int main() {
     CHECK(!sched.session_busy(B));  // scheduler: not busy...
     CHECK(!ctrl.is_eviction_eligible(B));  // ...but PROTECTED (undrained)
     clk.advance_ms(5000);  // WAY past the TTL
-    const std::vector<SessionId> evicted =
-        ctrl.evict_expired_sessions();
+    std::vector<SessionId> evicted;
+    CHECK(ctrl.evict_expired_sessions(&evicted).ok);
     CHECK(evicted.empty());  // NOT evicted: the stream is not drained
     CHECK(sm.lookup(B) != nullptr);
     // Drain the stream (poll = fully drained -> reaped):
@@ -364,8 +373,8 @@ int main() {
     CHECK(ctrl.poll(rb, &ev).ok);
     CHECK_EQ(static_cast<int>(ev.size()), 2);  // the committed token + the terminal
     // Now idle + expired + drained: evictable:
-    const std::vector<SessionId> evicted2 =
-        ctrl.evict_expired_sessions();
+    std::vector<SessionId> evicted2;
+    CHECK(ctrl.evict_expired_sessions(&evicted2).ok);
     CHECK(static_cast<int>(evicted2.size()) == 1 && evicted2[0] == B);
     CHECK(sm.lookup(B) == nullptr);
     CHECK_EQ(ctrl.stats().evicted_sessions_ttl, static_cast<std::uint64_t>(1));
@@ -489,8 +498,8 @@ int main() {
     CHECK_EQ(ctrl.stats().evicted_sessions_lru, static_cast<std::uint64_t>(0));
     CHECK_EQ(sm.num_sessions(), 2);
     // The explicit sweep is a no-op without an enabled TTL:
-    const std::vector<SessionId> evicted =
-        ctrl.evict_expired_sessions();
+    std::vector<SessionId> evicted;
+    CHECK(ctrl.evict_expired_sessions(&evicted).ok);
     CHECK(evicted.empty());
     std::printf("  [ok] default policy: EXACTLY Phase A (no eviction "
                 "without an explicit policy)\n");
@@ -569,13 +578,14 @@ int main() {
     // admission (t = 0): at t = 1900 (idle 900ms < 1000) the sweep
     // must NOT evict...
     clk.advance_ms(900);
-    const std::vector<SessionId> kept = ctrl.evict_expired_sessions();
+    std::vector<SessionId> kept;
+    CHECK(ctrl.evict_expired_sessions(&kept).ok);
     CHECK(kept.empty());
     CHECK(sm.lookup(S) != nullptr);
     // ...and at idle_age == TTL (t = 2000) the sweep evicts:
     clk.advance_ms(100);
-    const std::vector<SessionId> evicted =
-        ctrl.evict_expired_sessions();
+    std::vector<SessionId> evicted;
+    CHECK(ctrl.evict_expired_sessions(&evicted).ok);
     CHECK(static_cast<int>(evicted.size()) == 1 && evicted[0] == S);
     CHECK(sm.lookup(S) == nullptr);
     CHECK_EQ(ctrl.stats().evicted_sessions_ttl, static_cast<std::uint64_t>(1));
@@ -631,6 +641,83 @@ int main() {
     CHECK_EQ(ctrl.stats().rejected_session_limit, static_cast<std::uint64_t>(1));
     std::printf("  [ok] over-limit fail-safe: rejected WITHOUT evicting "
                 "(no id consumed, no pool mutation, A/U1/U2 untouched)\n");
+  }
+
+  // =========================================================================
+  // J. REVIEW FIX (fail loud): a real destroy failure is propagated as
+  //    a Status error — never downgraded to no-candidate / silent skip
+  // =========================================================================
+  {
+    Qwen35StateManager mgr(cfg, 4, 8, 4, stream);
+    SessionManager sm(mgr);
+    FakeForwarder fwd;
+    FakeClock clk;
+    Scheduler sched(fwd, mgr, stream, &sm);
+    const SessionEvictionPolicy pol =
+        SessionEvictionPolicy{}.with_idle_ttl(std::chrono::milliseconds(1000))
+            .with_lru_on_session_pressure();
+    ServingController ctrl(sched, sm, ServingLimits{2, -1, 0}, &clk, pol);
+    SessionId B = 0;
+    CHECK(ctrl.create_session(&B).ok);
+    // A CONTROLLED destroy failure via the small test seam (a real
+    // retire_sequence failure cannot be triggered non-invasively —
+    // the frozen manager is not modified):
+    ctrl.destroy_for_test = [](SessionId /*id*/) {
+      return Status::error("injected destroy failure");
+    };
+
+    // (1) The TTL sweep: FAILS LOUD with the original Status; the
+    //     failed session is left EXACTLY as it was (the transactional
+    //     invariant — metadata kept, no counter moves):
+    clk.advance_ms(5000);  // expired
+    std::vector<SessionId> evicted;
+    Status s1 = ctrl.evict_expired_sessions(&evicted);
+    CHECK(!s1.ok);
+    CHECK(s1.message.find("injected destroy failure") != std::string::npos);
+    CHECK(evicted.empty());
+    CHECK(sm.lookup(B) != nullptr);           // the session is untouched
+    CHECK(ctrl.is_eviction_eligible(B));      // the metadata is kept
+    CHECK_EQ(ctrl.stats().evicted_sessions_ttl, static_cast<std::uint64_t>(0));
+    CHECK_EQ(ctrl.stats().evicted_sessions_lru, static_cast<std::uint64_t>(0));
+    std::printf("  [ok] TTL sweep: destroy failure FAILS LOUD (original "
+                "Status; metadata / session / counters untouched)\n");
+
+    // (2) The LRU call: the ERROR is NOT reported as a no-candidate:
+    bool evicted_lru = true;
+    Status s2 = ctrl.evict_one_lru_idle(&evicted_lru);
+    CHECK(!s2.ok);
+    CHECK(s2.message.find("injected destroy failure") != std::string::npos);
+    CHECK(!evicted_lru);
+    CHECK_EQ(ctrl.stats().eviction_no_candidate,
+             static_cast<std::uint64_t>(0));  // NOT counted as no-
+                                              // candidate!
+    CHECK(sm.lookup(B) != nullptr);
+    std::printf("  [ok] LRU: destroy ERROR != no-candidate "
+                "(eviction_no_candidate must NOT move)\n");
+
+    // (3) create_session: the maintenance sweep's error aborts the
+    //     create BEFORE the admission (fail loud, not a limit
+    //     rejection):
+    SessionId C = 0;
+    Status s3 = ctrl.create_session(&C);
+    CHECK(!s3.ok);
+    CHECK(s3.message.find("injected destroy failure") != std::string::npos);
+    CHECK_EQ(ctrl.stats().rejected_session_limit,
+             static_cast<std::uint64_t>(0));
+    CHECK_EQ(C, static_cast<SessionId>(0));  // no SessionId consumed
+    std::printf("  [ok] create_session: a maintenance destroy error "
+                "aborts the create (no admission attempted)\n");
+
+    // (4) Recovery: with the failure cleared, the same sweep evicts
+    //     normally (the session survived the failed attempt):
+    ctrl.destroy_for_test = {};
+    std::vector<SessionId> evicted2;
+    CHECK(ctrl.evict_expired_sessions(&evicted2).ok);
+    CHECK(static_cast<int>(evicted2.size()) == 1 && evicted2[0] == B);
+    CHECK(sm.lookup(B) == nullptr);
+    CHECK_EQ(ctrl.stats().evicted_sessions_ttl, static_cast<std::uint64_t>(1));
+    std::printf("  [ok] recovery: after the failure clears, the sweep "
+                "evicts normally\n");
   }
 
   CUDA_CHECK(cudaStreamDestroy(stream));

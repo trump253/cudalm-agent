@@ -180,7 +180,8 @@ int main(int argc, char** argv) {
   // ---- the TTL sweep at t = 1050: B idle 1050ms >= 1000 (EXPIRED);
   //      A idle 50ms (SURVIVES) ----
   clk.advance_ms(50);
-  const std::vector<SessionId> evicted = ctrl.evict_expired_sessions();
+  std::vector<SessionId> evicted;
+  CHECK(ctrl.evict_expired_sessions(&evicted).ok);
   CHECK(static_cast<int>(evicted.size()) == 1 && evicted[0] == b);
   CHECK(sm.lookup(b) == nullptr);  // B INVALIDATED FOREVER
   CHECK(sm.lookup(a) != nullptr);  // A survives
