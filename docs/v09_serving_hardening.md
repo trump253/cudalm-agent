@@ -638,8 +638,52 @@ limit、pool OOM）→ 409（带 controller 消息）；forward 失败 →
 **参数合同**：`max_new_tokens`（默认 8）、`temperature`、
 `top_k`、`top_p`、`seed`、`deadline_ms`（`0` = **disabled**，与
 controller 语义一致；`> 0` = `steady_clock::now() + ms`）。
-greedy = 默认（`SamplingConfig::greedy()`）；**unknown / 非法
-query param → 400 fail loud**（不静默忽略）。
+**unknown / 非法 query param → 400 fail loud**（不静默忽略，且
+发生在 admission / forward **之前**）。
+
+**Sampling mode resolution（pinned：镜像 frozen v0.4
+`cudalm-generate` 合同**——`include/cudalm/generate_cli.h` 的
+`resolved_sampling` + `src/cli/generate_cli.cpp` 的解析规则；
+**不创造第二套 numeric semantics**）**：
+
+```text
+没有 temperature / top_k / top_p          → greedy
+只给 seed                                  → greedy（seed 不启用
+                                              sampling，被忽略——
+                                              greedy 不消费 RNG）
+出现 temperature / top_k / top_p 任意一个  → sampling mode
+sampling mode 中未显式给 temperature       → temperature = 1.0
+显式 temperature=0 或 -0                   → frozen greedy path
+                                              （runtime
+                                              temperature<=0）
+```
+
+即 `?top_k=40` → `temperature=1.0, top_k=40`（sampling）；
+`?top_p=0.9&seed=42` → `temperature=1.0, top_p=0.9, seed=42`；
+`?seed=42` → greedy（seed 被忽略）。
+
+**temperature 文本 range（pinned，镜像 v0.4 `parse_temperature`）**：
+文本必须 round 成**可表示的 float**；拒绝（400）：
+
+```text
+1e40 / 1e308 / inf   （double->float overflow → inf / 非有限）
+nan                  （非有限）
+1e-50 / 7e-46        （非零 double → float underflow 到 0 →
+                       静默 greedy，拒绝）
+1e-5000 / -1e-5000   （strtod 级 underflow，errno==ERANGE 到 ±0，
+                       拒绝）
+```
+
+合法：`0` / `-0`（文档化的 greedy 写法）、denormal floats（低到
+`denorm_min`，如 `1.4e-45` / `1e-45`）、`1.17549435e-38`
+（FLT_MIN）、`3.4e38`（~FLT_MAX）。`top_p` 用 full-consumption
+float parse（`(0,1]` range 由 **frozen** `validate_sampling_config`
+gate 强制——与 CLI 同一道 gate）；`top_k` / `seed` 用
+full-consumption digit parse（`top_k <= INT_MAX`、`seed` 完整
+`uint64`——v0.4 `parse_uint` 规则）。resolution 可观察性：
+`ServingHttpApi::resolve_turn_query`（public 小 helper，纯
+query→config，CPU contract gate 直接断言 resolved
+`SamplingConfig`）。
 
 ## 16. Phase D：Streaming 合同（NDJSON，commit-before-visible
 端到端）
@@ -700,7 +744,7 @@ parser 的显式 Status，**从不** parse controller 错误字符串**
 | gate | 类型 | 验证 |
 |---|---|---|
 | `test_http_protocol` | CPU 表驱动 | parser（16 例：GET/POST ± body、NUL-safe、413/400/415）+ `json_escape`（NUL/引号/反斜杠/控制字节）+ `format_response`（Content-Length + Connection: close + binary-safe）+ `parse_query` |
-| `test_serving_http` | CPU contract（**无 socket**） | fake forwarder + **真** pools/SessionManager/Scheduler/ServingController + handler 直驱：create/turn/parity（**HTTP committed ids == controller committed ids**）/append-only 第二轮/stats/404+405/reset/destroy/stream（token 事件严格先于 terminal；streamed == terminal == scheduler committed）/deadline（fake clock → 408 + Cancelled + session 存活）/disconnect（write 失败 → live_requests 归 0、session LIVE、下一 turn 成功） |
+| `test_serving_http` | CPU contract（**无 socket**） | fake forwarder + **真** pools/SessionManager/Scheduler/ServingController + handler 直驱：create/turn/parity（**HTTP committed ids == controller committed ids**）/append-only 第二轮/stats/404+405/reset/destroy/stream（token 事件严格先于 terminal；streamed == terminal == scheduler committed）/deadline（fake clock → 408 + Cancelled + session 存活）/disconnect（write 失败 → live_requests 归 0、session LIVE、下一 turn 成功）/**turn-query resolution**（resolved `SamplingConfig` contract：top_k/top_p only → sampling + implicit temperature=1.0；seed only → greedy；temperature=0/-0 → frozen greedy path；temperature 文本 range 全拒/全收边界；非法 query → 400 且 **nothing admitted**） |
 | `test_serving_lifecycle_soak` | CPU in-process soak | 240 iterations create/admit/drive/reset/destroy/TTL/LRU/reuse；per-iteration 不变量（无 stuck busy、三处 live 计数一致、SessionId 唯一、RequestId 单调）；teardown 后 **pools 归零**（used slots = 0、state bytes = 0） |
 | `test_serving_http_e2e` | **真实 checkpoint**（Python stdlib） | 真实 `cudalm-server` + socket：health → create A → sync turn（ctx = N_in + 8，input token 数**实测**——真 tokenizer 按 token 不按 byte）→ stream turn（streamed == terminal ids）→ stats → reset → post-reset turn → create B / turn B / destroy B / 404 → destroy A → 终态 live == 0 → health 仍 200 |
 | `test_serving_http_disconnect` | **真实 checkpoint**（Python stdlib socket） | create session → 原始 socket 发起 `turn/stream?max_new_tokens=256` → 读到 ≥1 token 事件 → **硬断 socket**（无 graceful drain）→ server 存活、`live_requests == 0`、原 session **仍 LIVE**、下一 turn 成功 continuation |

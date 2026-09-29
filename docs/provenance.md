@@ -2348,3 +2348,96 @@ stream / CUDA Graph / kernel 优化 / perf tuning / chat template /
 incremental text delta 等 scope creep。
 
 **本阶段不 merge 进 main**——待 external review 签核。
+
+---
+
+## v0.9 Phase D review fix：HTTP turn sampling 镜像 frozen v0.4
+cudalm-generate 合同（external review blocker）
+
+**Pinned SHA**（本地验证，非 CI）：
+
+- `V09D_FINAL_FUNCTIONAL_SHA`
+  `acee0b0157ac93e4da114a2f120547e2b1e4db6a`
+  （handler：v0.4-mirror sampling mode resolution +
+  parse_temperature / parse_float_full / parse_uint_full 镜像 +
+  `parse_turn_query` 提取为 public `resolve_turn_query`）
+- `V09D_FINAL_TESTED_SHA`
+  `8ec43897b131f51ef1bf79c3e62ac3d6ec7ab8fd`
+  （`test_serving_http` 新增 `test_turn_query_resolution`——
+  resolved `SamplingConfig` contract gate）
+- `V09_FINAL_HEAD` = 本节所在的 docs commit（自引用——SHA 不能
+  写进自己）；即 `origin/v0.9-serving-hardening` 的 tip，完整
+  SHA 记录在 final report。
+
+**Blocker**（external review）：HTTP turn query 从
+`SamplingConfig::greedy()` 起直接覆盖字段——`?top_k=40` /
+`?top_p=0.9` 仍 temperature=0 → **silently greedy**，sampling
+参数被静默忽略；且 temperature parser 缺 v0.4 的 float-range
+保护（`1e40` → float inf 被接受、`1e-50`/`1e-5000` → underflow
+到 0 → 静默 greedy、`inf`/`nan` 未拒）。
+
+**修复**（只动 HTTP query resolution + 小测试；**零**
+Scheduler / ServingController / sampling math / CUDA / model /
+transport / streaming-disconnect 生命周期改动）：
+
+- **Mode resolution 镜像 frozen v0.4**
+  （`GenerateCliOptions::resolved_sampling`）：temperature /
+  top_k / top_p **任一出现** → sampling mode；未显式给
+  temperature → **1.0**（不是 0）；显式 `temperature=0`/`-0` →
+  frozen greedy path（runtime `temperature<=0`）；**只给 seed →
+  greedy**（seed 不启用 sampling、被忽略——greedy 不消费
+  RNG）；
+- **temperature 文本 range 镜像 v0.4 `parse_temperature`**：
+  文本必须 round 成可表示 float；拒 `1e40`/`1e308`/`inf`
+  （overflow → inf）、`nan`（非有限）、`1e-50`/`7e-46`
+  （double→float underflow 到 0）、`1e-5000`/`-1e-5000`
+  （strtod 级 underflow，errno==ERANGE 到 ±0）；合法 `0`/`-0`
+  （greedy 写法）+ denormal floats（低到 `denorm_min`）+
+  `1.17549435e-38`（FLT_MIN）+ `3.4e38`（~FLT_MAX）；
+- **top_p** 用 v0.4 `parse_float`（full-consumption；`(0,1]`
+  range 由 **frozen** `validate_sampling_config` gate 强制——
+  与 CLI 同一道 gate）；**top_k / seed** 用 v0.4 `parse_uint`
+  规则（digits-only、full-consumption；top_k <= INT_MAX、seed
+  完整 uint64——旧的 1e9 long cap 与 `+` 容忍一并移除）；
+- **不创造第二套 numeric semantics**（镜像而非复制语义）；
+- resolution 可观察性：`ServingHttpApi::resolve_turn_query`
+  （public 小 helper，纯 query→config；CPU gate 直接断言
+  resolved `SamplingConfig`，**不**依赖随机碰巧生成不同
+  token）；
+- 非法 query → **400，发生在 admission / forward 之前**
+  （gate 断言 400 后 `total_admitted_requests` 仍为 0）。
+
+**测试**：`test_serving_http` 新增 `test_turn_query_resolution`
+（top_k only / top_p only → sampling + implicit temperature=1.0；
+top_k+top_p+seed 全字段；seed only → greedy；temperature=0/-0 →
+frozen greedy path；temperature=0+top_k → sampling by presence +
+greedy path；temperature 文本 range 全拒/全收边界；deadline 部分
+不变；端到端 400-before-admission）。全部 6 个
+`test_serving_http` [PASS]。
+
+**最终 tested evidence 重建**（`V09D_FINAL_TESTED_SHA` 树上，
+本地验证，非 CI）：
+
+- targeted `ctest -R
+  "http|server|evict|serving|stream|scheduler|session"
+  --output-on-failure` → **24/24 PASS**（Total 31.16 s）；
+- **full `ctest --output-on-failure`** → **84/84 PASS**（Total
+  824.22 s）；
+- `bash scripts/check_no_torch.sh` → **CLEAN**；
+- `compute-sanitizer --tool memcheck --leak-check full` on
+  `test_serving_stream_integration`（真实 checkpoint）→ **0
+  errors / 0 bytes leaked in 0 allocations**；
+- 真实 HTTP 重跑：`test_serving_http_e2e` **PASS**（turns=4，
+  streamed=8 ids，final live==0）/ `test_serving_http_disconnect`
+  **PASS**（server 存活、live_requests==0、session 存活、
+  continuation ctx=10）/ `test_serving_http_soak` **PASS**
+  （iterations=50, turns=17, failures=0, final live==0）；
+- 真实 server 边界 spot-check：`?temperature=1e40` → 400（错误
+  信息引用 v0.4 合同）、`?temperature=1e-50` → 400、
+  `?top_k=40` → 200（sampling mode）、`?temperature=0.9&seed=7`
+  → 200。
+
+**边界**：v0.9 最终 Phase——本 review fix 后 v0.9 停止；**不**
+merge 进 main、**不**打 tag、等待 external review 签核。
+
+**本阶段不 merge 进 main**——待 external review 签核。

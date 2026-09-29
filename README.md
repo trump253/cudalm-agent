@@ -744,7 +744,7 @@ FetchContent/Boost/Asio/httplib/libcurl/3rd-party JSON。
   chat-template / special-token 注入**）→ `admit_turn` → drive →
   收集 committed ids → decode；同步 JSON 响应（request_id、
   session_id、generated_token_ids、JSON-escaped generated_text、
-  finish_reason、context_length）；
+  finish_reason、context_length）。**Sampling 参数镜像 frozen v0.4 `cudalm-generate` 合同**：temperature/top_k/top_p 任一出现 → sampling mode（未给 temperature 默认 **1.0**，不是 0——`?top_k=40` 是 sampling，不是静默 greedy）；显式 `temperature=0`/`-0` → frozen greedy path；只给 seed → greedy（seed 被忽略）；temperature 文本 overflow 到 inf / underflow 到 0（如 `1e40`、`1e-50`、`1e-5000`）→ **400**（发生在 admission 之前）。
 - **Stream 合同**：`POST /v1/sessions/<id>/turn/stream` →
   `Content-Type: application/x-ndjson`、`Connection: close`（无
   Content-Length，close-delimited）；`step_stream()` 驱动，先 N 个
