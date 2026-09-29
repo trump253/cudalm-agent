@@ -119,7 +119,24 @@ Status ServingController::cancel(RequestId request_id) {
   // streaming bookkeeping (emitted cursor) survives so its committed-
   // but-not-yet-emitted tokens can still be drained (poll / the next
   // step_stream); the pending token is never emitted.
-  return sched_.cancel(request_id);
+  Status s = sched_.cancel(request_id);
+  if (!s.ok) return s;
+  // REVIEW FIX (unified streaming lifecycle): an explicit cancel that
+  // leaves a TRACKED request terminal enters the same terminal-pending
+  // lifecycle as a step-terminated one — its committed-but-undrained
+  // tokens + the Cancelled terminal event must stay drainable (e.g.
+  // run_stream() must not lose them just because live_requests is 0).
+  // A fully-drained request was already reaped (not in tracked_), so
+  // it can never re-enter — no duplicate terminal event. The already-
+  // terminal idempotent no-op keeps the frozen scheduler's semantics.
+  if (std::find(tracked_.begin(), tracked_.end(), request_id) !=
+      tracked_.end()) {
+    const Request* r = sched_.get(request_id);
+    if (r != nullptr && is_terminal(r->status)) {
+      terminal_pending_.insert(request_id);
+    }
+  }
+  return s;
 }
 
 Status ServingController::step_drive_(std::vector<ServingEvent>* out) {
@@ -192,10 +209,13 @@ Status ServingController::run() {
     if (live_request_count() == 0 && terminal_pending_.empty()) break;
     CUDALM_PRECONDITION(i <= bound + tracked_.size() + 1,
                         "serving: run did not converge (logic bug)");
-    // (a) Drain the PENDING terminal events (the events are discarded
-    //     here — the caller of run() is not streaming; they can still
-    //     be polled afterwards). A fully-drained id erases itself from
-    //     terminal_pending_ — iterate a SNAPSHOT:
+    // (a) Drain the PENDING terminal events — the non-streaming
+    //     run() DISCARDS them (drain_ advances the cursor and reaps
+    //     the fully-drained request: the events are consumed here and
+    //     are NOT retrievable afterwards — poll them via a streaming
+    //     drive / poll BEFORE run() if you need them). A fully-
+    //     drained id erases itself from terminal_pending_ — iterate a
+    //     SNAPSHOT:
     const std::set<RequestId> pending_snapshot = terminal_pending_;
     for (RequestId id : pending_snapshot) {
       const Request* r = sched_.get(id);

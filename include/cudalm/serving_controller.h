@@ -195,9 +195,11 @@ class ServingController {
   // The request capacity is released IMMEDIATELY (the live count is
   // derived); the session STAYS live at its last committed boundary.
   // Note (v0.9 Phase B): cancel does NOT reap the request's streaming
-  // bookkeeping — its COMMITTED-but-not-yet-emitted tokens can still be
-  // drained (poll / the next step_stream); the PENDING token (sampled,
-  // not committed) is never emitted.
+  // bookkeeping — its COMMITTED-but-not-yet-emitted tokens + the
+  // Cancelled terminal event can still be drained (poll / the next
+  // step_stream / run_stream — the cancel enters the same terminal-
+  // pending lifecycle as a step-terminated request); the PENDING token
+  // (sampled, not committed) is never emitted.
   Status cancel(RequestId request_id);
 
   // ---- driving (the frozen scheduler control plane) ---------------------
@@ -208,7 +210,10 @@ class ServingController {
   Status step();
   // Drive to quiescence (every tracked request terminal) via steps —
   // the same per-iteration behavior as Scheduler::run, with the
-  // deadline check before each step.
+  // deadline check before each step. NON-STREAMING: any pending
+  // terminal events encountered along the way are DISCARDED (drained
+  // and reaped — not retrievable afterwards; use the *_stream / poll
+  // API for events).
   Status run();
 
   // ---- committed-token streaming (v0.9 Phase B) -------------------------
