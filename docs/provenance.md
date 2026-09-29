@@ -2057,7 +2057,91 @@ cursor 并 reap）——仅文档/注释修正，不重构。
 
 **Phase B 明确不做**（non-goals，属后续 Phase）：text-byte
 streaming / incremental UTF-8 decoder、HTTP / OpenAI API、threads /
-async runtime、multi-stream、TTL / LRU、eviction、chat template、
-CUDA Graph、kernel 优化。
+async runtime、multi-stream、chat template、CUDA Graph、kernel
+优化。（TTL / LRU / eviction 已由 **Phase C** 完成。）
+
+### Phase C（Session TTL / LRU Eviction）
+
+**目标**：长期运行 serving runtime 的 idle tracking + TTL eviction
++ deterministic LRU eviction + session-pressure recovery + eviction
+observability。**核心原则：eviction == destroy whole Session**——
+policy 完全在 `ServingController`（零 frozen Scheduler /
+SessionManager / CUDA / model 改动），复用 frozen
+`SessionManager::destroy_session`（SessionId 永久失效 / never
+reused；bound Sequence retired；KV pages + Delta slot released +
+zeroed；logical context gone）——**不是** context truncation（v0.8
+overflow contract REJECT 原样保持）。
+
+**Contract**：
+
+- **默认 policy disabled**（`SessionEvictionPolicy{}`：TTL off +
+  LRU pressure off）——Phase A/B 行为完全不变（`max_sessions`
+  reached 仍 reject）；
+- **activity**（Phase B monotonic clock，无 wall clock）：successful
+  create / reset / admit / cancel / deadline terminal + 每个驱动该
+  session 非 terminal request 的 step；`poll` / drain **不**刷新；
+  unmanaged session（不经 controller 创建）不猜、不 auto-evict；
+- **TTL**：`idle_ttl` `nullopt` = disabled（明确 sentinel）、`0` =
+  一旦 idle 立即 eligible、`> 0` = 正常 timeout；sweep 只在显式
+  maintenance point（`evict_expired_sessions()` + TTL 启用时
+  `create_session()` 前 lightweight sweep）——**无 background
+  thread / timer**；
+- **LRU**：eligible idle 中 oldest last activity first，tie →
+  smaller SessionId first（pinned deterministic）；
+- **保护**：busy（Waiting / Running）与 terminal-but-undrained
+  （Phase B 生命周期：stream 事件未消费完）永不自动 evict；
+- **pressure admission**（仅启用后）：`max_sessions`（> 0）reached
+  时先 evict ONE eligible 再建；无 candidate → Phase A reject
+  （no SessionId consumed、no partial mutation）；`max_sessions ==
+  0` 永不被绕过；
+- **transactional**：只有 frozen destroy 成功后才更新 metadata +
+  stats（`evicted_sessions_ttl` / `evicted_sessions_lru` /
+  `eviction_no_candidate`——只计 automatic）。
+
+**Commit**：
+
+- Functional: `5b1233e720dff6e30914673ca6a7c36d066cc485`
+- Tests: `82cf5a4b04933bb066403af6ecd598f5e21bc967`
+  - `test_serving_eviction`（CPU contract gate，fake forwarder +
+    fake monotonic clock + 真实 pools / SessionManager /
+    Scheduler）：A. TTL（更老 B 过期 evict、recent activity 的 A
+    存活、B id 永久失效、KV/Delta/sequence accounting 释放、复用
+    Delta slot 验证 **zeroed**——evict 前 pattern、无 stale
+    contamination）；B. busy 保护（过期 + live request → 不
+    evict / 不 cancel / 不改状态）；C. **terminal-but-undrained
+    保护**（terminal 未 drain → sweep 不得 evict；drain 完 + TTL
+    后才可——Phase C hard contract）；D. LRU pressure（evict 最老
+    eligible、新 session 新 monotonic id、num_sessions 保持
+    limit）；E. 无 candidate（busy + terminal-undrained → reject、
+    no id consumed、no pool mutation、untouched）；F. 默认 =
+    严格 Phase A；G. unmanaged 永不 auto-evict；
+  - `test_serving_eviction_integration`（真实 Qwen3.5-0.8B-Base
+    checkpoint 小型 gate，self-skip 77）：B（2+2）后 A（3+2）
+    （A 更 recent）→ TTL sweep 只 evict B（B 无法继续、accounting
+    释放）→ A 无污染 continuation（streamed == final generated、
+    length 精确）→ C fresh（新 monotonic id）→ clean teardown
+    （pool accounting 归零）。
+
+**验收**（本地验证，非 CI）：
+
+- `test_serving_eviction` → **PASS**（7 个 [ok] 组）；
+- `test_serving_eviction_integration`（真实 checkpoint）→
+  **PASS**；
+- 回归（Phase C 构建下重跑）：`test_serving_admission` /
+  `test_serving_streaming` / `test_serving_integration` /
+  `test_serving_stream_integration` → 全部 **PASS**；
+- targeted `ctest -R "evict|serving|stream|scheduler|session"
+  --output-on-failure` → **18/18 PASS**（Total 21.79 s）；
+- 未修改 Scheduler / SessionManager internals / CUDA kernels /
+  model forward-state 路径（零 frozen code 改动）→ 免 full ctest /
+  compute-sanitizer / profiling（v0.9 最终 Phase D 再跑 full
+  suite）。
+
+**Phase C 明确不做**（non-goals）：HTTP server、OpenAI-compatible
+API、text-byte streaming、async threads、background timer thread、
+distributed session store、session persistence to disk、KV swap-
+to-CPU、partial context eviction、sliding-window truncation、
+multi-stream、CUDA Graph、kernel 优化、chat template。尤其禁止：
+context overflow → evict oldest tokens。
 
 **本阶段不 merge 进 main**——待 external review 签核。

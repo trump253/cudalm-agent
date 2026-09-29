@@ -336,6 +336,149 @@ exact SHA）。
 
 streaming 目前是 **token-level**——**text-byte streaming /
 incremental UTF-8 decoder**、HTTP server、OpenAI API、threads / async
-runtime、multi-stream、TTL / LRU、eviction、chat template、CUDA
-Graph、kernel 优化、动态 quota 系统——全部属于 v0.9 后续 Phase 或
-之后版本。
+runtime、multi-stream、chat template、CUDA Graph、kernel 优化、
+动态 quota 系统——全部属于 v0.9 后续 Phase 或之后版本。（TTL / LRU /
+eviction 已由 **Phase C** 完成，见 §13。）
+
+## 13. Phase C：Session TTL / LRU Eviction
+
+**核心原则：`eviction == destroy whole Session`**——policy 完全在
+`ServingController`（零 frozen Scheduler / SessionManager / CUDA /
+model 改动），复用 frozen `SessionManager::destroy_session`：
+
+```text
+SessionId invalidated forever（monotonic、never reused）
+bound Sequence retired
+KV pages released + zeroed
+Delta slot released + zeroed
+logical context gone
+```
+
+**绝对不是** context truncation / 只丢 KV / 截短 context——v0.8 的
+context overflow contract（REJECT）原样保持；Session eviction 与
+context truncation 是两回事。
+
+**默认 policy = Phase A/B 行为完全不变**（`SessionEvictionPolicy{}`
+= TTL disabled + LRU pressure disabled）：`max_sessions` reached →
+仍按 Phase A reject，**不**偷偷改冻结的 admission contract。
+
+### 13.1 Policy API（additive）
+
+```cpp
+struct SessionEvictionPolicy {
+  // nullopt = DISABLED（明确的 sentinel，无 0/-1 歧义）；
+  // 0 = 一旦 truly idle 立即 eligible；> 0 = 正常 idle timeout
+  std::optional<std::chrono::steady_clock::duration> idle_ttl;
+  bool lru_on_session_pressure = false;
+  // with_idle_ttl(...) / with_lru_on_session_pressure(bool) builders
+};
+// 构造：ServingController(..., MonotonicClock* clock = nullptr,
+//                              SessionEvictionPolicy policy = {})
+// 显式 maintenance API：
+std::vector<SessionId> evict_expired_sessions();  // TTL sweep
+bool evict_one_lru_idle();                        // 显式 LRU
+bool is_eviction_eligible(SessionId);             // idle + safe
+```
+
+**无 background thread / timer**——TTL sweep 只在明确 maintenance
+point 发生：显式 `evict_expired_sessions()` 调用 +（仅当 TTL 启用
+时）`create_session()` 前的 lightweight sweep。
+
+### 13.2 Activity / idle 定义（Phase B `MonotonicClock`，无 wall
+clock）
+
+每 MANAGED session（经本 controller 创建）记录 last-activity
+时间戳。**Activity 更新点**：successful `create_session` /
+`reset_session` / `admit_turn` / `cancel` / deadline terminal，以及
+**每个驱动该 session 非 terminal request 的 step**（长 request 的
+TTL 锚定在近期执行，而非 admit 时间）。`poll()` / event drain **不**
+刷新——消费输出不是新的推理活动。
+
+**unmanaged session**（直接经 SessionManager 创建、不经
+controller）：不猜 activity、**不**自动 eviction——仍占
+`live_sessions` / `max_sessions`；找不到 eligible managed session
+时 pressure admission 正常 reject。
+
+### 13.3 TTL 语义
+
+`idle_age = now - last_activity`；`idle_age >= TTL` → eligible。
+TTL == 0 = 一旦 truly idle 立即 eligible。sweep 结果确定性
+（ascending SessionId）。
+
+### 13.4 LRU 顺序 + tie-break
+
+只在 eligible idle session 中选：**oldest last activity first**；
+时间完全相同 → **SessionId smaller first**（pinned deterministic，
+便于测试与日志复现）。
+
+### 13.5 保护（eligibility = 全部满足）
+
+```text
+MANAGED（经 controller 创建）
+仍 live
+Scheduler::session_busy == false
+无 terminal-but-undrained streaming bookkeeping
+```
+
+最后一条是 Phase C 的 hard contract：Phase B 已区分
+`request terminal != stream events fully drained`——stream 事件尚未
+消费完的 session **protected**，不会在它的 Token / RequestTerminal
+events 尚未消费时被自动回收。Waiting / Running request 始终
+protected（busy）。
+
+### 13.6 max_sessions pressure 语义
+
+- **默认 policy**：`max_sessions` reached → reject（完全不变）；
+- **启用 LRU pressure 后**：`create_session()` 且
+  `live_sessions == max_sessions` → 先尝试 evict ONE eligible LRU
+  idle session；成功 → 建新 session；无 eligible candidate → 保持
+  Phase A reject（**no SessionId consumed、no partial
+  mutation**、`eviction_no_candidate++`）；
+- `max_sessions == 0` **永远**不能靠 eviction 绕过 zero-capacity
+  contract。
+
+### 13.7 Transactional 语义
+
+只有 frozen `destroy_session` **成功**后才：删除 activity
+metadata + eviction counter++ + 记录 evicted id。destroy 失败 →
+fail loud、metadata 保留、不假装成功。SessionId never reused。
+
+### 13.8 Stats（additive）
+
+`evicted_sessions_ttl` / `evicted_sessions_lru` /
+`eviction_no_candidate`——只计 **automatic** eviction；手工
+`destroy_session()` 不计入。
+
+### 13.9 Phase C 测试
+
+- **`test_serving_eviction`**（CPU contract gate——fake forwarder +
+  fake monotonic clock + 真实 pools / SessionManager / Scheduler）：
+  A. TTL（更老的 B 过期被 evict、最近 activity 的 A 存活、B 的
+  SessionId 永久失效、KV/Delta/sequence accounting 正确释放、复用的
+  Delta slot 验证 **zeroed**——evict 前 slot 被 pattern，无 stale
+  contamination）；B. **busy 保护**（TTL 过期但有 live request →
+  不 evict、不 cancel、不改状态）；C. **terminal-but-undrained
+  保护**（request terminal 但未 drain → sweep 不得 evict；drain
+  完成 + TTL 后**才**可 evict——Phase C hard contract）；D. LRU
+  pressure（max_sessions=2 时 evict 最老的 eligible、新 session
+  拿到新 monotonic id、num_sessions 保持 2）；E. **无 candidate**
+  （A busy + B terminal-undrained → create C reject、no SessionId
+  consumed、no pool mutation、A/B untouched——pressure safety
+  gate）；F. 默认 policy = 严格 Phase A（不自动 eviction）；
+  G. unmanaged session 永不 auto-evict（仍占 limit）；
+- **`test_serving_eviction_integration`**（真实 Qwen3.5-0.8B-Base
+  checkpoint，小型 gate——不做深度 KV/Delta memcmp）：B（2+2）
+  先跑、A（3+2）后跑（A 更 recent）→ fake-clock TTL sweep 只 evict
+  B（B 无法继续——admit error；Delta accounting 释放）→ A 正常
+  continuation（streamed ids == final generated ids、length 精确、
+  无 evicted 邻居污染）→ 新建 C fresh 生成（新 monotonic id）→
+  clean teardown（pool accounting 归零）。
+
+### 13.10 Phase C non-goals
+
+HTTP server、OpenAI-compatible API、text-byte streaming、async
+threads、**background timer thread**（当前 sweep 只在显式
+maintenance point）、distributed session store、session persistence
+to disk、KV swap-to-CPU、partial context eviction、sliding-window
+truncation、multi-stream、CUDA Graph、kernel 优化、chat template。
+**尤其禁止**：context overflow → evict oldest tokens。
