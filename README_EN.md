@@ -367,8 +367,18 @@ docs; the README does not stack per-version test counts):
   bound to an exact SHA of a clean tree + binary sha256 + environment
   record (fail loud on a dirty tree).
 
-The v1.0 full-suite release gate (complete ctest + sanitizer summary)
-is executed and recorded in Phase D.
+v1.0 release validation (Phase D) is two-layered:
+
+- **Hosted CI** (`.github/workflows/ci.yml` → `repository-checks`) →
+  repository / static guards (no-PyTorch guard, shell/Python syntax,
+  documentation relative links, conflict-marker hygiene).
+  **Hosted CI is NOT full GPU validation** — it does not compile
+  CUDA and does not run GPU tests;
+- **Local NVIDIA release validation** (the release NVIDIA
+  environment, exact-SHA bound) → full release build + full ctest
+  (including real-checkpoint GPU/integration and serving gates) + a
+  representative `compute-sanitizer` gate. Recorded in
+  `docs/v10_release_validation.md`.
 
 ## 9. Engineering Decisions
 
@@ -461,3 +471,7 @@ scripts/          guards (check_no_torch), profiling / benchmark workflows
   - a Qwen chat template / OpenAI-compatible adapter;
   - more advanced inference optimization (kernel tuning, larger batch
     shapes, etc.).
+
+---
+
+License: MIT

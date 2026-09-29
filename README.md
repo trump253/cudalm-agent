@@ -315,8 +315,17 @@ residual-add + RMSNorm **KEEP**，−24 kernel launches/traversal，paired E2E
 - **Exact-SHA benchmark provenance**：正式性能证据绑定 clean tree 的 exact
   SHA + binary sha256 + 环境记录（dirty tree fail-loud）。
 
-v1.0 的 full-suite release gate（完整 ctest + sanitizer 汇总）在 Phase D
-统一执行并记录。
+v1.0 release validation（Phase D）分两层：
+
+- **Hosted CI**（`.github/workflows/ci.yml` → `repository-checks`）→
+  repository / static guards（no-PyTorch guard、shell/Python 语法、
+  文档相对链接、conflict-marker hygiene）。**Hosted CI ≠ full GPU
+  validation**——它不编译 CUDA、不跑 GPU 测试；
+- **Local NVIDIA release validation**（本机 NVIDIA 环境，exact-SHA
+  绑定）→ 完整 release build + full ctest（含 real-checkpoint
+  GPU/integration 与 serving gates）+ 代表性
+  `compute-sanitizer` gate。记录见
+  `docs/v10_release_validation.md`。
 
 ## 9. 核心工程设计 / Engineering Decisions
 
@@ -398,3 +407,7 @@ scripts/          guard（check_no_torch）、profiling / benchmark 工作流
   - 真正的并发 HTTP frontend（multi-client / 异步 accept）；
   - Qwen chat template / OpenAI-compatible adapter；
   - 更高级的 inference optimization（kernel 调优、更大 batch 形态等）。
+
+---
+
+License: MIT

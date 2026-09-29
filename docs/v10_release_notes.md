@@ -15,6 +15,45 @@ review 任务为准。
 
 ---
 
+## v1.0 Release Summary
+
+v1.0 是 CUDALM 的 portfolio / release 状态（分支
+`v1.0-portfolio-release`，详见下方各 Phase 记录与
+`docs/v10_release_validation.md`）：
+
+- Native C++17/CUDA Qwen3.5-0.8B runtime（PyTorch-free production
+  runtime；W4A16 projection + BF16 激活）
+- 24 层混合模型：Full Attention（partial RoPE / GQA / zero-centered
+  RMSNorm）+ Gated DeltaNet（conv + delta-rule 递推）
+- 原生 tokenizer（CUDLMTK1）+ greedy / temperature / top-k / top-p
+  采样（v0.4 冻结合同）
+- Paged KV（Full Attention）+ Delta conv/recurrent state（DeltaNet），
+  session-bound 生命周期
+- True batched decode（`forward_batch_with_state`）+ continuous
+  batching（动态到达、逐步组 cohort）
+- 持久化多轮 Session（persistent multi-turn raw-text completion）
+- Committed-token streaming（commit-before-visible）+ cancel /
+  deadline
+- Admission / backpressure（zero-mutation 拒绝）+ TTL / LRU 驱逐
+- 最小原生 HTTP serving（`cudalm-server`，thin JSON/NDJSON 合同）
+- Profile-driven CUDA 优化（v0.7 KEEP/REJECT 证据纪律：fused
+  add+rmsnorm KEEP，W4A16 / DeltaNet 候选 REJECT）
+- 可复现性能证据（Phase B，exact-SHA 绑定：
+  `benchmarks/v10/` + `docs/v10_performance.md`）
+
+Limitations（如实记录，不改变）：仅 Qwen3.5-0.8B-Base；单 GPU；单
+CUDA stream；prefill 串行；HTTP frontend single-threaded（one request
+at a time）；raw-text completion（无官方 Qwen chat template、非
+OpenAI-compatible）；无 TP / multi-GPU / speculative decoding / CUDA
+Graph / distributed serving。
+
+Release 工件：MIT `LICENSE`；lightweight hosted CI
+（`.github/workflows/ci.yml` → repository-checks，只做
+repository/static guards，不做 hosted CUDA build）；release
+validation evidence（`docs/v10_release_validation.md`）。
+
+---
+
 ## Phase A：Release Hygiene
 
 ### A.1 清理 cudalm-server 临时 debug 输出
