@@ -5,12 +5,19 @@
 #   1. this script is committed FIRST (tooling commit);
 #   2. run it from a CHECK-OUT-CLEAN tracked tree (FAIL LOUD otherwise —
 #      no "official evidence" is generated from a dirty tree);
-#   3. it records the exact git SHA + environment, builds, runs the
-#      canonical workload (benchmarks/bench_qwen35_continuous_batching.cpp)
-#      with the release protocol, and writes the raw evidence into
+#   3. the benchmark executable is BUILT (CMake build / up-to-date
+#      validation) at the recorded exact source SHA, and the HEAD SHA
+#      is re-verified AFTER the build and AFTER the benchmark — the
+#      executed binary is thereby the binary built from the recorded
+#      source SHA (the binary sha256 is recorded in environment.txt);
+#      a full clean rebuild is NOT required (the build dir may be
+#      incremental);
+#   4. it runs the canonical workload
+#      (benchmarks/bench_qwen35_continuous_batching.cpp) with the
+#      release protocol and writes the raw evidence into
 #      benchmarks/v10/ (raw files are ALWAYS kept — the summary is a
 #      convenience view, never the only evidence);
-#   4. the caller then commits the evidence (docs/evidence-only commit)
+#   5. the caller then commits the evidence (docs/evidence-only commit)
 #      — the large model file (build/data/*.cudalm) is NEVER committed.
 #
 # Release protocol: warmup-runs = 2, measured-runs = 10.
@@ -50,8 +57,20 @@ echo "git sha:    ${sha}"
 echo "git branch: ${branch}"
 echo "git tree:   CLEAN (tracked tree)"
 
-# ---- 2. prerequisites ------------------------------------------------------
-[ -f "${bin}" ] || die "benchmark binary missing: ${bin} (build it first: cmake --build ${build_dir} --target bench_qwen35_continuous_batching)"
+# ---- 2. build the benchmark target AT the recorded SHA ----------------------
+# CMake build / up-to-date validation of the exact target (a full clean
+# rebuild is not required — the build dir may be incremental). FAIL LOUD
+# on build failure. The HEAD SHA is re-verified after the build: the
+# executed binary must be the binary built from the recorded source SHA.
+build_cmd="cmake --build ${build_dir} --target bench_qwen35_continuous_batching -j8"
+echo "build: ${build_cmd}"
+( cd "${build_dir}" && cmake --build . --target bench_qwen35_continuous_batching -j8 ) \
+    || die "benchmark target build failed at ${sha}"
+[ "$(git rev-parse HEAD)" = "${sha}" ] || die "git HEAD changed DURING the build"
+[ -f "${bin}" ] || die "benchmark binary missing after build: ${bin}"
+bin_sha256="$(sha256sum "${bin}" | awk '{print $1}')"
+
+# ---- 2b. prerequisites ------------------------------------------------------
 [ -f "${model}" ] || die "converted model missing: ${model} (run tools/convert_qwen35.py --full-model first)"
 [ -f "${ckpt}/model.safetensors" ] || die "checkpoint missing: ${ckpt}/model.safetensors"
 [ -x "${python3}" ] || die "python missing: ${python3}"
@@ -79,8 +98,9 @@ env_file="${out_dir}/environment.txt"
   echo "cuda_runtime:         (recorded inside each raw report: cuda_runtime / cuda_driver lines)"
   echo "host_compiler:        ${compiler}"
   echo "cmake_build_type:     ${build_type}"
+  echo "build_command:        ${build_cmd}  (run at git_sha; HEAD re-verified unchanged after the build and after the benchmark)"
   echo "benchmark_binary:     ${bin}"
-  echo "benchmark_binary_sha256: $(sha256sum "${bin}" | awk '{print $1}')"
+  echo "benchmark_binary_sha256: ${bin_sha256}  (computed AFTER the build at git_sha)"
   echo "model_file:           ${model}"
   echo "model_file_sha256:    $(sha256sum "${model}" | awk '{print $1}')"
   echo "checkpoint_dir:       ${ckpt}"
@@ -215,9 +235,16 @@ print("wrote summary.json")
 PYEOF
 
 # ---- 6. self-consistency check ----------------------------------------------
+# HEAD re-verified AFTER the benchmark: the exact source SHA was unchanged
+# across the build AND the run, so the executed binary == the binary built
+# from the recorded SHA.
 [ "$(git rev-parse HEAD)" = "${sha}" ] || die "git HEAD moved during the benchmark run"
 grep -q "git_sha:              ${sha}" "${env_file}" || die "environment.txt SHA mismatch"
 grep -q "${sha}" "${out_dir}/summary.json" || die "summary.json SHA mismatch"
-echo "self-consistency: OK (sha ${sha} == HEAD == environment.txt == summary.json)"
+# the recorded binary sha256 matches the executed binary (and the disk):
+grep -q "benchmark_binary_sha256: ${bin_sha256} " "${env_file}" || die "environment.txt binary sha256 mismatch"
+[ "$(sha256sum "${bin}" | awk '{print $1}')" = "${bin_sha256}" ] || die "executed binary hash drifted after the run"
+echo "self-consistency: OK (sha ${sha} == HEAD before/after build+run =="
+echo "  environment.txt == summary.json; binary sha256 ${bin_sha256} recorded+verified)"
 echo "=== done. Evidence in ${out_dir}:"
 ls -l "${out_dir}"
