@@ -44,10 +44,16 @@ Status ServingController::create_session(SessionId* out_id) {
     (void)evict_expired_sessions();
   }
   if (policy_.lru_on_session_pressure && limits_.max_sessions > 0 &&
-      sessions_.num_sessions() >= limits_.max_sessions) {
+      sessions_.num_sessions() == limits_.max_sessions) {
     // LRU-on-session-pressure: evict ONE eligible idle session, then
-    // retry the Phase A check below. max_sessions == 0 can NEVER be
-    // bypassed by eviction (the zero-capacity contract).
+    // retry the Phase A check below. REVIEW FIX (Phase C): this
+    // triggers ONLY at live_sessions == max_sessions — when the
+    // controller is already OVER the limit (live_sessions >
+    // max_sessions, e.g. unmanaged sessions took the capacity) it
+    // does NOT destructively evict first: it goes straight to the
+    // Phase A session-limit rejection (no SessionId consumed, no
+    // session destroyed, no pool mutation). max_sessions == 0 can
+    // NEVER be bypassed by eviction (the zero-capacity contract).
     if (!evict_one_lru_idle()) {
       ++eviction_no_candidate_;  // no eligible session: the Phase A
                                  // rejection stands below
@@ -343,7 +349,15 @@ void ServingController::check_deadlines_() {
       // (the frozen FinishReason has no deadline reason: at the
       // scheduler level the request reports Cancelled/Cancelled).
       const Status s = sched_.cancel(id);
-      if (s.ok) deadline_cancelled_.insert(id);
+      if (s.ok) {
+        deadline_cancelled_.insert(id);
+        // REVIEW FIX (Phase C): a deadline terminal is ACTIVITY —
+        // the session's TTL is re-anchored to THIS terminal, not to
+        // the old admission / drive time (the same contract as the
+        // explicit cancel(); this path must not go through the
+        // public cancel() — minimal refresh here, no recursion):
+        refresh_activity_(r->session_id);
+      }
     }
   }
 }

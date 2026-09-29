@@ -222,11 +222,14 @@ class ServingController {
   // v0.9 Phase C: with a TTL enabled, a lightweight sweep runs FIRST
   // (expired idle sessions are evicted — they no longer count
   // against the limit). With lru_on_session_pressure ENABLED and
-  // live_sessions == max_sessions (> 0), ONE eligible idle LRU
-  // session is evicted before the create is retried; with NO
-  // eligible candidate the Phase A rejection stands (the zero-
-  // capacity contract, max_sessions == 0, can never be bypassed by
-  // eviction). With the DEFAULT policy this method is EXACTLY the
+  // live_sessions == max_sessions (exactly at the limit, > 0), ONE
+  // eligible idle LRU session is evicted before the create is
+  // retried; with NO eligible candidate the Phase A rejection
+  // stands. When ALREADY OVER the limit (live_sessions >
+  // max_sessions) there is NO eviction — straight to the Phase A
+  // session-limit rejection (no mutation). The zero-capacity
+  // contract (max_sessions == 0) can never be bypassed by
+  // eviction. With the DEFAULT policy this method is EXACTLY the
   // Phase A behavior.
   Status create_session(SessionId* out_id);
 
