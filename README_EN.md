@@ -4,7 +4,7 @@ A native C++17/CUDA quantized LLM inference & serving engine
 
 [中文](README.md)
 
-[![repository-checks](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml/badge.svg?branch=v1.0-portfolio-release)](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml?branch=v1.0-portfolio-release)
+[![repository-checks](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml)
 
 > The CI badge covers `repository-checks` (repository / static
 > guards) only; full CUDA/checkpoint validation is the Local NVIDIA

@@ -4,7 +4,7 @@
 （分支 `v1.0-portfolio-release`；validation 前 `git status --porcelain`
 clean，`git rev-parse HEAD` = 该 SHA）
 
-**Date**: 2026-07-08
+**Date**: 2026-09-29
 
 ## Environment
 

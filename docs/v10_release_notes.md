@@ -503,12 +503,11 @@ Docs-only; no other Phase C content touched.
 
 ## Deferred / Future Work
 
-- **README curl 示例**：现有 `curl --data` 示例在新 CT 合同下
-  仍可用（form-urlencoded 被接受），但应在 Phase C README 重写
-  时显式加 `-H 'Content-Type: text/plain'` 作为规范写法。
+v1.0 已关闭。以下为**尚未完成**的事项（历史 Phase A–D 工作记录
+保留在上方各节，不在这里重复）：
+
 - **`ModelConfig::v011_general_test` 命名**：见 A.5——保留，供
-  v1.0 后续或 v1.1 决定是否重命名（需跨 C++/Python 同步）。
-- **LICENSE**：Phase A 明确不决定——保持现状，后续单独确定。
-- **GitHub Actions / CI**：Phase D 范围。
-- **benchmark 整理**：Phase B 范围。
-- **README 重写**：Phase C 范围。
+  v1.1+ 决定是否重命名（需跨 C++/Python 同步）。
+- **Post-v1.0 roadmap 方向**（README §13，均为 future work，未
+  开始）：真正的并发 HTTP frontend；Qwen chat template /
+  OpenAI-compatible adapter；更高级的 inference optimization。

@@ -4,7 +4,7 @@
 
 [English](README_EN.md)
 
-[![repository-checks](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml/badge.svg?branch=v1.0-portfolio-release)](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml?branch=v1.0-portfolio-release)
+[![repository-checks](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml)
 
 > CI badge = `repository-checks`（repository / static guards）；
 > 完整 CUDA/checkpoint 验证见 Local NVIDIA release validation（§8）。
