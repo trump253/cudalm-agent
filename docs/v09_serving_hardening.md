@@ -224,6 +224,10 @@ Token 事件之后**；**无重复 / 无跨 request contamination**。
 - **`run_stream()`**：controller 中已存在 terminal-but-undrained
   request 时，**不会**仅因 `live_requests == 0` 直接返回而遗失
   pending events——先/按序 drain 再驱动 live request；
+- **`run()`（non-streaming）**：途中遇到的 pending terminal events
+  被 **discard**（drain 推进 cursor 并 reap fully-drained request）
+  ——**之后不可再 poll**；需要事件请用 `*_stream` / `poll` 在
+  `run()` 之前取走；
 - 不修改 frozen `Scheduler` 的 Request 生命周期（controller 只管
   自己的 bookkeeping）。
 
@@ -240,7 +244,15 @@ contract）：
 - **Session 保持 live**，context / KV / Delta 保持**最后 committed
   boundary**；
 - **request quota 正常释放**（derived live count，立即生效）；
-- **next turn 能从该 boundary 继续**。
+- **next turn 能从该 boundary 继续**；
+- **统一 streaming 生命周期（review fix）**：`cancel()` 成功且
+  request 变为 terminal 时，**纳入与 step-terminated 相同的
+  terminal-pending lifecycle**——committed 未 emit 的 token +
+  Cancelled terminal event 保持可 drain（`poll` / `step_stream` /
+  `run_stream` 均不遗失；仅因 `live_requests == 0` 不会丢事件）；
+  fully-drained 的 request 已被 reap（不在 tracked 集），**不会**
+  重新进入、不会重复 terminal event；already-terminal cancel 保持
+  frozen scheduler 的 idempotent 语义。
 
 ## 9. Phase B：Deadline（cooperative boundary between scheduler steps）
 

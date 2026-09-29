@@ -2013,6 +2013,48 @@ model 改动。
   标准**不**需要 full ctest / compute-sanitizer / profiling / v0.8
   historical hard gates。
 
+### Phase B review fix 2（cancel 纳入统一 streaming 生命周期）
+
+**External review blocker**：显式 `ctrl.cancel(rid)` 使 request
+terminal，但未纳入 terminal-pending streaming lifecycle（只有
+`step_drive_()` 记录 terminal）——唯一 live request 被 cancel 后
+`run_stream()` 因 `live_requests == 0 && terminal_pending_ 空`
+直接返回，遗漏 committed-but-undrained token + Cancelled terminal
+event。
+
+**修复**（仅 ServingController bookkeeping）：`cancel()` 成功后若
+request 仍 tracked（有 controller bookkeeping）且已 terminal →
+`terminal_pending_.insert`（与 step-terminated 同一 lifecycle）；
+fully-drained 的 request 已被 reap（不在 tracked 集）→ 不会重进、
+不重复 terminal event；already-terminal cancel 保持 frozen
+idempotent 语义。不变式保持：quota terminal 立即释放、stream state
+fully drained 才 reap、pending token 永不 emit。另修正 `run()`
+注释：discarded 的 pending events **不可**再 poll（drain 推进
+cursor 并 reap）——仅文档/注释修正，不重构。
+
+**Commit**：
+
+- Functional: `7c57af26a1cadf8e20eb282415f964139f85e0c1`
+- Tests: `9a4eadaed14a5d30f86fbd0e6eb726f11e710198`
+  （`test_serving_streaming` 新增 1 个小 case：2 input + max_new 2
+  用普通 `step()` 驱动到 g0 committed 未 emit / g1 pending /
+  Running → `cancel()` + `run_stream()`：g0 exactly once、g1 永不
+  emit、RequestTerminal(Cancelled) 在 g0 之后且
+  `deadline_exceeded == false`、cancel 后无 forward、session 停在
+  committed boundary（length 3）、`live_requests == 0`；re-poll
+  error（fully-drained）；next turn 继续；**cancel Waiting
+  request + `run_stream()` 仍得 Cancelled terminal event**）
+
+**验收**（本地验证，非 CI）：
+
+- `test_serving_streaming` → **PASS**（11 个 [ok] 用例）；
+- 回归：`test_serving_admission` / `test_serving_integration` /
+  `test_serving_stream_integration` → **PASS**；
+- targeted `ctest -R "stream|serving|scheduler|session"
+  --output-on-failure` → **16/16 PASS**（Total 19.42 s）；
+- 修改仍在 serving control plane（零 frozen code 改动）→ 免 full
+  ctest / sanitizer / profiling。
+
 **Phase B 明确不做**（non-goals，属后续 Phase）：text-byte
 streaming / incremental UTF-8 decoder、HTTP / OpenAI API、threads /
 async runtime、multi-stream、TTL / LRU、eviction、chat template、
