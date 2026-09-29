@@ -263,6 +263,126 @@ speedup 写。
 
 ---
 
+## Phase C：Bilingual Portfolio README & Architecture Documentation
+
+### C.1 语言结构
+
+中文是主要 portfolio 展示语言（用户求职以国内 AI Infra / CUDA /
+LLM inference 公司为主），英文保留完整 companion version；代码 /
+API / 文件名 / CUDA/C++ identifier / benchmark terminology 保持
+原始英文。文档布局：
+
+```text
+README.md                       中文主 README（彻底重写，非 append）
+README_EN.md                    完整英文 companion（同章节结构）
+docs/v10_architecture_overview.md        中文系统架构总览
+docs/v10_architecture_overview_en.md     英文系统架构总览
+docs/v10_performance.md         Phase B 冻结英文性能文档（核心内容未改）
+docs/v10_performance_zh.md      中文 companion（数字与 frozen 英文逐一对齐）
+```
+
+README 顶部互相提供语言入口；不把完整中英文塞进同一文件。
+
+### C.2 README 重写
+
+旧 README（813 行 / 4148 词）是自 v0.1 起的 append-only 开发日志，
+首页从 single decoder block 开始，已不能代表 v1.0——**整体重写**为
+portfolio README（13 节：项目简介 / 核心能力 / 系统架构 / 推理引擎
+实现 / 快速开始 / 生成·Multi-turn·HTTP 示例 / 性能 / 正确性与工程
+验证 / 核心工程设计 / 当前限制 / 仓库结构 / 技术文档 / Roadmap），
+历史 changelog 不再由 README 承担（真实来源留在 docs/provenance.md、
+docs/v07_*.md、docs/v08_session_runtime.md、docs/v09_serving_hardening.
+md、docs/v10_performance.md 等）。中英文两版章节结构相同、技术事实
+完全一致（feature support / limitations / 性能数字 / HTTP 行为 /
+multi-turn 语义 / scheduler 语义 / future work 逐项对齐）。
+
+### C.3 Quick Start 与 HTTP 示例的核实
+
+README 中所有命令都从实际代码核实（不凭空创造 flag）：
+
+- `cudalm-generate` / `cudalm-chat` / `cudalm-server` 的 flag 逐一
+  对 `--help` 输出与 source 核对（含 --slots / --pages / --page-
+  tokens / --max-sessions / --max-live-requests / --session-ttl-ms /
+  --lru-on-pressure 等）；
+- HTTP 路由与 handler source 核对：`GET /healthz`、`GET /v1/stats`、
+  `POST /v1/sessions`、`POST /v1/sessions/<id>/turn`、
+  `POST /v1/sessions/<id>/turn/stream`、`POST /v1/sessions/<id>/reset`、
+  `DELETE /v1/sessions/<id>`（错误码 / NDJSON 事件格式链接到
+  docs/v09_serving_hardening.md）；
+- 所有 turn POST 示例显式 `-H 'Content-Type: text/plain'`（Phase A
+  合同：不依赖 curl 默认 Content-Type）；
+- 转换命令对 `tools/convert_qwen35.py --help` /
+  `tools/convert_qwen35_tokenizer.py --help` 核实。
+
+### C.4 架构图与语义文档
+
+- README（中英）新增 Mermaid 系统架构图（Frontend → Tokenizer →
+  ServingController → Scheduler → SessionManager → StateManager →
+  Paged KV / Delta state → Qwen35Model → CUDA Kernels；Full
+  Attention→Paged KV、Gated DeltaNet→conv+recurrent state 正确
+  体现；不含 multi-GPU / tensor parallel / CUDA Graph / async pool /
+  speculative decoding 等不存在的组件）；
+- 架构总览（中英）新增 request lifecycle / streaming 语义
+  （admit → prefill → decode → sample → commit → stream-visible →
+  terminal → reap 的 Mermaid 图 + 硬不变量 `sampled token !=
+  stream-visible token`、`generated[0..committed)` 才可暴露、
+  terminal final token 先 emit 后 terminal）与 state ownership 图
+  （SessionId → SequenceId → Paged KV + Delta slot）；
+- scheduler 诚实边界（底层 continuous batching 已就绪，但 HTTP
+  frontend 仍 single-threaded one-request-at-a-time，不能描述为
+  concurrent HTTP serving）在 README 与架构总览（中英）中均明确
+  写出；
+- multi-turn 节明确 **persistent multi-turn raw-text completion**
+  语义 + "无官方 Qwen chat template / 非 OpenAI-compatible / 不是
+  ChatGPT-style conversation API"。
+
+### C.5 性能叙事与限制
+
+- README 性能节数字全部来自 frozen Phase B evidence（SHA
+  `eeaef3e0b0cdd9b3dd808787e7b00f468f9b4b6a`）：serial
+  132.707 ms / 203.46 tok/s / 27 traversals；continuous batched
+  116.064 ms / 232.63 tok/s / 22 traversals / avg-max batch 2.67/3；
+  batched-only 110.017 ms / 245.42 tok/s；同实验 delta
+  −16.64 ms（−12.5%）；附"仅对应当前硬件 / checkpoint / canonical
+  workload"声明；
+- profile-driven optimization 短叙事（v0.7：profile first →
+  candidate → correctness → microbench → profiler → paired E2E →
+  KEEP/REJECT；W4A16 REJECT / DeltaNet REJECT / fused KEEP；
+  −24 launches/traversal、paired E2E −1.238 ms、95% CI
+  [−2.437, −0.040]；"更快的 kernel 不代表更快的程序"）；
+- Limitations 中英一致（Qwen3.5-0.8B-Base only / single GPU /
+  single stream / serial prefill / HTTP single-threaded /
+  raw-text no chat template / not OpenAI-compatible / 无 TP /
+  multi-GPU / speculative / CUDA Graph / distributed / 跨重启
+  session 存储）；
+- 无虚假 badge（Phase D 才有真实 CI）。
+
+### Phase C 明确未做的事
+
+- 不改任何代码（src/ include/ tools/ tests/ 零改动；本 Phase
+  docs-only）；不重跑 benchmark；不做新性能分析；不重写
+  qwen35_architecture.md / provenance.md / v07_*.md /
+  v08_session_runtime.md / v09_serving_hardening.md /
+  v10_performance.md 核心内容；不 merge main、不 tag v1.0。
+
+### Phase C validation（docs-only）
+
+- 全部新增 README 相对链接解析通过、引用文件存在、executable 名
+  （cudalm-generate / cudalm-chat / cudalm-server）、CLI flag（对
+  --help）、HTTP 路由（对 handler source）逐一核实；
+- 中英性能数字与 frozen Phase B evidence（summary.json / raw
+  报告）一致；中英 limitation / feature / HTTP / multi-turn /
+  scheduler / future work 逐项对齐（无"中文支持 X 英文不支持 X"）;
+- 无 unsupported claim 扫描（无 production-grade HTTP / 高并发 /
+  OpenAI 兼容 / Tensor Core / fully optimized 等表述）；
+- 未把历史限制（no tokenizer / no batching / no scheduler / no
+  Paged KV / no session / no HTTP）误写为当前限制——这些现在都已
+  实现；
+- 按 Phase 边界：docs-only → 无 full ctest / compute-sanitizer /
+  benchmark rerun。
+
+---
+
 ## Deferred / Future Work
 
 - **README curl 示例**：现有 `curl --data` 示例在新 CT 合同下
