@@ -29,7 +29,19 @@
 //     max_sessions reached still REJECTS;
 //   * G. UNMANAGED sessions (created directly on the manager, outside
 //     the controller) are never guessed, never auto-evicted — they
-//     still occupy the session limit.
+//     still occupy the session limit;
+//   * H. REVIEW FIX: a DEADLINE terminal refreshes the session's
+//     activity (the TTL is re-anchored to the deadline terminal, not
+//     to the old admission/drive time) — the request is
+//     deadline-cancelled on the first step_stream() after a long
+//     undriven silence; a sweep BEFORE the TTL from that terminal
+//     must NOT evict; at idle_age == TTL the sweep evicts;
+//   * I. REVIEW FIX (over-limit fail-safe): pressure eviction
+//     triggers ONLY at live_sessions == max_sessions — when the
+//     controller is ALREADY OVER the limit (unmanaged sessions took
+//     the capacity) the create REJECTS without evicting anything
+//     (no SessionId consumed, no pool mutation, the eligible
+//     managed session survives).
 //
 // Provenance: CUDALM-native (v0.9 Phase C).
 
@@ -517,6 +529,108 @@ int main() {
     CHECK_EQ(ctrl.stats().evicted_sessions_lru, static_cast<std::uint64_t>(0));
     std::printf("  [ok] unmanaged session: never guessed, never "
                 "auto-evicted (still occupies the limit)\n");
+  }
+
+  // =========================================================================
+  // H. REVIEW FIX: a DEADLINE terminal refreshes the session activity
+  //    (the TTL is re-anchored to the deadline terminal)
+  // =========================================================================
+  {
+    Qwen35StateManager mgr(cfg, 4, 8, 4, stream);
+    SessionManager sm(mgr);
+    FakeForwarder fwd;
+    FakeClock clk;
+    Scheduler sched(fwd, mgr, stream, &sm);
+    const SessionEvictionPolicy pol =
+        SessionEvictionPolicy{}.with_idle_ttl(std::chrono::milliseconds(1000));
+    ServingController ctrl(sched, sm, ServingLimits{-1, -1, 0}, &clk, pol);
+    SessionId S = 0;
+    CHECK(ctrl.create_session(&S).ok);  // activity t = 0
+    // Admit a request with a deadline at t = 500, then do NOT drive:
+    const std::chrono::steady_clock::time_point dl =
+        clk.t0 + std::chrono::milliseconds(500);
+    RequestId r = 0;
+    CHECK(ctrl.admit_turn(S, {71}, 2, -1, kGreedy, &r, dl).ok);
+    // t = 1000 (a long undriven silence): the FIRST step_stream:
+    clk.advance_ms(1000);
+    std::vector<ServingEvent> ev = ctrl.step_stream();
+    // The deadline fired BEFORE the next forward (no additional
+    // commit — nothing was ever forwarded):
+    CHECK_EQ(fwd.forwards(sm.lookup(S)->sequence_id), 0);
+    CHECK_EQ(static_cast<int>(ev.size()), 1);  // only the terminal
+    CHECK(ev[0].kind == ServingEventKind::RequestTerminal);
+    CHECK(ev[0].status == RequestStatus::Cancelled);
+    CHECK(ev[0].deadline_exceeded);
+    CHECK(sched.get(r)->status == RequestStatus::Cancelled);
+    std::printf("  [ok] deadline terminal: cancelled before the next "
+                "forward, no commit\n");
+
+    // The TTL must be anchored to the TERMINAL (t = 1000), not to the
+    // admission (t = 0): at t = 1900 (idle 900ms < 1000) the sweep
+    // must NOT evict...
+    clk.advance_ms(900);
+    const std::vector<SessionId> kept = ctrl.evict_expired_sessions();
+    CHECK(kept.empty());
+    CHECK(sm.lookup(S) != nullptr);
+    // ...and at idle_age == TTL (t = 2000) the sweep evicts:
+    clk.advance_ms(100);
+    const std::vector<SessionId> evicted =
+        ctrl.evict_expired_sessions();
+    CHECK(static_cast<int>(evicted.size()) == 1 && evicted[0] == S);
+    CHECK(sm.lookup(S) == nullptr);
+    CHECK_EQ(ctrl.stats().evicted_sessions_ttl, static_cast<std::uint64_t>(1));
+    std::printf("  [ok] TTL re-anchored to the deadline terminal "
+                "(no evict before the TTL, evict at idle_age == TTL)\n");
+  }
+
+  // =========================================================================
+  // I. REVIEW FIX (over-limit fail-safe): pressure eviction triggers
+  //    ONLY at live_sessions == max_sessions — already over the limit
+  //    -> reject WITHOUT evicting anything
+  // =========================================================================
+  {
+    Qwen35StateManager mgr(cfg, 4, 8, 4, stream);
+    SessionManager sm(mgr);
+    FakeForwarder fwd;
+    FakeClock clk;
+    Scheduler sched(fwd, mgr, stream, &sm);
+    const SessionEvictionPolicy pol =
+        SessionEvictionPolicy{}.with_lru_on_session_pressure();
+    ServingController ctrl(sched, sm, ServingLimits{2, -1, 0}, &clk, pol);
+    // A: a MANAGED, eligible, IDLE session:
+    SessionId A = 0;
+    CHECK(ctrl.create_session(&A).ok);
+    // U1 / U2: UNMANAGED (directly on the manager) -> the controller
+    // is ALREADY OVER the limit (3 live > 2):
+    SessionId U1 = 0, U2 = 0;
+    CHECK(sm.create_session(&U1).ok);
+    CHECK(sm.create_session(&U2).ok);
+    CHECK_EQ(sm.num_sessions(), 3);
+    const SequenceId next_seq_before = mgr.next_sequence_id();
+    const int kv_before = mgr.kv_pool().used_pages();
+    const int dl_before = mgr.delta_pool().used_slots();
+    // Create C while OVER the limit: NO eviction, straight to the
+    // Phase A session-limit rejection:
+    SessionId C = 123;
+    Status s = ctrl.create_session(&C);
+    CHECK(!s.ok);
+    CHECK_EQ(C, static_cast<SessionId>(123));
+    // A was NOT evicted (even though it is the LRU eligible one);
+    // U1/U2 are untouched:
+    CHECK(sm.lookup(A) != nullptr);
+    CHECK(sm.lookup(U1) != nullptr);
+    CHECK(sm.lookup(U2) != nullptr);
+    CHECK_EQ(sm.num_sessions(), 3);
+    // No new SessionId / sequence consumed, no pool mutation:
+    CHECK_EQ(mgr.next_sequence_id(), next_seq_before);
+    CHECK_EQ(mgr.kv_pool().used_pages(), kv_before);
+    CHECK_EQ(mgr.delta_pool().used_slots(), dl_before);
+    // No automatic eviction happened at all:
+    CHECK_EQ(ctrl.stats().evicted_sessions_lru, static_cast<std::uint64_t>(0));
+    CHECK_EQ(ctrl.stats().evicted_sessions_ttl, static_cast<std::uint64_t>(0));
+    CHECK_EQ(ctrl.stats().rejected_session_limit, static_cast<std::uint64_t>(1));
+    std::printf("  [ok] over-limit fail-safe: rejected WITHOUT evicting "
+                "(no id consumed, no pool mutation, A/U1/U2 untouched)\n");
   }
 
   CUDA_CHECK(cudaStreamDestroy(stream));
