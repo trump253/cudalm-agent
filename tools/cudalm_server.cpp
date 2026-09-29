@@ -299,24 +299,10 @@ int main(int argc, char** argv) {
     const int fd = transport.accept_one(std::chrono::milliseconds(200));
     if (fd < 0) continue;
     http::HttpParseResult res;
-    std::fprintf(stderr, "[dbg] %f accepted fd=%d\n",
-                 (double)std::chrono::duration_cast<std::chrono::microseconds>(
-                     std::chrono::steady_clock::now().time_since_epoch())
-                     .count() / 1e6,
-                 fd);
     if (!transport.read_request(fd, limits, &res)) {
-      std::fprintf(stderr, "[dbg] %f TRANSPORT READ FAILURE (close)\n",
-                   (double)std::chrono::duration_cast<
-                       std::chrono::microseconds>(
-                       std::chrono::steady_clock::now().time_since_epoch())
-                       .count() / 1e6);
       http::HttpTransport::close_fd(fd);  // a clean transport failure
       continue;
     }
-    std::fprintf(stderr, "[dbg] parsed ok=%d status=%d method=%s path=%s "
-                 "body=%zu\n",
-                 (int)res.ok, res.status, res.req.method.c_str(),
-                 res.req.path.c_str(), res.req.body.size());
     if (!res.ok) {
       (void)http::HttpTransport::send_response(
           fd, http::HttpResponse::json_error(res.status, "", res.message));
@@ -329,8 +315,6 @@ int main(int argc, char** argv) {
         res.req.path.size() >= stream_suffix.size() &&
         res.req.path.compare(res.req.path.size() - stream_suffix.size(),
                              stream_suffix.size(), stream_suffix) == 0;
-    std::fprintf(stderr, "[dbg] handler start (stream=%d)\n",
-                 (int)is_stream);
     if (is_stream) {
       // The handler writes the header block + the NDJSON events; a
       // false return = the client disconnected (the handler already
@@ -343,10 +327,7 @@ int main(int argc, char** argv) {
                               });
     } else {
       const http::HttpResponse resp = api.handle(res.req);
-      std::fprintf(stderr, "[dbg] handle done status=%d, sending\n",
-                   resp.status);
       (void)http::HttpTransport::send_response(fd, resp);
-      std::fprintf(stderr, "[dbg] sent, closing\n");
     }
     http::HttpTransport::close_fd(fd);
   }

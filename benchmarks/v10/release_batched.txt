@@ -1,0 +1,66 @@
+# CUDALM v0.6 Phase C — dynamic continuous-batching benchmark
+# (reproducible; correctness-first; NO performance pass threshold)
+
+environment:
+  gpu: NVIDIA GeForce RTX 2080 Ti
+  cuda_runtime: 11.8
+  cuda_driver: 12.8
+  checkpoint: /root/models/Qwen3.5-0.8B-Base
+  model: /root/code/cudalm-agent/build/data/qwen35_08b_full.cudalm
+  stream: single (prefill stays serial; decode cohort is batched)
+
+workload (SAME for both modes; all four complete, no cancellation in the timed run):
+  requests: 4 (A greedy; B/C/D seeded)
+  prompt_tokens: 14
+  generated_tokens: 17
+  logical_sequence_token_forwards: 27  (sum over requests of N + m - 1)
+  arrival: A,B first; C after 1 step; D after 2 steps (dynamic)
+timing:
+  warmup_runs (un-timed): 2
+  measured_runs: 10 (each bracketed by cudaStreamSynchronize; steady_clock wall)
+  mode selector (--mode): batched (PROFILING-ONLY: single-mode serving profile)
+
+results (per-run metrics are identical across measured runs for this fixed workload; wall time is summarized):
+
+  mode B — SCHEDULER CONTINUOUS BATCHED (dynamic arrivals):
+    wall_time_s mean:   0.110017
+    wall_time_s median: 0.109119
+    wall_time_s min:    0.107920
+    wall_time_s max:    0.113852
+    logical_tokens: 27
+    logical_tokens_per_s (mean): 245.416445
+    single_forward_calls: 19
+    successful_single_forward_calls: 19
+    batch_forward_calls: 3
+    model_traversal_calls: 22
+    batched_sequence_tokens: 8
+    avg_decode_batch_size: 2.666667
+    max_decode_batch_size: 3
+
+profile_totals (this process: warmup + all measured runs, BOTH modes;
+ties the whole run to the Nsight Systems kernel-launch count):
+  serial_mode_traversals: 0
+  batched_mode_single_attempts: 228
+  batched_mode_successful_singles: 228
+  batched_mode_committed_batches: 36
+  batched_mode_traversals: 264
+  batched_mode_logical_tokens: 324
+  batched_mode_batched_tokens: 96
+  total_completed_traversals: 264
+
+notes:
+  * logical_sequence_token_forwards == model-traversal calls only in the SERIAL mode; in the batched mode a committed batch of B is B logical tokens but ONE traversal (so batched traversals < logical tokens).
+  * NO speedup claim is made: the correctness-first batch kernels are untuned (tuning is v0.7). A batched time >= serial time in THIS environment is NOT a failure.
+  * Numbers are for THIS environment / checkpoint / workload only; they are not a general performance conclusion.
+
+per-measured-run wall_time_s:
+  run 1: batched=0.109619s
+  run 2: batched=0.108619s
+  run 3: batched=0.108290s
+  run 4: batched=0.110908s
+  run 5: batched=0.113852s
+  run 6: batched=0.108436s
+  run 7: batched=0.108180s
+  run 8: batched=0.107920s
+  run 9: batched=0.112959s
+  run 10: batched=0.111387s

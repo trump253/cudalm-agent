@@ -80,6 +80,9 @@ class ServingHttpApi {
   //   408 a synchronous turn that ended deadline-cancelled
   //   409 admission conflict (the session / request / context limit
   //         or a live request on a destroy)
+  //   415 an unsupported turn-body Content-Type (text/plain + the
+  //         documented compatibility set only; see the gate in the
+  //         .cpp) — the sync and the streaming endpoints agree
   //   500 an internal forward / runtime failure
   HttpResponse handle(const HttpRequest& req);
 

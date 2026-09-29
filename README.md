@@ -1,813 +1,419 @@
 # CUDALM
 
-原生 C++/CUDA 量化 LLM 推理引擎。**v0.1** 实现一个完整的 Llama 风格
-decoder block —— W4A16 量化线性层、fp16 激活、单 GPU 自回归解码 ——
-**运行时不依赖 PyTorch（也不依赖任何 Python）**。C++17、CUDA 11.8、
-`sm_75`（RTX 2080 Ti）。kernel 只接收裸指针 + `cudaStream_t`；Python
-只存在于 `tools/`（离线生成测试数据），绝不链接进运行时。
+原生 C++17/CUDA 量化大模型推理与 Serving 引擎
 
-**v0.1.1（架构清理）**：泛化 decoder 投影形状契约
-（Q 宽度不再等于 hidden_size）、benchmark 的"stage 之和"与"整块 GPU
-时间"分离、速率指标更名 `block_steps_per_second`、权重来源显式化
-（固定种子合成权重）。不新增模型架构、不改 W4A16 kernel 算法、
-不重新优化 Attention、不扩大 scope。
+[English](README_EN.md)
 
-## v0.1 范围 —— 以及刻意不做的部分
+[![repository-checks](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml)
 
-已实现（端到端）：
+> CI badge = `repository-checks`（repository / static guards）；
+> 完整 CUDA/checkpoint 验证见 Local NVIDIA release validation（§8）。
 
-```
-x ─► RMSNorm ─► Q/K/V（W4A16 GEMV）──► RoPE（交错对）
-  ─► KV 缓存写入 @ position ─► 因果解码注意力（fp32 计算）
-  ─► O 投影 ─► + 残差 ─► RMSNorm ─► gate/up（W4A16 GEMV）
-  ─► SiLU(gate)·up ─► down（W4A16 GEMV）──► + 残差 ─► y
-```
+CUDALM 是一个 **PyTorch-free 的 native C++17/CUDA 推理与 serving runtime**：它从官方
+Qwen/Qwen3.5-0.8B-Base checkpoint 出发，用自实现的 weight 格式（W4A16 投影 + BF16 激活）、
+自实现的 tokenizer、自实现的 CUDA kernel 完成完整的前向推理，并在其上实现了
+**持久化多轮 Session、continuous batching 调度、commit-before-visible streaming、
+取消 / deadline、TTL/LRU 驱逐和原生 HTTP frontend**。
 
-v0.1 刻意不在范围内（v0.1.1 之后硬停止 —— 见文末清单）：FlashAttention、
-批处理（batching）、张量并行、多 GPU、CUDA Graphs、tokenizer、完整
-多层模型。
+它实现的模型是 **Qwen3.5-0.8B-Base**：24 层 decoder，**18 层 Gated DeltaNet（线性注意力）
++ 6 层 Full Attention** 的混合架构，hidden size 1024、head_dim 256、vocab 248320。
+所有 projection GEMV 走 W4A16 量化路径（G=128 对称打包 int4 + fp16 scale），
+激活与逐元素 kernel 走 BF16；DeltaNet 层持有持久的 conv state + recurrent state，
+Full Attention 层持有 Paged KV cache。
 
-## 钉死的契约
+**为什么它不仅是 kernel demo**：仓库里不是孤立的算子样例，而是一条从 checkpoint
+到 serving 的完整链路——离线转换（Python 只存在于离线工具中，runtime 零 PyTorch /
+零 Python 依赖，由 `scripts/check_no_torch.sh` 硬门禁保证）、单模型生成、持久多轮
+会话、调度器驱动的真 batched decode、带 streaming / 取消 / 限流的 HTTP server，
+以及配套的真实 checkpoint golden 测试、bit-exact 门禁、compute-sanitizer 验证和
+exact-SHA 绑定的 benchmark 证据链。
 
-| 项 | 契约 |
-|------|----------|
-| 配置（v0.1 默认） | `H=1024, n_heads=8, n_kv_heads=4, head_dim=128, intermediate=2816, group=128, max_seq=512, eps=1e-5, rope_theta=10000` |
-| 投影形状（v0.1.1 泛化） | q_proj `(q_proj_out, H)`、k/v_proj `(kv_proj_out, H)`、o_proj `(H, q_proj_out)`、gate/up `(inter, H)`、down `(H, inter)`，其中 `q_proj_out = n_heads·head_dim`、`kv_proj_out = n_kv_heads·head_dim`。**q_proj_out 独立于 hidden_size**（默认配置二者恰好相等，8×128=1024）；`ModelConfig::valid()` 要求 q_proj_out 与 inter 均为 group_size 的倍数，不再要求 `hidden_size == n_heads·head_dim`。完整形状契约：[`docs/weight_format.md`](docs/weight_format.md) |
-| 权重 | W4A16：对称分组 INT4，G=128，q∈[−7,7]，zero_point=0，`scale=amax/7` 以 fp32 计算、以 fp16 存储（**存储的 fp16 scale 即契约**），nibble 打包 low=k=2b / high=k=2b+1（4 位补码）。格式规范：[`docs/weight_format.md`](docs/weight_format.md) |
-| KV 缓存 | K、V 各为 fp16 `[n_kv_heads][max_seq_len][head_dim]`；行 (n,t) 偏移 `((n*max_seq_len)+t)*head_dim`；零初始化；越界即致命前置检查 |
-| RoPE | 交错对：`y[2i]=a·c−b·s`，`y[2i+1]=a·s+b·c`；cos/sin 表 fp16 `[max_seq, hd/2]`；按行查 `positions[m]`；基址 4B 对齐走 4B 打包路径，否则走标量回退（从不拒绝） |
-| 注意力 | GQA 整数映射 `kh = h * n_kv // n_heads`；`scale = 1/√head_dim`；减最大值的 softmax，逐元素除法；**全部 fp32 计算，仅在存储时做一次 fp16 RNE** |
-| stage 容差 | 相对黄金判据 `\|a−r\| ≤ 1e-2 + 1e-2·\|r\|`（实测最大偏差 ≤ 2.4e-4，来自 kernel FMA 收缩 vs 黄金的独立 mul+add）。p=0 RoPE 恒等、全部 18 个权重张量、带种子的 KV 历史行均钉死为**逐位精确**；当前位置的 KV 行按"对黄金容差 + 对运行时自身 rope_k/v stage 行逐位一致"校验 |
-| Benchmark 计时（v0.1.1 语义） | 三个互不混淆的视图：`stage_sum_us` = 17 个 stage CUDA 事件时长之和（**不含**事件未覆盖的位置 H2D 等工作，是分解小计，不是端到端时延）；`whole_block_gpu_us` = 包围整个 forward GPU 工作的一对 CUDA 事件（真实整块 GPU 时间）；`host_api_wall_us` = forward 调用 + stream 同步的 CPU 墙钟。速率指标 `block_steps_per_second` = 1e6 / whole_block 均值 —— **一次 decoder block 解码步 ≠ 一个模型 token**，故不再叫 tokens/s |
+**当前做到什么程度**：v1.0 是一个 **release-stable 的 portfolio 状态**——上述链路在
+单机单卡（开发基线：RTX 2080 Ti / CUDA 11.8）上完整可运行、可测试、可复现；
+性能文档（[性能与可复现性（中文）](docs/v10_performance_zh.md) /
+[Performance (English)](docs/v10_performance.md)）与优化案例（v0.7
+profile-driven optimization）全部绑定 exact SHA。它**不是**一个通用推理框架：
+只支持 Qwen3.5-0.8B-Base 这一个模型、单 GPU、单 CUDA stream、raw-text
+completion 语义（无官方 Qwen chat template、非 OpenAI 兼容）。
 
-## 仓库结构
+---
 
-```
-include/cudalm/           运行时头文件（decoder_block.h、kv_cache.h、
-                          weight_format.h、kernels/{rmsnorm,int4_gemv,rope,
-                          kv,attention,elementwise}.h、device_buffer.h …）
-src/kernels/              .cu kernel（裸指针 + cudaStream_t）
-src/runtime/              decoder_block.cpp、kv_cache.cpp、weight_loader.cpp、
-                          golden_loader.cpp、device_buffer.cpp
-tests/cpu/                无 GPU 测试：文件格式、跨语言权重一致性
-tests/cuda/               kernel 测试 + 端到端黄金测试（共 18 个 ctest
-                          用例；v0.1.1 新增泛化投影形状测试）
-tools/                    离线 Python（torch 2.3.1+cpu）：
-                          convert_weights.py（量化器）、generate_golden.py、
-                          common/binfmt.py —— 绝不链接进运行时
-benchmarks/               bench_decoder_block.cpp + 已提交的结果
-                          （v0.1.1 计时 schema）+ sanitizer 证据
-                          （v0.1 与 v0.1.1 各一份）
-scripts/check_no_torch.sh 守卫脚本：include/ + src/ 出现任何 torch/pybind/py
-                          符号即硬失败
-docs/                     bootstrap_plan_v0.1.md、provenance.md、
-                          weight_format.md
-```
+## 1. 项目简介 / Overview
 
-**溯源（Provenance）。** 三个 kernel 是从上游 CUDALab 研究仓库
-（冻结于 `cb6a6a9`，tag `v0.7.1`，只读）逐行移植的：`rmsnorm`（v4 fp16）、
-`int4_gemv`（rowtile4_hx + 标量回退）、`rope`（v3 half2，交错对）。
-host 层（PyTorch extension API）被替换为裸指针 + `cudaStream_t` +
-`CUDA_CHECK`；kernel 的数学与控制流 1:1 保留。其余部分 —— KV 缓存、
-注意力流水线、decoder block 接线、权重格式、测试、benchmark —— 均为
-CUDALM 原生。逐文件明细表（含偏差说明）见
-[`docs/provenance.md`](docs/provenance.md)。
+CUDALM 的目标是把"一个 hybrid 架构的小模型如何在没有 PyTorch 的情况下被完整
+推理并 serve"这个问题做成一个**工程上完整、证据上可核查**的参考实现：
 
-## 权重来源（固定种子合成权重）
+- **推理正确性由 inference/runtime 层负责**：模型数学、tensor layout、状态管理、
+  调度全部用 native C++17/CUDA 实现，用 pinned oracle 的 real-checkpoint
+  golden 测试做显式容差数值验证，语义必须保持一致的路径再叠加
+  bit-exact 硬门（见 §8）；
+- **serving 策略由 serving/control 层负责**：一个独立的薄控制层
+  （`ServingController`）在不修改 frozen runtime 的前提下叠加 admission / quota /
+  streaming / cancel / deadline / TTL / LRU；
+- **每一阶段都有 exact-SHA 绑定的证据**：性能、优化、修复结论都可以回溯到具体
+  commit 与 raw 数据（见 `docs/provenance.md`）。
 
-本仓库的权重与 golden 参考数据全部由 `tools/` 脚本（固定种子的离线
-PyTorch，`convert_weights.py` / `generate_golden.py`，种子 `20250922`）
-生成的**确定性合成权重（fixed-seed synthetic weights）**，**不是**
-HuggingFace checkpoint 转换器的输出。v0.1 / v0.1.1 的目标是验证：
-原生运行时架构（权重容器、加载器、DecoderBlock 接线）、移植 kernel
-的集成、以及逐 stage 的 golden 正确性 —— 与具体模型权重无关。
+## 2. 核心能力 / Highlights
 
-真实 HuggingFace safetensors checkpoint 的权重摄入（ingestion）**不
-在 v0.1.1 范围内**，随 v0.2 Qwen3.5 bring-up 一并完成。
+- 原生 C++17/CUDA Qwen3.5-0.8B 推理（**PyTorch-free production runtime**）
+- W4A16 projection（G=128 对称 int4 + fp16 scale）+ BF16 activation
+- 24 层混合模型：18× Gated DeltaNet + 6× Full Attention（partial RoPE、GQA、
+  zero-centered RMSNorm、SwiGLU MLP）
+- 原生 tokenizer（自研 CUDLMTK1 格式）+ greedy / temperature / top-k / top-p 采样
+- Paged KV Cache（Full Attention）+ Delta conv/recurrent state pool（DeltaNet）
+- **True batched decode**：decode cohort 走真 batched GPU path
+  （`forward_batch_with_state`），不是 request loop 模拟 batch
+- Continuous batching：多 request 动态到达、逐步组 cohort
+- **持久化多轮 Session**：turn N 只追加并执行新输入，不重放历史 prompt
+- Committed-token streaming（commit-before-visible）+ cancellation + deadline
+- Admission / backpressure（session / request / context 限流，zero-mutation 拒绝）
+- TTL / LRU-on-pressure session 驱逐
+- Native HTTP frontend（`cudalm-server`，thin JSON/NDJSON 合同）
+- Profile-driven CUDA 优化（v0.7：KEEP/REJECT 证据纪律，见 §7 与性能文档）
 
-## 构建
+## 3. 系统架构 / Architecture
 
-要求：CMake ≥ 3.16、CUDA 11.8 工具链（`nvcc` 面向 `sm_75`）、C++17
-编译器，以及（**仅用于生成测试数据**，构建本身不需要）python3 +
-`torch`（CPU 版即可）。构建过程不链接任何 Python。
+CUDALM 有**三条 user-facing 执行 path**（详见 [系统架构总览](docs/v10_architecture_overview.md)）。
+**ServingController 只是 HTTP serving path 的策略边界，不是所有 CUDALM 执行模式
+的通用 frontend 层**：
 
-```sh
-cmake -S . -B build
-cmake --build build -j
-```
+```mermaid
+flowchart TD
+    subgraph F["三条 user-facing 执行 path"]
+        A["cudalm-generate<br/>one-shot"]
+        B["cudalm-chat<br/>persistent session CLI"]
+        C["cudalm-server<br/>HTTP（single-threaded，<br/>one request at a time）"]
+    end
 
-## 复现证据
+    subgraph PA["Path A — one-shot（legacy，model-owned state）"]
+        TOKA["Qwen35Tokenizer（encode）"]
+        TG["Qwen35TextGenerator → Qwen35Generator<br/>host-side prefill + greedy/sampling decode<br/>（model.reset_state / model.forward_token）"]
+        A --> TOKA
+        TOKA --> TG
+    end
 
-所有测试数据由 `ctest` 从 `tools/` 自动生成到 `build/data/`
-（带种子、确定性：共享种子 `20250922`，历史种子 `20250923`）。
+    subgraph PB["Path B — persistent session CLI"]
+        TOKB["Qwen35Tokenizer（encode）"]
+        STG["Qwen35SessionTextGenerator<br/>（owns its own Scheduler）"]
+        B --> TOKB
+        TOKB --> STG
+    end
 
-**1. 完整测试套件（18/18）：**
+    subgraph PC["Path C — HTTP serving（v0.9 pinned chain）"]
+        HPA["HTTP transport（HttpTransport：accept loop ·<br/>connection I/O）→ ServingHttpApi<br/>（route · method/path · Content-Type · query 校验）"]
+        TOKC["Qwen35Tokenizer（encode——在 request handling 内部，<br/>CT/route 校验之后、admit_turn 之前）"]
+        SC["ServingController —— 仅 HTTP path：<br/>admission / quota · streaming<br/>cancel / deadline · TTL / LRU"]
+        C --> HPA
+        HPA --> TOKC
+        TOKC --> SC
+    end
 
-```sh
-cd build && ctest
-```
+    subgraph SL["共享 stateful 下层（Path B + C）"]
+        SCH["Scheduler —— request 生命周期 · continuous batching ·<br/>host-side per-request 采样（greedy / temperature / top-k / top-p）"]
+        SM["SessionManager —— persistent multi-turn sessions"]
+        ST["Qwen35StateManager —— Paged KV + Delta state slot"]
+        KV[("Paged KV pages<br/>（Full Attention）")]
+        DS[("Delta state slot<br/>conv + recurrent state<br/>（Gated DeltaNet）")]
+        SCH --> SM
+        SM --> ST
+        ST --> KV
+        ST --> DS
+    end
 
-覆盖：文件格式往返、跨语言权重字节一致性（Python 量化器 → C++ 加载器）、
-逐 kernel 测试（rmsnorm、int4_gemv、rope、kv_cache、attention、
-elementwise），以及端到端黄金测试（`test_decoder_block`，位置 0 与 7：
-18 个权重张量 + 16 个 stage 张量 + KV 状态，按上表钉死的契约校验）。
-v0.1.1 另含泛化投影形状用例（`gen_general_weights` +
-`test_decoder_block_general`：H=1024、n_heads=16、head_dim=128 →
-q_proj_out=2048 ≠ H，非对称形状下走完整量化/黄金流水线）。
+    MDL["Qwen35Model —— 24 混合层前向：logits + 状态更新（不含采样）"]
+    KER["CUDA Kernels<br/>W4A16 GEMV · paged attention · DeltaNet recurrence<br/>partial RoPE · RMSNorm · fused add+rmsnorm"]
 
-**2. 逐 stage 时延分解 + 整块计时**（CUDA 事件，17 个 stage +
-整块事件对；三个视图的语义见上表"benchmark 计时"行）：
-
-```sh
-./build/benchmarks/bench_decoder_block build/data/block_v01.cudalm <position> [iters=100] [out.json]
-```
-
-已提交结果（`benchmarks/results/`，RTX 2080 Ti，CUDA 11.8，驱动
-570.172.08，iters=100；v0.1.1 计时 schema，JSON 内 `timing_semantics`
-字段记录各指标含义）：
-
-| 位置 | stage_sum_us（均值） | whole_block_gpu_us（均值） | host_api_wall_us（均值） | block steps/s |
-|------|-----------|------------------|------------------|----------|
-| 0   | 121.6 µs | 160.5 µs | 178.0 µs | 6 230 |
-| 511 | 153.5 µs | 193.8 µs | 212.4 µs | 5 161 |
-
-`block steps/s = 1e6 / whole_block 均值`；一个 decoder block 解码步不是
-一个模型 token，故不再报告 tokens/s。stage_sum 是分解小计（不含事件
-未覆盖的位置 H2D 等工作），不能当作端到端时延；整块 GPU 时间与
-stage_sum 的差即未覆盖部分（约 39–40 µs）。注意力是唯一随位置变化的
-stage（12.9 µs @ p=0 → 42.1 µs @ p=511）；整个 block 由 GEMV 主导
-（7 个量化投影 ≈ 100 µs）。
-
-**3. 内存 sanitizer**（v0.1 证据
-`benchmarks/sanitizer_decoder_block.txt`；v0.1.1 证据
-`benchmarks/sanitizer_decoder_block_v011.txt`，含默认配置与泛化配置两次
-运行；重跑方式）：
-
-```sh
-cd build
-/usr/local/cuda-11.8/bin/compute-sanitizer --tool memcheck \
-  tests/test_decoder_block data/block_v01.cudalm \
-  data/block_v01_golden_p0.cudalm data/block_v01_golden_p7.cudalm
-# → ERROR SUMMARY: 0 errors
-# v0.1.1 泛化配置：data/block_general.cudalm + 对应 golden（同文件）
+    TG --> MDL
+    STG --> SCH
+    SC --> SCH
+    KV --> MDL
+    DS --> MDL
+    MDL --> KER
 ```
 
-**4. 运行时无 PyTorch 守卫：**
+**HTTP path 的顺序要点**：HTTP request handling（transport accept →
+`ServingHttpApi` 的 route / method/path / Content-Type / query 校验）
+发生在 raw-text tokenization **之前**；tokenization 在
+request-handling path 内部、admission 进 ServingController
+**之前**完成（`ServingHttpApi::handle` 中
+`codec->encode(req.body)` → `ctrl->admit_turn(...)`）。
 
-```sh
-bash scripts/check_no_torch.sh
-# → forbidden_deps_check OK
-```
+组件职责与所属 path（"—" = 该 path 不经过此组件；`Qwen35Tokenizer`
+是三条 path 共用的同一组件，CUDLMTK1 · raw text · 无 chat template，
+只是在 Path C 中由 `ServingHttpApi` 在 request handling 内部调用）：
 
-## v0.1 停止条件清单
+| 组件 | 职责 | A: generate | B: chat | C: server |
+|---|---|---|---|---|
+| Qwen35Tokenizer | encode / decode（raw text，无 template）；Path C 中在 ServingHttpApi 的 request handling 内调用 | ✓ | ✓ | ✓ |
+| Qwen35TextGenerator → Qwen35Generator | one-shot prefill + host-side 采样 decode；**legacy model-owned state** | ✓ | — | — |
+| Qwen35SessionTextGenerator | session CLI 的 text-in/text-out，owns 自己的 Scheduler | — | ✓ | — |
+| HTTP transport / server loop（HttpTransport + server main） | bind / listen、single-threaded accept loop、connection I/O、one request at a time | — | — | ✓ |
+| ServingHttpApi | routing、method/path + Content-Type 校验、query 解析、tokenizer codec encode/decode、ServingController 调用、JSON/NDJSON 响应与状态码 | — | — | ✓ |
+| ServingController | serving policy：admission / quota / streaming / cancel / deadline / TTL / LRU | — | — | ✓ |
+| Scheduler | request 生命周期、continuous batching、host-side per-request 采样 | — | ✓ | ✓ |
+| SessionManager / Qwen35StateManager | session 与 per-sequence 状态（Paged KV + Delta slot）生命周期 | — | ✓ | ✓ |
+| Qwen35Model + CUDA Kernels | 24 层混合前向 → logits + KV / Delta 状态更新（**采样不在此**） | ✓ | ✓ | ✓ |
 
-- [x] 一个 Llama 风格 decoder block 在固定种子合成权重上端到端运行
-- [x] p=0 与 p=7 的端到端黄金 PASS（1e-2 容差；按契约逐位钉死：RoPE
-      恒等、18 个权重张量、带种子 KV 历史）
-- [x] 16/16 ctest 全绿（CPU + CUDA）
-- [x] `compute-sanitizer --tool memcheck`：0 错误
-- [x] CUDA 事件逐 stage 时延分解；p=0 / p=511 JSON 已提交
-- [x] 运行时不依赖 PyTorch/Python（守卫脚本，Python 仅在 `tools/`）
-- [x] 逐文件溯源已记录（上游移植 + 原生清单）
-- [x] 工作树干净；全部证据产物已提交；remote `origin`
-      （`github.com/trump253/cudalm-agent`，SSH 传输）已配置，`main`
-      已推送；无 force push
+## 4. 推理引擎实现 / What CUDALM Implements
 
-## v0.1.1 完成清单（架构清理）
+**模型**（详细数学契约：`docs/qwen35_architecture.md`，本文不重复）：
 
-- [x] 投影形状契约泛化：Q/K/V/O 形状不再假设 Q 宽度 = hidden_size；
-      新增 ctest `test_decoder_block_general`（H=1024、n_heads=16、
-      head_dim=128 → q_proj_out=2048 ≠ H）PASS
-- [x] benchmark 计时语义拆分为 `stage_sum_us` / `whole_block_gpu_us` /
-      `host_api_wall_us` 三视图；stage 之和不再称为"总端到端时延"；
-      JSON 内 `timing_semantics` 显式记录
-- [x] 速率指标更名 `block_steps_per_second_mean`（基于整块 GPU 时间
-      均值；一个 decoder block 步 ≠ 一个模型 token）
-- [x] p=0 / p=511 benchmark 按新 schema 重新生成并提交
-- [x] 文档明确权重为固定种子合成权重；HF safetensors 摄入归属
-      Qwen bring-up
-- [x] 18/18 ctest 全绿；`compute-sanitizer` 0 错误（默认 + 泛化配置，
-      证据 `benchmarks/sanitizer_decoder_block_v011.txt`）；no-torch
-      守卫 PASS
-- [x] 标签 `v0.1.1` 已打；`main` 已推送
-- [x] 未新增模型架构、未改 W4A16 kernel 算法、未重新优化 Attention、
-      未扩大 scope
+- 24 层 decoder；Full Attention 在层 `{3, 7, 11, 15, 19, 23}`，其余 18 层为
+  Gated DeltaNet；
+- 每层全部 12 个 projection GEMV 为 W4A16（G=128 对称，q∈[-7,7]，fp16 scale，
+  bf16 源）；layernorm / conv1d / embed 等非 GEMV 张量保留 BF16
+  （两个张量按官方 checkpoint 以 FP32 直通）；
+- Full Attention：q_proj 输出融合 [q; gate]、q/k 逐头 zero-centered RMSNorm、
+  partial rotary（旋转维 64、theta=1e7）、GQA（8 query heads / 2 KV heads）、causal softmax(fp32)；
+- Gated DeltaNet：in_proj_qkv/z/b/a → depthwise causal conv1d（k=4，持久 conv
+  state）→ delta-rule 递推（持久 [16,128,128] FP32 recurrent state）→ gated
+  RMSNorm → out_proj；
+- 采样：greedy（默认）/ temperature / top-k / top-p（v0.4 冻结合同，HTTP 层
+  精确镜像）。
 
-**停止（STOP）。** 按任务简报要求，开发在 v0.1.1（架构清理）之后停止。
-以上内容均不超出单个 decoder block 的范围。下一阶段（未开始）：
-**CUDALM v0.2 — Qwen3.5 混合架构 bring-up**（含真实 HuggingFace
-checkpoint 权重摄入）。
-
-## v0.2 Phase B 完成清单（Qwen3.5 Full Attention，BF16）
-
-分支 `v0.2-qwen35`。范围 = Qwen3.5 全注意力层（layers 3/7/11/15/19/23）
-的 BF16 运行时路径：BF16 W4A16 GEMV、零中心 BF16 RMSNorm、partial RoPE
-（复制频率布局）、Q/K norm、GQA 注意力、attention gate、BF16 逐元素、
-Qwen35 KV cache、`Qwen35FullAttentionLayer`。W4A16 权重契约不变
-（G=128、q∈[-7,7]、scale FP16、FP32 累加），激活/输出走 BF16，
-**绝不静默转 FP16**。oracle = 官方 pinned transformers（`fc9137225880`）
-+ 真实 checkpoint + 同一 W4A16 反量化权重。
-
-- [x] BF16 W4A16 GEMV（`int4_gemv_bf16`）单元位级/0 错误
-- [x] 零中心 RMSNorm / split / partial RoPE / KV 写 / 注意力 / 逐元素
-      kernel 单元位级/0 错误（RoPE 对精确舍入 CPU 参考位级一致）
-- [x] 真实 checkpoint 硬门 `test_qwen35_full_attention_golden`（layer 3，
-      seed 20260209）：p=0 最差 6.1e-05、p=5（5 行非零 KV 历史）最差
-      4.9e-04，21 stage 全 PASS（tolerance 1e-2，理由见
-      `include/cudalm/stage_compare.h`）
-- [x] p=0 不变式位级成立（rope==q/k_norm、attention_raw 每头 == 对应 v 行、
-      KV 行 == stage 拷贝）；p=5 KV 历史位级 round-trip
-- [x] 旧回归全绿 + Phase A ingestion：**27/27 ctest**
-- [x] `compute-sanitizer --tool memcheck` 0 错误（kernel/GEMV 单元 +
-      bench 全层 p=0/p=5；golden 测试的 sanitizer 启动器挂起说明见
-      `benchmarks/sanitizer_qwen35_full_attention.txt`）
-- [x] no-torch 守卫 PASS（`scripts/check_no_torch.sh`）
-- [x] 时延基准 p=0/p=5 JSON 已提交（`benchmarks/results/`，报告性，非调优）
-- [x] 量化保真度 REPORT ONLY（`*.fidelity.json`，权重 cosine≈0.992、
-      层输出 cosine≈0.982），不进硬门
-- [x] 文档 + 溯源更新（`docs/qwen35_architecture.md` §5/§11.1/§14、
-      `docs/provenance.md`、本清单）
-- [x] 工作树干净；commit 已推送 `v0.2-qwen35`
-
-**停止（STOP）。** 按交接简报要求，Phase B（Full Attention）完成后停止，
-**不自动进入 Phase C（DeltaNet）**。下一阶段（未开始）：Phase C
-`Qwen35DeltaNetLayer` + state 转移硬门；Phase D 4 层混合 micro-stack。
-
- ---
-
-## v0.4：文本生成（`cudalm-generate` CLI）
-
-v0.4（Phase A/B/C，分支 `v0.4-generation`）在 Qwen3.5-0.8B 上提供
-**single-request、serial prefill** 的 token 级生成：原生 tokenizer
-（prompt → ids → 文本，oracle-exact）+ 生成核（greedy 为 Phase A/B
-冻结路径；Phase C 增加基础 sampling）+ 一个真实可用的 native CLI。
-**不是** production serving engine（无 streaming / chat template /
-batching / scheduler / Paged KV —— 见下"当前限制"）。
-
-### 用法
-
-```bash
-cmake -S . -B build && cmake --build build -j
-
-./build/cudalm-generate \
-  --model build/data/qwen35_08b_full.cudalm \
-  --tokenizer build/data/qwen35_tokenizer.cudaltk \
-  --prompt "The capital of France is" \
-  --max-new-tokens 32 \
-  --temperature 0.8 \
-  --top-k 40 \
-  --top-p 0.95 \
-  --seed 42
-```
-
-- 成功：stdout **只有生成的文本**（binary-safe / length-aware 写入：
-  原生 decode 合法产生的 embedded NUL 字节不会被截断）；错误：
-  stderr + 非零退出（1 = 运行时失败：model/tokenizer 加载、生成
-  契约；2 = 用法错误：缺参 / 坏参数 / 非法 sampling config）。
-- 模式：默认 **greedy**（冻结 Phase A 路径，bit-for-bit）；
-  `--temperature` / `--top-k` / `--top-p` 任一出现 → sampling
-  （未显式给 `--temperature` 时默认 1.0）；`--greedy` 显式关闭
-  sampling（与 sampling 参数互斥）；`--seed` 只在 sampling 模式生效
-  （相同 prompt + config + seed → 完全相同输出）。
-- `--help` 打印完整用法。
-
-### Sampling 语义（摘要）
-
-固定流水线 `temperature → top-k → top-p → normalize → sample`
-（scaled/max/exp 用 double，对任何合法有限正 temperature 都保持
-数值合法）：`logits/T`；top-k 留最高的 k 个（`top_k == 0` 禁用、
-`top_k < 0` 非法、`>vocab` 时 clamp 到 vocab，tie → 最小 id）；
-top-p 在 k 幸存者上保留 cumulative 概率达到 p 的最小前缀（≥1 个）；
-softmax 先减 max（数值稳定）。CLI 的 `--temperature` 文本若 overflow 到 inf 或
-underflow 到 0（含 `strtod` 级 underflow，如 `1e-5000`）→ usage error
-（不静默变 inf / 0/greedy）。
-详见 `docs/qwen35_architecture.md` §21。
-
-### 当前限制（v0.4 边界）
-
-single request / serial prefill（correctness-first，非性能声明）；
-无 streaming、无 chat template / 会话历史、无 batching / chunked
-prefill、无 multi-request / scheduler / continuous batching、无
-Paged KV / state pool、无 beam search / repetition / frequency /
-presence penalty / typical / min-p / speculative decoding、无 HTTP
-server / OpenAI API、无 NCU / CUDA Graph / kernel fusion / 性能调优。
-后续阶段（v0.5+）再进入。
-
-### v0.4 最终 evidence
-
-`V04_EVIDENCE_SHA = 5aba21fe0b351079850600f3f8fe7f55a77c8745` —— 完整 ctest + `scripts/check_no_torch.sh`
-+ tokenizer quick differential validation 于该 SHA（clean tree、
-HEAD == SHA）执行；失效规则：此后任何 `src/`/`include/`/`tools/`/
-`tests/`/functional CMake 修改 → evidence 失效必须重跑（仅
- docs/evidence 修改——文档 + benchmark 证据记录——不失效）。细节见
- `docs/qwen35_architecture.md` §21.6 与
-`docs/provenance.md`（v0.4 Phase C）。
-
-**sign-off**：external reviewer 判 PASS —— v0.4 正式 **DONE /
-FROZEN**，`v0.4-generation` 已 merge 进 main。
-
-## v0.7：Profile-Guided 性能优化（continuous batching serving 路径）
-
-**状态：DONE / FROZEN**（`v0.7-profile-opt` 已 merge 进 main）。
-
-v0.7 在 v0.4 的 Qwen3.5-0.8B continuous batching serving 路径上做
-**profile-driven 性能优化**（PROFILE FIRST：先量化 baseline，再按证据优化）。
-四个阶段都走完整证据链（baseline → BIT-EXACT 门 → microbench → Nsys → paired
-E2E → KEEP/REJECT），并**保持逐位精确**（full logits/token/state EXACT；不改
-数值语义、不引入 CUDA Graph、不重调 W4A16/DeltaNet）。
-
-### 阶段结论
-
-| 阶段 | 内容 | 结论 |
-|------|------|------|
-| Phase A | profiling baseline（PROFILE FIRST，无优化） | **DONE** |
-| Phase B | W4A16 GEMV row-tile 变体 | **REJECTED**（提升 selected kernels/shapes，但无稳健 E2E 收益，未进 production） |
-| Phase C | DeltaNet delta-rule 变体 | **REJECTED**（delta-rule GPU 时间大幅下降，但 paired E2E 门未过，未进 production） |
-| Phase D | **BIT-EXACT fused residual-add + RMSNorm**（post-attention 残差路径，4 处） | **KEPT**（进 production） |
-
-> Phase B / C 候选被 **REJECTED**，**不是** production 提速。v0.7 production
-> runtime 相对 Phase-A baseline 的唯一功能性改动是 Phase D 的 fused
-> add+rmsnorm（README 不堆 profiler 细节，完整数据见下链接）。
-
-### production 收益（仅列有证据支持者）
-
-- **kernels/traversal：442.6 → 418.6（−24 / traversal）**（exact，= −1 launch/层 × 24 层）
-- **host `cudaLaunchKernel`：约 −125 µs / traversal**（paired Nsys capture 下）
-- **canonical paired E2E：mean delta ≈ −1.238 ms，95% CI [−2.437, −0.040] ms**（20 对 fresh-process 配对，CI 不含 0 → KEEP）
-- 全量 ctest **63/63**、`check_no_torch` **CLEAN**、compute-sanitizer **0 errors**、full logits/token/state **EXACT**。
-
-Phase D fused kernel 为 **BIT-EXACT**（residual 与 norm 双双 `memcmp` 一致），
-冻结 RMSNorm 归约树 / 算子序不变，RMSNorm 基于**已 BF16 舍入的 residual** 计算。
-
-### 详细证据（链接）
-
-- [`docs/v07_profiling.md`](docs/v07_profiling.md) — Phase A profiling baseline
-- [`docs/v07_w4a16_optimization.md`](docs/v07_w4a16_optimization.md) — Phase B W4A16 实验（REJECTED）
-- [`docs/v07_deltanet_optimization.md`](docs/v07_deltanet_optimization.md) — Phase C DeltaNet 实验（REJECTED）
-- [`docs/v07_final_performance.md`](docs/v07_final_performance.md) — Phase D final sign-off（KEEP + 硬门 + Phase-A vs v0.7 对比）
-
-### v0.7 最终 evidence
-
-`V07D_FINAL_FUNCTIONAL_SHA = 9edd9ef6aec84b8dcf66a262652c2e285ff73793`
-（production runtime 最终态 = fused add+rmsnorm）；`V07_FINAL_HEAD =
-c5d20efe3424a82ac0c6e4b01849645c74a1aa40`（其后 commits 均为 docs/evidence-only，
-无 runtime functional drift）。完整 ctest（63/63）+ `scripts/check_no_torch.sh`
-+ compute-sanitizer 于该 SHA（clean tree、HEAD == SHA）执行；失效规则：此后任何
-`src/`/`include/`/`tools/`/`tests/`/functional CMake 修改 → evidence 失效必须重跑
-（仅 docs/evidence 修改不失效）。
-
-**sign-off**：v0.7 正式 **DONE / FROZEN**，`v0.7-profile-opt` 已 merge 进 main。
-
-## v0.8：Multi-turn / Session Runtime
-
-**状态：v0.8 DONE / FROZEN / MERGED**（Phase A + B + C + D complete，
-external review **PASS**；开发分支 `v0.8-session-runtime`（从
-`cf28abd`（v0.7 merge）创建）已 `--no-ff` merge 进 main，tag
-**`v0.8`**）。
-
-**最终冻结点**：
+**状态（session-bound path：`cudalm-chat` / `cudalm-server`）**：每个
+live sequence 同时持有 (a) Full Attention 的 Paged KV 页（默认 2
+tokens/page，可配）与 (b) DeltaNet 的 Delta slot（conv state +
+recurrent state）。在 session-bound multi-turn / serving path 中，二者
+统一绑定到 `SessionId → SequenceId` 生命周期；reset / destroy 以 Session
+为生命周期边界：
 
 ```text
-V08D_FINAL_FUNCTIONAL_SHA: 482f4ae7f7a6a0f87a42b64fb7ee7b9cd7682ab1
-V08D_FINAL_TESTED_SHA:     bd8329a62096b5f00ec3b4e483df07d3d0e6f8be
-V08_FINAL_BRANCH_HEAD:     3d212d2a8d547d5d75f37cb8b40b67989d215a46
+reset   → 状态清零（session id 不变，context 回到 0）
+destroy → sequence retire → KV 页释放 → Delta slot 释放
+multi-turn → 只追加并执行新输入，不重放历史 prompt
 ```
 
-v0.8 把"一次性 Request 生命周期"升级为 **persistent Session + multiple
-Requests/turns**：**SessionId 与 RequestId 分离**；一个 Session 跨 turn
-持有模型推理状态（Qwen3.5 hybrid：paged KV + DeltaNet conv/recurrent +
-logical position + slot/page 所有权 + lifecycle metadata）；一个 Request
-是绑定到 Session 的**临时操作** —— request 完成后 KV pages / Delta
-conv / Delta recurrent / position **全部保留**（只有 `reset_session` /
-`destroy_session` 才执行明确的 reset/release）。
+**状态（legacy one-shot path：`cudalm-generate`）**：`Qwen35Generator`
+直接使用 model-owned 的 legacy state（`model.reset_state()` /
+`model.forward_token()`），不经过 SessionManager / StateManager。两条
+path 共享同一套冻结 kernel 与数学合同，external-state path 对 legacy
+path 有 bit-exact parity 验证（要求完全一致的位置）。
 
-### Phase A：Session abstraction + persistent-state lifecycle
+**执行**：单 CUDA stream，prefill 串行，decode cohort 真 batch——
+`forward_batch_with_state` 对同一 cohort 的 B 条 sequence 一次遍历 24 层
+（B 个 logical token，1 次 model traversal）。
 
-- **新控制面**：`SessionId` / `SessionState` / `Session` /
-  `SessionManager`（`include/cudalm/session.h` + `src/runtime/session.cpp`）
-  —— 冻结 v0.5 `Qwen35StateManager` 之上的**薄非拥有绑定层**（一个
-  session == 一个 bound sequence）；池的 zero-on-release / zero-on-reset /
-  精确 byte accounting 语义**全部继承**，**未改动任何模型数学语义**；
-- **所有权迁移**：state lifetime 从 request 迁到 session —— request 完成
-  = **无 state 操作**（v0.6 request-scoped 模式冻结并存；scheduler 接入
-  属 Phase C）；
-- **overflow policy**：`fits()` context 容量纯查询；
-  `context_length + new_tokens > max_context` → **明确 reject**（无
-  eviction、不静默丢最早 token/page）；
-- **硬门**：`test_session_manager`（CPU，真实设备池：create/destroy、
-  事务式 OOM、A/B 隔离、reset 不影响他者、destroy + slot/page 复用无
-  残留、fits 精确边界、unknown-id fail loud）+
-  `test_qwen35_session_runtime`（真实 Qwen3.5-0.8B-Base checkpoint：
-  request 边界持久化 == 一次性连续 reference **bit-identical**、真实使用
-  下隔离、reset parity、destroy + 复用，全 memcmp）。
+## 5. 快速开始 / Quick Start
 
-### Phase B：incremental multi-turn execution（单 Session 真多轮）
+依赖：CMake ≥ 3.16、CUDA 11.8（以本机工具链为准）、C++17 编译器、
+官方 Qwen3.5-0.8B-Base checkpoint、Python（**仅离线转换工具使用**）。
 
-- **新 API**：`SessionGenerator::generate_turn(session_id,
-  new_input_tokens, max_new_tokens, eos_token_id, sampling, stream,
-  observer)`（`include/cudalm/session_generator.h`）—— 薄引擎，只驱动
-  冻结的 `forward_token_with_state`，**append-only**：turn 只 forward
-  新 input（从 session 当前逻辑长度起），不 re-prefill 历史、不 reset
-  session、不拷贝/重建 KV 或 Delta state；随后从既有 KV + Delta
-  conv/recurrent + position 继续生成；per-turn 全新 `Sampler`
-  （RNG 不跨 turn）；`eos_token_id == -1` = 无 EOS gate（v0.6 约定）；
-- **commit 契约（pinned）**：turn 返回的每个 generated token（**包括**
-  触发停止的 EOS / max_new 最后一个）**都已提交**进 session state ——
-  turn 后 session 的 KV / Delta / logical length 与已提交 token history
-  完全一致（无"滞后最后一 token"语义；与冻结的 v0.4 one-shot 请求
-  `N + m - 1` 契约不同，v0.4 未改）；
-- **语义**：`max_new_tokens == 0` = input-only append；EOS token 提交后
-  停止；context overflow（`length + input + max_new_tokens >
-  max_seq_len`，精确边界相等 = 接受）= **明确 reject，无
-  eviction/truncation**；preflight 失败 = **zero mutation**；执行中
-  失败（如 KV OOM）= 已提交 token 保留、失败 token 不提交、停在最后
-  成功 token 边界（无 snapshot/rollback）；
-- **硬门**：`test_session_turn_contract`（CPU，无 checkpoint：preflight
-  全失败路径逐一 zero-mutation，含 overflow reject 与精确边界接受）+
-  `test_qwen35_session_generation`（真实 Qwen3.5-0.8B-Base checkpoint：
-  **turn 1 + turn 2 == 等价 one-shot continuous execution，逐步全量
-  logits / generated ID / 长度 / paged KV / Delta conv+rec 全部
-  bit-identical**；input-only、EOS commit、overflow、reset 后重执行 ==
-  fresh、KV OOM partial-commit，全 memcmp）。
+```bash
+# ---- build（runtime 与工具） ----------------------------------------------
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 
-### Phase C：scheduler + Session 集成 / 多 session interleaving
-
-- **核心关系**：**Session = persistent model state owner；Request = one
-  scheduled turn/job**；`RequestId != SessionId != SequenceId`；**request
-  终态 ≠ session 销毁/重置**（只有 `reset_session` / `destroy_session`
-  能动 session state）；
-- **additive API**（legacy `admit()` 行为 byte-identical，未动）：
-  `Scheduler(fwd, mgr, stream, SessionManager* sessions = nullptr)` +
-  `admit_session_turn(session_id, new_input_tokens, max_new_tokens,
-  eos_token_id, sampling, &request_id)` + `session_busy(session_id)`。
-  session-bound request **绑定 session 的已有 bound sequence**（不创建
-  新 sequence、不 replay 历史、从当前 length 追加）；preflight 失败
-  （unknown session / **busy session（每 session 至多一个 live
-  request）** / 非法 token・eos・sampling / `max_new < 0` / context
-  overflow（`length + input + max_new > max_seq_len`，精确边界接受，
-  无 eviction）/ **instance identity（SessionManager 必须绑定本
-  scheduler 的 state manager，跨 manager 的 SequenceId 数值巧合不
-  会静默驱动错误 sequence）**）= **zero mutation**；
-  `max_new_tokens == 0` = input-only turn；
-- **commit 语义（hard gate，sampled != committed）**：session turn 的
-  generated token **先 forward 成功（commit）才可能触发终态** ——
-  EOS / max_new 的 stop 判定在 commit **之后**（legacy 的"采样时判定、
-  末 token 不 forward、N+m-1"冻结不变）；一个 commit m 个 generated
-  的 turn forward 共 `input + m` 次；cancel/failure 时 pending
-  （已采样未 commit）token **不进入 session 历史**，committed 状态
-  保留、session live、无 rollback；
-- **多 session batching**：session-bound request 与 legacy 共用现有
-  FIFO snapshot / one logical token per request per iteration /
-  decode cohort / **true batched forward** / batch fallback / per-
-  request sampler 隔离；每个 batch 行访问自己的 SequenceId / KV /
-  Delta slot；turn 终态后 session + sequence + KV/Delta 保留，下一
-  turn 从上一 turn 的最终 committed state 继续；
-- **硬门**：`test_qwen35_scheduler_session`（CPU：准入零 mutation 全
-  路径、不创建 sequence、terminal != retired、commit 计数、cancel /
-  failure 保留 committed、next turn 不 replay、input-only turn、legacy
-  不变）+ `test_qwen35_scheduler_session_integration`（真实
-  Qwen3.5-0.8B-Base checkpoint：session A/B 各两 turn 交错执行 vs
-  独立连续参考 —— **每步全量 logits（含 batched 行）/ generated ID /
-  turn 边界与最终 length / paged KV / Delta conv+rec 全部
-  bit-identical**；batch 证据 `batch_forward_calls == 4`、
-  `max_batch_size == 2`、`decode_cohort_trace == [1,2,2,1,2,2]`；
-  busy / overflow 零 mutation；拆除后 accounting 归零）。
-
-### Phase D：text-level multi-turn + demo + final sign-off
-
-- **text facade**（`Qwen35SessionTextGenerator`，
-  `include/cudalm/session_text_generator.h`）：薄 facade，不写
-  generation loop —— 只把冻结 contract 串起来：
-  `Qwen35Tokenizer::encode`（native，oracle-exact）→
-  `Scheduler::admit_session_turn`（Phase C session-bound，绑定已有
-  bound sequence，**append-only**）→ `Scheduler::run`（frozen
-  control plane，commit-then-stop）→ `Qwen35Tokenizer::decode`。
-  **turn N 只 encode / append 新文本**，turn 1..N-1 不 re-encode /
-  不 replay；`ok == true` 时 result 的**每个** generated id 都已
-  commit 进 session state；错误（invalid UTF-8 / unknown / busy /
-  overflow / forward failure）= fail loud，session 停在 last
-  committed boundary 且保持 LIVE（无半个 turn）；
-- **`cudalm-chat` CLI**（`tools/cudalm_chat.cpp`）：persistent
-  **raw text** 多轮 demo REPL（`--model` / `--tokenizer` /
-  `--max-new-tokens` / `--temperature` / `--top-k` / `--top-p` /
-  `--seed` / `--greedy` / `--page-tokens` / `--pages` / `--slots`）。
-  用户输入**原样（逐字节、不 trim）** encode 追加到同一 persistent
-  session（**不加** chat template / special token / separator）；
-  response fully committed 后才显示。**这是 persistent text-session
-  demo，不是完整 instruct/chat-template serving API**（Qwen3.5-0.8B-
-  Base 是 base 模型，仓库没有冻结的 official chat-template
-  contract）。**REPL 命令语义（pinned，exact whole-line
-  matching）**：命令识别**只认整行精确匹配**——`reset` / `quit` /
-  `exit` 是命令；` reset `（带空格）是 **raw text** 不是命令；
-  **只有真空行 `""` 被忽略（"empty line is ignored"）**；
-  whitespace-only 非空行（如 `"   "`）是 raw-text turn（不被 trim
-  掉）。非命令行逐字节传给 `generate_turn`（不增删任何空格 / 换行 /
-  separator / special token）。generated text 用 **length-aware
-  （binary-safe）** 写输出（embedded NUL 逐字节保留，不用 `%s`）；
-  response 末尾若无 `\n`，CLI 补一个**仅显示用**的换行（UX，**不
-  进入** session / token history）；
-- **真实 CLI 示例**（真实 checkpoint 输出）：
-
-  ```text
-  $ ./build/cudalm-chat --model build/data/qwen35_08b_full.cudalm \
-      --tokenizer build/data/qwen35_tokenizer.cudaltk --max-new-tokens 24
-  cudalm-chat: v0.8 persistent text session (session 1)
-    model: build/data/qwen35_08b_full.cudalm | sampling: greedy | max_new_tokens: 24
-    RAW TEXT contract: your input is appended VERBATIM — no
-    chat template, no special tokens, no separator. ...
-  user> The capital of France is
-  model>  located in the northern part of the country.
-  A. True
-  B. False
-    [turn 1: +5 input, +24 generated, stop max_new_tokens, context 29]
-  user> And its most famous monument is the
-  model>  Eiffel Tower.
-  A. True
-  B. False
-    [turn 2: +7 input, +24 generated, stop max_new_tokens, context 60]
-  user> quit
-  session destroyed (state released)
-  ```
-
-  （turn 2 从 turn 1 的 committed state 继续：context 29 → 60 =
-  29 + 7 + 24 精确累加；turn 2 没有 re-encode / re-forward turn 1。）
-
-- **硬门**：`test_qwen35_session_text`（CPU contract gate：真实
-  tokenizer artifact + deterministic fake forwarder + 真实池 /
-  SessionManager / Scheduler 经 facade 驱动 —— encode →
-  session-bound request → decode；turn 2 只 encode 新文本且**不
-  replay** turn 1（per-sequence step 计数证明续接）；reset 同
-  SessionId 重新开始；错误全路径零 mutation + session LIVE）+
-  `test_qwen35_session_text_e2e`（真实 checkpoint + 真实 tokenizer：
-  两轮 text turn 与**直接 token-level Phase C 路径**逐轮比较 ——
-  encoded ids / generated ids / decoded text / final context length
-  全部相同，final context 恰为 `n1 + m1 + n2 + m2`；reset /
-  overflow 零 mutation / clean teardown）。
-
-### v0.8 能力总览（portfolio 视角）
-
-| 能力 | 说明 |
-|---|---|
-| **SessionId vs RequestId** | 两个独立、单调、不复用的 id 空间（外加 SequenceId 共三个）：**Session = persistent model state owner；Request = 一次被调度的 turn/job**；request 终态 ≠ session 销毁/重置 |
-| **persistent paged KV + Delta recurrent state** | Qwen3.5-0.8B hybrid（6 full-attention 层 paged KV + 18 DeltaNet 层 conv/recurrent）的 state 跨 request 持久化；zero-on-release / zero-on-reset / 精确 byte accounting（v0.5 池冻结继承） |
-| **incremental multi-turn** | turn N 只 forward 新 input，从既有 KV + Delta + position 继续；已证明 incremental == 等价 one-shot continuous（bit-identical） |
-| **scheduler + true batched multi-session decode** | session-bound turn 经 v0.6 scheduler；多 session 交错、true batched decode cohort、per-request sampler 隔离；commit-then-stop 语义 |
-| **native tokenizer** | PyTorch-free 原生 encode/decode（CUDLMTK1 artifact，对 pinned HF oracle 全量 EXACT） |
-| **text-level multi-turn demo** | `cudalm-chat`：raw text persistent session（无 chat template），response fully committed 后显示 |
-| **sampling** | greedy / seeded temperature + top-k + top-p（per-request 全新 sampler，RNG 不跨 request/turn） |
-| **reset / destroy lifecycle** | `reset_session`（state 归零、同 SessionId、序列复用）/ `destroy_session`（释放 slot/pages；池 accounting 归零有硬门） |
-
-### v0.8 当前限制（诚实清单）
-
-- 模型为 **Qwen3.5-0.8B-Base**（base 模型；无 official chat template ——
-  仓库没有可证明的 pinned template contract，Phase D 的 text demo 是
-  raw text completion，不是 instruct serving）；
-- **无 HTTP / OpenAI-compatible API**（只有进程内 C++ API + 两个 CLI）；
-- **无 streaming**（turn 的 generated token 在 request 终态后整体可见）；
-- **无 eviction / sliding window / TTL / LRU**（context overflow =
-  明确 reject，精确边界接受）；
-- **单 CUDA stream**（池与 model 同 stream；无 multi-stream / CUDA
-  Graph）；
-- **同 Session 同时至多一个 live turn**（busy session 的第二个 live
-  request 直接 reject，fail loud）；
-- 生成循环 correctness-first：每步 host 全量 logits D2H + host 采样；
-  池容量（pages/slots）构造期固定。
-
-详见 [`docs/v08_session_runtime.md`](docs/v08_session_runtime.md)（§1–
-§12：四个 phase 的 contract、测试与验收证据）与
-[`docs/provenance.md`](docs/provenance.md)（逐 phase 的 SHA 绑定
-证据）。
-
-## v0.9：Serving Hardening
-
-### Phase A：Serving Admission / Backpressure / Resource Guardrails
-
-**状态：Phase A 完成（external review PASS / FROZEN）**（分支
-`v0.9-serving-hardening`，从 `1d6c83a`（v0.8 merge）创建；**不**在
-main 开发，**不** merge）。
-
-在冻结的 v0.8 persistent Session + Scheduler 之上增加一个**独立薄
-控制层** `ServingController`（policy / quota / admission /
-observability；frozen runtime 仍负责 correctness，零 frozen code
-改动）：
-
-- **Serving limits**（`ServingLimits`）：`max_sessions`（live session
-  配额）、`max_live_requests`（live request 配额）——**quota 三态**：
-  `-1 = unlimited`、`0 = zero capacity`（拒绝一切 admission）、
-  `N>0 = capacity N`；`max_context_tokens_per_session`（可选
-  per-session policy cap，`0 = 禁用`——它不是 quota；构造时钳制到
-  模型 `max_seq_len`——只能收紧、不能突破）；
-- **reject early / fail loud / zero mutation**：limit rejection 发生
-  在触碰 frozen runtime **之前**——no SessionId / RequestId
-  consumed、no sequence created、no KV page / Delta slot / logical-
-  length mutation；frozen Phase C preflight（identity / busy / model
-  overflow 等）仍由 scheduler 执行并原样透传，不重复实现；
-- **quota 生命周期**：request 终态（Finished / Cancelled / Failed）
-  恰好一次释放 request 配额（live 计数从 tracked id + scheduler
-  status 推导，结构上无 double-decrement 路径）；`destroy_session`
-  释放 session 配额；`reset_session` 不释放；
-- **serving stats**（刻意轻量）：`live_sessions` / `live_requests` /
-  `total_admitted_sessions` / `total_admitted_requests` /
-  `rejected_session_limit` / `rejected_request_limit` /
-  `rejected_context_limit`。
-
-Phase A **不做**：streaming、deadline / timeout、TTL / LRU、eviction、
-HTTP server、OpenAI API、multi-stream、CUDA Graph、kernel 优化、chat
-template、动态 quota 系统（streaming / deadline 已在 Phase B 做入，
-其余属后续 Phase）。
-
-### Phase B：Committed-token Streaming + Cancellation / Deadline
-
-**状态：Phase B 完成（等待 external review）**。
-
-在 `ServingController` 上增加（单线程、单 CUDA stream，无 HTTP / 无
-异步线程；不修改模型数学 / CUDA kernel / v0.8 commit-then-stop
-语义）：
-
-- **pull-based committed-token streaming**（`ServingEvent` +
-  `step_stream()` / `run_stream()` / `poll(request_id)`）：**commit-
-  before-visible**——只有 `generated[0 .. committed_generated)`
-  （forward 成功进入 Session KV / Delta / position 的 token）可
-  emit；**pending token 永不 emit**；每个 committed token
-  **exactly once、按序**；**EOS / max-new 最后 token 先 emit 再
-  报告 terminal**；继续驱动 frozen `Scheduler::step()`（不复制
-  generation loop）；**streaming 生命周期与 quota 解耦**——request
-  terminal 时 quota 立即释放，但未 drain 的 committed token /
-  terminal event 保留到被 drain exactly once（`step()` + `poll()`
-  可用；`run_stream()` 不遗失 pending events）；
-- **explicit cancellation**：cancel 后不再 forward；committed 且未
-  emit 的 prefix 可正常 drain；pending 不 emit；**Session 保持
-  live**（context / KV / Delta 停在最后 committed boundary）；quota
-  正常释放；next turn 从 boundary 继续；
-- **per-request deadline**（monotonic clock，可注入 fake clock）：
-  **每次 scheduler step 之前检查**——过期 → cancel before its next
-  forward → no additional token commit → session 保持 live；
-  **deadline = cooperative boundary between scheduler steps**（不
-  preemption）；serving-layer 独立 termination reason
-  （`deadline_exceeded`，不改 frozen `FinishReason`）；
-- **多 request streaming**：A/B 同时 live 仍走 batched decode——一次
-  step 多 request 各自新 committed token，serving 层分别 drain，无
-  跨 request contamination。
-
-Phase B streaming 目前是 **token-level（committed token IDs）**：
-text-byte streaming / incremental UTF-8 decoder / HTTP / OpenAI API /
-threads 属后续 Phase。
-
-详见 [`docs/v09_serving_hardening.md`](docs/v09_serving_hardening.md)
-与 [`docs/provenance.md`](docs/provenance.md)（SHA 绑定证据）。
-
-### Phase C：Session TTL / LRU Eviction
-
-**状态：Phase C 完成（等待 external review）**。
-
-为长期运行的 serving runtime 增加 idle tracking + TTL eviction +
-deterministic LRU eviction + session-pressure recovery + eviction
-observability。**核心原则：`eviction == destroy whole
-Session`**——policy 完全在 `ServingController`（零 frozen Scheduler /
-SessionManager / CUDA / model 改动），复用 frozen
-`SessionManager::destroy_session`：SessionId 永久失效（never
-reused）、bound Sequence retired、KV pages + Delta slot released +
-zeroed、logical context gone。**不是** context truncation——v0.8
-的 context overflow contract（REJECT）原样保持。
-
-- **默认 policy 完全不变**（`SessionEvictionPolicy{}` = TTL + LRU
-  均 disabled）：`max_sessions` reached 仍按 Phase A reject；
-- **TTL**（`idle_ttl`：`nullopt` = disabled，`0` = 一旦 idle 立即
-  eligible，`> 0` = 正常 timeout；Phase B monotonic clock，无 wall
-  clock、**无 background thread / timer**）：activity = successful
-  create / reset / admit / cancel / **deadline terminal（TTL 从
-  deadline terminal 重新锚定）** + 每个驱动该 session 非 terminal
-  request 的 step（`poll` / drain 不刷新）；
-  sweep 只在显式 maintenance point（`evict_expired_sessions()` +
-  TTL 启用时 `create_session()` 前的 lightweight sweep）；
-- **LRU**：只在 eligible idle session 中选——oldest last activity
-  first，tie → smaller SessionId first（pinned deterministic）；
-- **保护**：busy（Waiting / Running request）与 **terminal-but-
-  undrained**（Phase B 生命周期：stream 事件未消费完的 session）
-  永不自动 evict；unmanaged session（不经 controller 创建）永不
-  auto-evict；
-- **pressure admission**（仅启用 LRU pressure 后）：**严格**
-  `live_sessions == max_sessions` 时先 evict ONE eligible idle LRU
-  session 再建；无 candidate → Phase A reject（no SessionId
-  consumed、no partial mutation）；**已超限**（`live_sessions >
-  max_sessions`，如 unmanaged 占容量）→ 不 eviction、直接 Phase A
-  reject（over-limit fail-safe）；`max_sessions == 0` 永远不能被
-  eviction 绕过；
-- **transactional + fail loud**：只有 frozen destroy 成功后才
-  commit metadata + stats（只计 automatic，手工 destroy 不计）；
-  **destroy 失败 → 原始 Status 原样传播**（eviction API 是
-  **THREE-STATE**：`Status evict_expired_sessions(std::vector<
-  SessionId>*)` / `Status evict_one_lru_idle(bool*)`——ok +
-  evicted / ok + no-candidate（唯一计 `eviction_no_candidate`）/
-  ERROR = 真实 destroy 失败，**绝不**被降级成 no-candidate 或
-  静默跳过；失败时 metadata / counters / session 原样保留；
-  `create_session` 中 maintenance error 立即中止 admission）。
-
-测试：`test_serving_eviction`（CPU contract gate，A–G 含
-terminal-undrained 保护与 pressure safety gate）+
-`test_serving_eviction_integration`（真实 checkpoint 小型 gate：
-evict B → A 无污染 continuation → C fresh → pool accounting 归
-零）。详见 docs 与 provenance（SHA 绑定证据）。
-
-### Phase D：Minimal HTTP Serving + Soak/Fault Hardening + Final Sign-off
-
-**状态：Phase D 完成（v0.9 结束；等待 external review，不 merge
-main）**。
-
-`cudalm-server`：在 **frozen** 的 Phase A/B/C runtime chain 上
-（`Qwen35Model → ModelForwarder → Qwen35StateManager →
-SessionManager → Scheduler → ServingController`）加一层 **minimal
-HTTP/1.1 serving**。`Qwen35SessionTextGenerator`（v0.8 facade，自建
-Scheduler、绕过 v0.9 层）**不使用**；`cudalm-chat` 保持 frozen。
-Transport 在 `tools/common/`（tool-only，core CUDA runtime **不**
-引入 POSIX 依赖）：Linux POSIX sockets、C++17、**单线程 accept
-loop**（一次一个连接/请求，`Connection: close`），**无**
-FetchContent/Boost/Asio/httplib/libcurl/3rd-party JSON。
-
-- **CLI**：`--model --tokenizer --host --port --page-tokens
-  --pages --slots --max-sessions --max-live-requests
-  --session-ttl-ms --lru-on-pressure`；默认 `127.0.0.1`（**从不**
-  默认 0.0.0.0）；
-- **HTTP 范围**：只接受 Content-Length body；**无** request
-  chunked / keep-alive / HTTP2 / TLS / WebSocket；header/body 上限
-  64KB/64MB；socket rcv/snd 60s 超时；SIGPIPE suppressed；响应带
-  正确 Content-Length + binary-safe send（生成文本绝不过 `%s`）；
-- **API（CUDALM 自有，NOT OpenAI-compatible）**：
-  `GET /healthz` → `{"ok":true}`；`GET /v1/stats`（11 counters）；
-  `POST /v1/sessions` → 201 `{"session_id":N}`；
-  `POST /v1/sessions/<id>/reset`；`DELETE /v1/sessions/<id>`（busy
-  → 409）；`GET /v1/sessions/<id>`（summary）；
-- **Turn 合同（raw-text）**：`POST /v1/sessions/<id>/turn`（可带
-  `max_new_tokens`（默认 8）、`temperature`/`top_k`/`top_p`/
-  `seed`、`deadline_ms`（`0` = disabled））——body = 原始 UTF-8
-  bytes → tokenizer.encode（**NO trim / newline / separator /
-  chat-template / special-token 注入**）→ `admit_turn` → drive →
-  收集 committed ids → decode；同步 JSON 响应（request_id、
-  session_id、generated_token_ids、JSON-escaped generated_text、
-  finish_reason、context_length）。**Sampling 参数镜像 frozen v0.4 `cudalm-generate` 合同**：temperature/top_k/top_p 任一出现 → sampling mode（未给 temperature 默认 **1.0**，不是 0——`?top_k=40` 是 sampling，不是静默 greedy）；显式 `temperature=0`/`-0` → frozen greedy path；只给 seed → greedy（seed 被忽略）；temperature 文本 overflow 到 inf / underflow 到 0（如 `1e40`、`1e-50`、`1e-5000`）→ **400**（发生在 admission 之前）。
-- **Stream 合同**：`POST /v1/sessions/<id>/turn/stream` →
-  `Content-Type: application/x-ndjson`、`Connection: close`（无
-  Content-Length，close-delimited）；`step_stream()` 驱动，先 N 个
-  `{"type":"token","request_id":N,"token_id":M}`，再 1 个
-  `{"type":"terminal",...}`（含 generated_token_ids /
-  generated_text / context_length / deadline_exceeded）。**STRICT
-  COMMIT-BEFORE-VISIBLE**：只发 controller 已 emit 的 committed
-  事件，**不** peek `Request::generated` pending tail；**无
-  incremental text delta**（scope limit，文档明示）；
-- **Disconnect 硬化**：stream 中途客户端断开 → 不 crash；live
-  request → `cancel(rid)` + 非 stream drain/reap；committed state
-  保留、pending 不 commit、quota 释放、stream bookkeeping drained；
-  **Session 保持 LIVE**（disconnect 永不 destroy）；下一 turn 正常
-  continuation；
-- **错误合同**（稳定 JSON error body，分类来自 controller
-  Status、**不** parse 错误字符串）：400 malformed/bad param/invalid
-  UTF-8；404 未知 route/session；405 错误 method；413 body 超限；
-  415 不支持的 transfer mode；408 deadline terminal（sync turn）；
-  409 runtime/admission 冲突（含 busy session DELETE）；500
-  internal forward failure。
-
-**单线程语义（诚实声明）**：这不是并发 web server——无 worker
-pool / async reactor / epoll；一个 accept loop 串行处理请求；一个
-CUDA stream。生产并发需要明确的后续设计，不在 v0.9 范围。
-
-启动（copy-paste）：
-
-```sh
-cmake -S . -B build && cmake --build build -j
-./build/cudalm-server \
-  --model build/data/qwen35_08b_full.cudalm \
-  --tokenizer build/data/qwen35_tokenizer.cudaltk \
-  --host 127.0.0.1 --port 8080
+# ---- 一次性离线转换（Python 只在这里出现）---------------------------------
+python3 tools/convert_qwen35.py --full-model \
+    --checkpoint-dir /path/to/Qwen3.5-0.8B-Base \
+    --out build/data/qwen35_08b_full.cudalm
+python3 tools/convert_qwen35_tokenizer.py \
+    --tokenizer-dir /path/to/Qwen3.5-0.8B-Base \
+    --out build/data/qwen35_tokenizer.cudaltk
 ```
 
-curl 示例：
+## 6. 文本生成 / Multi-turn / HTTP 示例
 
-```sh
+### 6.1 原生一次性生成（`cudalm-generate`）
+
+```bash
+build/cudalm-generate \
+    --model build/data/qwen35_08b_full.cudalm \
+    --tokenizer build/data/qwen35_tokenizer.cudaltk \
+    --prompt "Explain what a paged KV cache is." \
+    --max-new-tokens 64
+# 采样模式（任一采样参数出现即进入 sampling；省略 --temperature 默认 1.0）：
+build/cudalm-generate ... --temperature 0.8 --top-k 40 --top-p 0.9 --seed 42
+# --greedy 与 --temperature/--top-k/--top-p 互斥
+```
+
+### 6.2 持久化多轮会话（`cudalm-chat`）
+
+```bash
+build/cudalm-chat \
+    --model build/data/qwen35_08b_full.cudalm \
+    --tokenizer build/data/qwen35_tokenizer.cudaltk
+```
+
+每行输入 **verbatim** 追加到同一个持久 Session（raw text，无 chat template、
+无 special token、无分隔符）；turn N 从不重新编码或前向 turn 1..N-1。模型回复
+在展示前已完整 commit 进该 Session 的 KV / Delta 状态。REPL 整行精确匹配
+`reset`（清零，同一 session id）与 `quit`/`exit`（销毁退出）。
+
+### 6.3 HTTP server（`cudalm-server`）
+
+```bash
+build/cudalm-server \
+    --model build/data/qwen35_08b_full.cudalm \
+    --tokenizer build/data/qwen35_tokenizer.cudaltk \
+    --host 127.0.0.1 --port 8080 --slots 4 --pages 64
+# 可选：--max-sessions N --max-live-requests N --session-ttl-ms N --lru-on-pressure
+```
+
+最典型的几条请求（turn 请求显式带 `Content-Type: text/plain`；完整合同、
+错误码与 NDJSON 事件格式见 `docs/v09_serving_hardening.md`）：
+
+```bash
 curl -s http://127.0.0.1:8080/healthz
-curl -s -X POST http://127.0.0.1:8080/v1/sessions
-curl -s -X POST --data "Hello" "http://127.0.0.1:8080/v1/sessions/1/turn?max_new_tokens=8"
-curl -sN -X POST --data "Second" "http://127.0.0.1:8080/v1/sessions/1/turn/stream?max_new_tokens=8"
 curl -s http://127.0.0.1:8080/v1/stats
+curl -s -X POST http://127.0.0.1:8080/v1/sessions
+# 返回 {"session_id":N} —— 下面的 1 换成实际返回的 id
+curl -s -X POST -H 'Content-Type: text/plain' \
+    --data "What is my name?" \
+    "http://127.0.0.1:8080/v1/sessions/1/turn?max_new_tokens=32"
+# 流式：NDJSON，逐 token 事件 + 终态事件（含完整 committed 文本）
+curl -s -X POST -H 'Content-Type: text/plain' \
+    --data "Why does paged KV matter?" \
+    "http://127.0.0.1:8080/v1/sessions/1/turn/stream?max_new_tokens=32"
 curl -s -X POST http://127.0.0.1:8080/v1/sessions/1/reset
 curl -s -X DELETE http://127.0.0.1:8080/v1/sessions/1
 ```
 
-**Phase D 明确限制（诚实清单）**：Qwen3.5-0.8B-**Base** raw-text
-completion——**无**官方 chat template（输出是 base model 自由
-continuation，不是 chat assistant）；**NOT OpenAI-compatible**；
-单线程/一次一个请求/单 CUDA stream；**无** TLS/auth；**无** HTTP/2、
-无 request chunked transfer、无 incremental text delta；**无**
-distributed session store、**无** persistence、**无** multi-stream、
-**无** CUDA Graph、**无** 多 GPU/多机。
+turn 查询参数：`max_new_tokens`、`temperature`、`top_k`、`top_p`、`seed`、
+`deadline_ms`（v0.4 采样合同，与 CLI 一致）。
 
-测试：`test_http_protocol`（CPU 表驱动 parser/transport）+
-`test_serving_http`（contract gate：fake forwarder + 真
-pools/SessionManager/Scheduler/controller + handler 直驱，无
-socket；HTTP committed ids == controller committed ids）+
-`test_serving_lifecycle_soak`（in-process CPU lifecycle soak，pools
-归零）+ 真实 checkpoint gate：`test_serving_http_e2e`（真实
-server + socket 全生命周期）/ `test_serving_http_disconnect`
-（Python stdlib socket：stream 中途硬断 → server 存活、
-live_requests==0、session 存活、continuation 成功）/
-`test_serving_http_soak`（bounded soak，默认 50 turns，`--iterations`
-可扩展）。详见 docs 与 provenance（SHA 绑定证据）。
+## 7. 性能 / Performance
+
+当前 release benchmark（canonical workload：4 requests、prompts 2/5/3/4、
+generated 3/6/5/3、27 logical token-forwards、动态到达；warmup=2、measured=10；
+证据 SHA `eeaef3e0b0cdd9b3dd808787e7b00f468f9b4b6a`）：
+
+| 模式 | wall mean / median | logical tok/s (mean) | model traversals | avg / max decode batch |
+|---|---|---|---|---|
+| independent / serial | 132.707 / 131.392 ms | 203.46 | 27 | 0 / 0 |
+| continuous batched | **116.064 / 115.457 ms** | **232.63** | 22 | 2.67 / 3 |
+| batched-only serving profile | 110.017 ms | 245.42 | 22 | 2.67 / 3 |
+
+同次实验（`--mode both`）serial→batched 观测差：**−16.64 ms（−12.5%）**。
+**以上结果仅对应当前硬件、checkpoint 和 canonical workload**
+（RTX 2080 Ti / CUDA 11.8），不代表通用性能提升。完整环境记录、per-run 数据、
+复现流程与 v0.7 优化案例（profile-first、KEEP/REJECT 证据纪律：fused
+residual-add + RMSNorm **KEEP**，−24 kernel launches/traversal，paired E2E
+−1.238 ms，95% CI [−2.437, −0.040]；W4A16 与 DeltaNet 候选 **REJECT**）见：
+
+- [性能与可复现性（中文）](docs/v10_performance_zh.md) ·
+  [Performance (English)](docs/v10_performance.md)
+- raw evidence：`benchmarks/v10/`（environment.txt + 两份 RAW 报告 + summary.json）
+
+## 8. 正确性与工程验证 / Correctness & Validation
+
+工程纪律（细节在各版本 sign-off 文档，README 不堆 per-version 测试数）：
+
+- **Golden numerical correctness（tolerance-based）**：所有模型数学对照
+  **pinned official / quantized oracle**（官方 Qwen3.5-0.8B-Base
+  checkpoint，transformers 钉死在固定 commit；pins 记录在
+  `docs/qwen35_architecture.md`），real-checkpoint golden 测试用**显式
+  数值容差**（bf16 stage 容差、depth-aware full-model envelope）验证——
+  不是与 oracle 的 bit-for-bit 相等；缺失 checkpoint 时 self-skip
+  （ctest 77）；
+- **Semantic parity（bit-exact where required）**：对必须完全保持行为
+  一致的路径（external-state migration 对 frozen legacy path、paged-state
+  parity、fused add+rmsnorm 对冻结 2-launch 序列、reset / interleave
+  parity）使用 bit-exact / `memcmp` 硬门；
+- **compute-sanitizer**：关键路径 0 error / 0 leak 验证记录；
+- **no-PyTorch runtime guard**：`scripts/check_no_torch.sh` 对 `include/` +
+  `src/` 硬扫描 torch / pybind 符号；
+- **Session 交叉 / 断连 / fault 测试**：多 session 交叉、客户端断连清理、
+  受控 destroy 失败注入（fail-loud）；
+- **Bounded soak**：长时轮转压力脚本（e2e / disconnect / soak 三门禁）；
+- **Exact-SHA benchmark provenance**：正式性能证据绑定 clean tree 的 exact
+  SHA + binary sha256 + 环境记录（dirty tree fail-loud）。
+
+v1.0 release validation（Phase D）分两层：
+
+- **Hosted CI**（`.github/workflows/ci.yml` → `repository-checks`）→
+  repository / static guards（no-PyTorch guard、shell/Python 语法、
+  文档相对链接、conflict-marker hygiene）。**Hosted CI ≠ full GPU
+  validation**——它不编译 CUDA、不跑 GPU 测试；
+- **Local NVIDIA release validation**（本机 NVIDIA 环境，exact-SHA
+  绑定）→ 完整 release build + full ctest（含 real-checkpoint
+  GPU/integration 与 serving gates）+ 代表性
+  `compute-sanitizer` gate。记录见
+  `docs/v10_release_validation.md`。v1.0 release validation:
+  **84 passed / 0 skipped / 0 failed**（0 errors / 0 bytes leaked）。
+
+## 9. 核心工程设计 / Engineering Decisions
+
+**Hybrid State Management** — 在 session-bound multi-turn / serving path
+（`cudalm-chat` / `cudalm-server`）中，Paged KV（Full Attention）与
+Delta conv/recurrent state（DeltaNet）统一绑定到
+`SessionId → SequenceId` 生命周期：admission 时分配、reset 时清零、
+destroy 时释放；Session 是该 path 中资源与策略的单位。CUDALM 同时保留
+frozen legacy one-shot / request-scoped execution path（`cudalm-generate`
+的 model-owned state；`Scheduler::admit()` 的 request-scoped path），
+因此 Session 不是整个引擎所有状态的唯一生命周期单位。
+
+**True Batched Execution** — 调度器的 decode cohort 执行的是
+`forward_batch_with_state` 真 batched GPU path（batched GEMV / paged
+attention / DeltaNet 递推都按 B 条 sequence 一次执行），不是"对 B 个 request
+循环跑 B 次单 forward"。canonical workload 上 27 个 logical token 只需
+22 次 model traversal（3 个 committed batch 覆盖 8 个 batched token）。
+
+**Commit-before-visible Streaming** — 硬约束：`sampled token != stream-visible
+token`。token 只有在 forward 成功、进入 Session KV / Delta / position 之后
+才能 emit；pending token 永不 emit（包括失败与取消）；EOS / max-new 的最后
+token 先 emit 再报告 terminal；每 token exactly once、按顺序；serving 层
+pull-based（只在 drive/poll 时 drain），不复制 generation loop。
+
+**Evidence-driven Optimization** — 优化流程是 profile-first：先建 Nsight
+baseline → 候选 → correctness（bit-exact 硬门禁）→ microbench → profiler →
+paired E2E（pre-specified KEEP/REJECT 判据）。v0.7 的三个候选里两个被
+REJECT——包括一个 kernel 隔离显著更快但 E2E 未过 gate 的 DeltaNet 候选。
+**更快的 kernel 不代表更快的程序；最终以 E2E wall-clock gate 决策。**
+（详见 §7 链接。）
+
+## 10. 当前限制 / Limitations
+
+- 仅支持 **Qwen3.5-0.8B-Base** 一个模型（单模型专用 runtime，不是通用框架）；
+- 单 GPU、单 CUDA stream、prefill 串行；
+- HTTP frontend：**single-threaded、一次一个 HTTP request**——底层 scheduler
+  已支持 multi-request continuous batching，但不能把底层 batching 能力描述为
+  concurrent HTTP serving；
+- **raw-text completion 语义**：输入 verbatim 追加，**无官方 Qwen chat
+  template、非 OpenAI-compatible**，也不是 ChatGPT-style conversation API；
+- 无 tensor parallel / multi-GPU / speculative decoding / CUDA Graph /
+  distributed serving；
+- 无跨进程重启的持久 session 存储（session 状态只存在于进程内存）。
+
+## 11. 仓库结构 / Repository Layout
+
+```text
+include/cudalm/   公共头文件：模型 / 状态 / 调度 / session / serving / tokenizer / weight 格式
+src/kernels/      CUDA kernels（.cu）：W4A16 & bf16 GEMV、paged KV attention、DeltaNet、RoPE、RMSNorm、fused add+rmsnorm
+src/runtime/      runtime（C++）：模型前向、state manager、scheduler、session、serving controller、weight/tokenizer loader
+tools/            CLI（cudalm-generate / cudalm-chat / cudalm-server）、HTTP serving 公共代码、离线 Python 转换工具
+tests/            CPU + GPU 测试门禁（无框架；缺 checkpoint self-skip）
+benchmarks/       benchmark 程序 + 历史证据（v0.6 / v0.7 / v10，exact-SHA 绑定）
+docs/             文档：provenance、架构契约、各版本 sign-off、性能
+scripts/          guard（check_no_torch）、profiling / benchmark 工作流
+```
+
+## 12. 技术文档 / Documentation
+
+- [系统架构总览（中文）](docs/v10_architecture_overview.md) ·
+  [Architecture Overview (English)](docs/v10_architecture_overview_en.md)
+- [性能与可复现性（中文）](docs/v10_performance_zh.md) ·
+  [Performance (English)](docs/v10_performance.md)
+- Qwen3.5 详细运行时契约（模型数学 / tensor layout / pins）→
+  `docs/qwen35_architecture.md`
+- Serving hardening（HTTP 合同 / streaming / cancel / deadline / TTL / LRU）→
+  `docs/v09_serving_hardening.md`
+- Multi-turn Session runtime → `docs/v08_session_runtime.md`
+- v0.7 profile-guided optimization（profiling baseline / W4A16 / DeltaNet /
+  final performance sign-off）→ `docs/v07_*.md`
+- Weight / tokenizer 文件格式 → `docs/weight_format.md`
+- 全版本 provenance（exact-SHA 证据链）→ `docs/provenance.md`
+- v1.0 release 工作日志 → `docs/v10_release_notes.md`
+
+## 13. Roadmap
+
+- **v1.0**：portfolio / release stabilization（当前状态）。
+- v1.0 后可能方向（**均为 future work，未开始**）：
+  - 真正的并发 HTTP frontend（multi-client / 异步 accept）；
+  - Qwen chat template / OpenAI-compatible adapter；
+  - 更高级的 inference optimization（kernel 调优、更大 batch 形态等）。
+
+---
+
+License: MIT

@@ -1,0 +1,57 @@
+# CUDALM repository checks — lightweight hosted CI.
+#
+# Scope: repository / static guards only. The full CUDALM build and
+# runtime validation requires the CUDA toolkit, an NVIDIA GPU and the
+# real Qwen3.5-0.8B-Base checkpoint, so GitHub hosted CI deliberately
+# does NOT attempt a CUDA build here. Full GPU/checkpoint correctness
+# validation is performed separately in the release NVIDIA environment
+# (see docs/v10_release_validation.md).
+
+name: repository-checks
+
+on:
+  push:
+    branches: [main, v1.0-portfolio-release]
+  pull_request:
+    branches: [main, v1.0-portfolio-release]
+
+permissions:
+  contents: read
+
+jobs:
+  repository-checks:
+    name: repository-checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: no-PyTorch runtime guard
+        run: bash scripts/check_no_torch.sh .
+
+      - name: Shell syntax check (bash -n, tracked .sh only)
+        run: |
+          files=$(git ls-files '*.sh')
+          [ -n "$files" ] || { echo "no tracked shell scripts found"; exit 1; }
+          for f in $files; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
+
+      - name: Python syntax check (py_compile only — no imports, no dependencies)
+        run: |
+          files=$(git ls-files '*.py')
+          [ -n "$files" ] || { echo "no tracked python files found"; exit 1; }
+          python3 -m py_compile $files
+          echo "py_compile OK for $(echo "$files" | wc -l) files"
+
+      - name: Markdown repository-relative link check (stdlib only)
+        run: python3 scripts/check_docs_links.py .
+
+      - name: Repository hygiene (merge-conflict markers)
+        run: |
+          if git grep -nE '^(<<<<<<< |>>>>>>> |=======$)' -- .; then
+            echo "::error::merge-conflict markers found in tracked files"
+            exit 1
+          fi
+          echo "no conflict markers"

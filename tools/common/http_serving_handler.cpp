@@ -121,6 +121,42 @@ bool parse_uint_full(const std::string& s, T* out) {
 
 }  // namespace
 
+// The turn-body CONTENT-TYPE gate (v1.0 release hygiene): the turn
+// body is ALWAYS opaque raw UTF-8 bytes (the media type never changes
+// the handling). ACCEPTED:
+//   * `text/plain` (any parameters, e.g. `; charset=utf-8`);
+//   * a MISSING Content-Type header (treated as text/plain — the
+//     documented compatibility policy for quick clients);
+//   * the `curl --data` defaults `application/x-www-form-urlencoded`
+//     and `application/octet-stream` (the body is raw bytes either
+//     way — compatibility with the documented curl examples).
+// REJECTED with 415 (before any admission / forward): everything
+// else — notably `application/json` (a JSON prompt body is NOT part
+// of the contract — the body is raw text) and `multipart/*` (no
+// multipart parsing). No content negotiation.
+bool turn_content_type_ok(const HttpRequest& req, std::string* error) {
+  const auto it = req.headers.find("content-type");
+  if (it == req.headers.end()) return true;  // missing = text/plain
+  std::string ct = it->second;
+  for (char& c : ct) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  std::size_t b = ct.find_first_not_of(" \t");
+  std::size_t e = ct.find_last_not_of(" \t");
+  if (b == std::string::npos) return true;  // an empty value = missing
+  ct = ct.substr(b, e - b + 1);
+  const std::size_t semi = ct.find(';');  // drop the parameters
+  if (semi != std::string::npos) ct = ct.substr(0, semi);
+  if (ct == "text/plain" ||
+      ct == "application/x-www-form-urlencoded" ||
+      ct == "application/octet-stream") {
+    return true;
+  }
+  *error = "unsupported Content-Type: " + it->second +
+           " (the turn body is raw text — send text/plain)";
+  return false;
+}
+
 ServingHttpApi::ServingHttpApi(const ServingHttpDeps& deps) : deps_(deps) {}
 
 bool ServingHttpApi::parse_session_path(const std::string& path,
@@ -420,7 +456,11 @@ HttpResponse ServingHttpApi::handle(const HttpRequest& req) {
       if (req.method != "POST") {
         return HttpResponse::json_error(405, "", "wrong method");
       }
+      std::string err415;
       // ---- the raw-text synchronous turn -------------------------
+      if (!turn_content_type_ok(req, &err415)) {
+        return HttpResponse::json_error(415, "", err415);
+      }
       if (req.body.empty()) {
         return HttpResponse::json_error(400, "", "empty body");
       }
@@ -542,6 +582,10 @@ bool ServingHttpApi::handle_stream(const HttpRequest& req,
   }
   if (deps_.sessions->lookup(sid) == nullptr) {
     return answer_error(404, "unknown session");
+  }
+  std::string err415;
+  if (!turn_content_type_ok(req, &err415)) {
+    return answer_error(415, err415);
   }
   if (req.body.empty()) {
     return answer_error(400, "empty body");

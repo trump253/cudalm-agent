@@ -58,6 +58,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <map>
 #include <vector>
 
@@ -68,6 +69,22 @@
 #include "cudalm/scheduler.h"
 #include "cudalm/session.h"
 #include "cudalm/serving_controller.h"
+
+namespace cudalm {
+// The test-only friend of ServingController (see the header): the
+// sole way the eviction fault-injection gate reaches the PRIVATE
+// `destroy_for_test` seam. NO production translation unit defines
+// this struct, so no production code can install the hook.
+struct ServingControllerTestSeams {
+  static void install(ServingController& ctrl,
+                      std::function<Status(SessionId)> hook) {
+    ctrl.destroy_for_test = std::move(hook);
+  }
+  static void clear(ServingController& ctrl) {
+    ctrl.destroy_for_test = {};
+  }
+};
+}  // namespace cudalm
 
 using namespace cudalm;
 
@@ -662,9 +679,10 @@ int main() {
     // A CONTROLLED destroy failure via the small test seam (a real
     // retire_sequence failure cannot be triggered non-invasively —
     // the frozen manager is not modified):
-    ctrl.destroy_for_test = [](SessionId /*id*/) {
-      return Status::error("injected destroy failure");
-    };
+    ServingControllerTestSeams::install(
+        ctrl, [](SessionId /*id*/) {
+          return Status::error("injected destroy failure");
+        });
 
     // (1) The TTL sweep: FAILS LOUD with the original Status; the
     //     failed session is left EXACTLY as it was (the transactional
@@ -710,7 +728,7 @@ int main() {
 
     // (4) Recovery: with the failure cleared, the same sweep evicts
     //     normally (the session survived the failed attempt):
-    ctrl.destroy_for_test = {};
+    ServingControllerTestSeams::clear(ctrl);
     std::vector<SessionId> evicted2;
     CHECK(ctrl.evict_expired_sessions(&evicted2).ok);
     CHECK(static_cast<int>(evicted2.size()) == 1 && evicted2[0] == B);

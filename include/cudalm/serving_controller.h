@@ -357,13 +357,6 @@ class ServingController {
   // ERROR = a real destroy failure (fail loud, the candidate is left
   // untouched, the caller must NOT count it as no-candidate).
   Status evict_one_lru_idle(bool* out_evicted);
-  // TEST SEAM (Phase C review fix — not part of the production
-  // contract): a swappable destroy hook. When EMPTY (production),
-  // the frozen SessionManager::destroy_session is used. Tests install
-  // it to inject a controlled destroy failure and verify the fail-
-  // loud Status propagation (a real retire_sequence failure cannot be
-  // triggered non-invasively — the frozen manager is not modified).
-  std::function<Status(SessionId)> destroy_for_test;
   // A session is managed + live + not busy + not
   // terminal-but-undrained.
   bool is_eviction_eligible(SessionId session_id) const;
@@ -381,6 +374,21 @@ class ServingController {
   const ServingLimits& limits() const { return limits_; }
 
  private:
+  // TEST SEAM (Phase C review fix — v1.0 release hygiene: PRIVATE,
+  // reachable ONLY through the test-only friend below — a production
+  // caller CANNOT install it; it is not part of the public API and
+  // not part of the production contract). A swappable destroy hook:
+  // when EMPTY (production), the frozen SessionManager::destroy_
+  // session is used; the eviction fault-injection test installs it
+  // to inject a controlled destroy failure and verify the fail-loud
+  // Status propagation (a real retire_sequence failure cannot be
+  // triggered non-invasively — the frozen manager is not modified).
+  std::function<Status(SessionId)> destroy_for_test;
+  // The test-only friend (DEFINED in tests/cpu/test_serving_eviction.
+  // cpp — the CPU eviction gate; no production translation unit
+  // defines it, so no production code can ever reach the hook):
+  friend struct ServingControllerTestSeams;
+
   // The live-request count DERIVED from the tracked ids + their
   // current scheduler status (no counter, no double-decrement path).
   int live_request_count() const;
