@@ -1,5 +1,5 @@
 {
-  "sha": "88d1c881c888f781c3eedebdbf45a938d6bf80e6",
+  "sha": "eeaef3e0b0cdd9b3dd808787e7b00f468f9b4b6a",
   "hardware": {
     "gpu": "NVIDIA GeForce RTX 2080 Ti (11264 MiB)",
     "nvidia_driver": "570.172.08",
@@ -28,12 +28,12 @@
   "warmup_runs": 2,
   "measured_runs": 10,
   "serial": {
-    "wall_time_s_mean": 0.134687,
-    "wall_time_s_median": 0.132533,
-    "wall_time_s_min": 0.131803,
-    "wall_time_s_max": 0.143668,
+    "wall_time_s_mean": 0.132707,
+    "wall_time_s_median": 0.131392,
+    "wall_time_s_min": 0.129797,
+    "wall_time_s_max": 0.13838,
     "logical_tokens": 27,
-    "logical_tokens_per_s_mean": 200.464647,
+    "logical_tokens_per_s_mean": 203.455273,
     "single_forward_calls": 27,
     "batch_forward_calls": 0,
     "model_traversal_calls": 27,
@@ -41,12 +41,12 @@
     "max_decode_batch_size": 0
   },
   "batched": {
-    "wall_time_s_mean": 0.121831,
-    "wall_time_s_median": 0.119209,
-    "wall_time_s_min": 0.114817,
-    "wall_time_s_max": 0.137651,
+    "wall_time_s_mean": 0.116064,
+    "wall_time_s_median": 0.115457,
+    "wall_time_s_min": 0.114167,
+    "wall_time_s_max": 0.120369,
     "logical_tokens": 27,
-    "logical_tokens_per_s_mean": 221.617976,
+    "logical_tokens_per_s_mean": 232.630374,
     "single_forward_calls": 19,
     "batch_forward_calls": 3,
     "model_traversal_calls": 22,
@@ -54,12 +54,12 @@
     "max_decode_batch_size": 3
   },
   "batched_only_serving_profile": {
-    "wall_time_s_mean": 0.109486,
-    "wall_time_s_median": 0.10853,
-    "wall_time_s_min": 0.107199,
-    "wall_time_s_max": 0.117658,
+    "wall_time_s_mean": 0.110017,
+    "wall_time_s_median": 0.109119,
+    "wall_time_s_min": 0.10792,
+    "wall_time_s_max": 0.113852,
     "logical_tokens": 27,
-    "logical_tokens_per_s_mean": 246.607712,
+    "logical_tokens_per_s_mean": 245.416445,
     "single_forward_calls": 19,
     "batch_forward_calls": 3,
     "model_traversal_calls": 22,
@@ -67,8 +67,8 @@
     "max_decode_batch_size": 3
   },
   "batched_vs_serial_delta": {
-    "wall_time_s_mean": -0.012856000000000006,
-    "logical_tokens_per_s_mean": 21.153328999999985,
+    "wall_time_s_mean": -0.01664299999999999,
+    "logical_tokens_per_s_mean": 29.175100999999984,
     "interpretation": "measured on this hardware / checkpoint / canonical workload only \u2014 not a general speedup claim"
   }
 }

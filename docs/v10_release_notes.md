@@ -159,41 +159,56 @@ content negotiation。
   `benchmarks/v10/release_batched.txt`；
 - 结果（measured on this hardware / checkpoint / canonical
   workload；RTX 2080 Ti，CUDA 11.8，driver 570.172.08，gcc 9.4，
-  Release build；evidence SHA `88d1c881c888f781c3eedebdbf45a938d6bf80e6`）：
+  Release build；evidence SHA `eeaef3e0b0cdd9b3dd808787e7b00f468f9b4b6a`）：
 
   | metric | serial | continuous batched |
   |---|---|---|
-  | wall mean / median | 0.134687 / 0.132533 s | 0.121831 / 0.119209 s |
-  | wall min / max | 0.131803 / 0.143668 s | 0.114817 / 0.137651 s |
-  | logical tok/s (mean) | 200.46 | 221.62 |
+  | wall mean / median | 0.132707 / 0.131392 s | 0.116064 / 0.115457 s |
+  | wall min / max | 0.129797 / 0.138380 s | 0.114167 / 0.120369 s |
+  | logical tok/s (mean) | 203.46 | 232.63 |
   | single / batch forward calls | 27 / 0 | 19 / 3 |
   | model traversals | 27 | 22 |
   | avg / max decode batch | 0 / 0 | 2.67 / 3 |
 
-  batched-only serving profile：mean 0.109486 s（246.61 tok/s）。
-  observed delta（both 遍）：wall **−12.86 ms（−9.5%）**，
-  +21.2 tok/s——仅本硬件/本 checkpoint/本 workload 的测量，不是
-  泛化 speedup 声明。
-- 与 frozen v0.7 sign-off 对比（同机同 checkpoint，v0.7 用
-  1 warmup + 5 measured）：serial 0.130968 → 0.134687（+2.8%）、
-  batched 0.117271 → 0.121831（+3.9%）——均在 run-to-run spread
-  内，**无 regression**（v0.9 serving / v1.0 Phase A 未改 runtime）。
+  batched-only serving profile：mean 0.110017 s（245.42 tok/s）。
+  observed delta（both 遍，同次实验比较）：wall **−16.64 ms
+  （−12.5%）**，+29.2 tok/s——仅本硬件/本 checkpoint/本 workload
+  的测量，不是泛化 speedup 声明。
+- 与历史 v0.7 sign-off 的跨版本对比（**descriptive only**，下同）：
+  v0.7（1 warmup + 5 measured，`docs/v07_final_performance.md`
+  §3.1）serial 0.130968 s、batched 0.117271 s；v1.0 点估计约
+  **+1.3% serial**（0.132707 s）、**−1.0% batched**（0.116064 s）。
+  两次测量是不同 run、不同 warmup/样本数、不同时间、非 paired
+  A/B、非交替顺序——因此只做描述性对比，**不从中得出任何
+  regression / improvement 结论**（review fix：删除了原先的
+  "no regression" 因果结论）。
 
 ### B.2 exact-SHA benchmark workflow
 
-新增 `scripts/benchmark_v10_release.sh`（tooling commit
-`88d1c881c888f781c3eedebdbf45a938d6bf80e6`）：
+`scripts/benchmark_v10_release.sh`（最终 tooling commit
+`eeaef3e0b0cdd9b3dd808787e7b00f468f9b4b6a`，含 review fix 1 的
+binary provenance 修复）：
 
 - tracked tree dirty → **fail loud**（不生成正式 evidence）；
+- **binary provenance 链**（review fix 1：executed binary 必须 ==
+  在记录的 exact source SHA 上 CMake build 的 binary）：
+  clean tree → 记录 exact HEAD SHA → `cmake --build build
+  --target bench_qwen35_continuous_batching -j8`（build /
+  up-to-date validation，build 失败 fail loud；不要求 clean
+  rebuild）→ **build 后再验 HEAD 未变** → 计算 binary sha256 →
+  运行 benchmark → **benchmark 后再验 HEAD 未变**；
 - 记录：git SHA / tree cleanliness / date / GPU / nvidia driver /
-  CUDA toolkit / host compiler / CMake build type / benchmark
-  command / model + checkpoint identity（含 sha256）/ binary sha256
-  → `benchmarks/v10/environment.txt`；
+  CUDA toolkit / host compiler / CMake build type / **build
+  command** / benchmark command / model + checkpoint identity（含
+  sha256）/ **benchmark_binary_sha256**（build 后计算）→
+  `benchmarks/v10/environment.txt`；
 - 运行两遍 benchmark → raw reports（**永远保留**）；
 - Python stdlib 解析 raw reports → `benchmarks/v10/summary.json`
   （sha / hardware / workload / serial / batched metrics /
   delta）——summary 只是 convenience view，不是唯一证据；
-- 自检：HEAD == environment.txt SHA == summary.json SHA；
+- 自检：HEAD（build 前后 + benchmark 后）== environment.txt SHA ==
+  summary.json SHA；记录的 binary sha256 == 实际执行 binary 的
+  sha256（run 后复验未漂移）；
 - 大模型文件留在 `build/data`（gitignored，**不 commit**）。
 
 v1.0 evidence 归入 `benchmarks/v10/`（不再平铺到 benchmarks/
@@ -201,7 +216,7 @@ v1.0 evidence 归入 `benchmarks/v10/`（不再平铺到 benchmarks/
 
 ### B.3 性能文档 + v0.7 case study
 
-新增 `docs/v10_performance.md`（≈2200 词，面向 GitHub 用户 /
+新增 `docs/v10_performance.md`（≈2300 词，面向 GitHub 用户 /
 面试官）：Executive Summary / Environment / 当前 v1.0 release
 benchmark（serial + continuous batched + workload 定义）/ What
 Continuous Batching Demonstrates / **v0.7 优化 case study**
@@ -229,14 +244,20 @@ speedup 写。
 
 ### Phase B 测试 / validation
 
-- benchmark executable build PASS（Release；无 C++ 源码改动，binary
-  与 Phase A 全量构建一致）；
+- benchmark executable build PASS（`cmake --build build --target
+  bench_qwen35_continuous_batching`，在记录的 exact SHA 上执行
+  build / up-to-date validation；build 前后 HEAD 复验未变）；
 - release benchmark 完整运行 PASS（两遍 + self-consistency OK，
-  SHA `88d1c881c888f781c3eedebdbf45a938d6bf80e6` 绑定）；
+  evidence 绑定 tooling SHA `eeaef3e0b0cdd9b3dd808787e7b00f468f9b4b6a`；
+  benchmark 后 HEAD 复验未变）；
+- binary provenance：executed binary 的 sha256
+  `c908f5a79438f2521ffa2f58968358939cc72c0f8333443cee2ac3e56f56f54a`
+  记录于 environment.txt 并在 run 后复验未漂移；
 - `bash scripts/check_no_torch.sh` → **CLEAN**（include/ + src/ 零
   改动，guard 复验）；
-- evidence 自洽：binary sha256 / model + checkpoint sha256 /
-  environment.txt / summary.json 同一 SHA。
+- evidence 自洽：SHA（HEAD build 前后/benchmark 后 == environment.
+  txt == summary.json）/ binary sha256 / model + checkpoint sha256
+  同一记录。
 - 按任务边界：无 C++ runtime 改动 → 不需要 full ctest /
   compute-sanitizer；不跑 profiling。
 

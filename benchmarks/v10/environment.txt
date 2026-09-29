@@ -1,6 +1,6 @@
 # CUDALM v1.0 release benchmark — environment record
-date:                 2026-09-29T07:43:38Z
-git_sha:              88d1c881c888f781c3eedebdbf45a938d6bf80e6
+date:                 2026-09-29T07:52:35Z
+git_sha:              eeaef3e0b0cdd9b3dd808787e7b00f468f9b4b6a
 git_branch:           v1.0-portfolio-release
 git_tree_clean:       yes (tracked tree clean at generation — enforced by the script)
 gpu (device 0):       NVIDIA GeForce RTX 2080 Ti (11264 MiB)
@@ -9,8 +9,9 @@ cuda_toolkit:         11.8 (V11.8.89)
 cuda_runtime:         (recorded inside each raw report: cuda_runtime / cuda_driver lines)
 host_compiler:        gcc (Ubuntu 9.4.0-1ubuntu1~20.04.2) 9.4.0
 cmake_build_type:     Release
+build_command:        cmake --build /root/code/cudalm-agent/build --target bench_qwen35_continuous_batching -j8  (run at git_sha; HEAD re-verified unchanged after the build and after the benchmark)
 benchmark_binary:     /root/code/cudalm-agent/build/benchmarks/bench_qwen35_continuous_batching
-benchmark_binary_sha256: c908f5a79438f2521ffa2f58968358939cc72c0f8333443cee2ac3e56f56f54a
+benchmark_binary_sha256: c908f5a79438f2521ffa2f58968358939cc72c0f8333443cee2ac3e56f56f54a  (computed AFTER the build at git_sha)
 model_file:           /root/code/cudalm-agent/build/data/qwen35_08b_full.cudalm
 model_file_sha256:    8637f987d0d59961c63c548e69ac8a75ff7c2a072e8d157f521bbff5b73822dd
 checkpoint_dir:       /root/models/Qwen3.5-0.8B-Base

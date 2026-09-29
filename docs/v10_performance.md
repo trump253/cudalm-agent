@@ -7,8 +7,10 @@ case study (profile-first, KEEP/REJECT discipline). It is deliberately
 short — the deep dives live in the referenced documents.
 
 **Evidence base:** everything in §3 is bound to the exact commit
-`88d1c881c888f781c3eedebdbf45a938d6bf80e6` (branch
-`v1.0-portfolio-release`, check-out-clean tracked tree) and the raw
+`eeaef3e0b0cdd9b3dd808787e7b00f468f9b4b6a` (branch
+`v1.0-portfolio-release`, check-out-clean tracked tree; the
+benchmark executable was CMake-built at this SHA and its sha256 is
+recorded in `benchmarks/v10/environment.txt`) and the raw
 reports in `benchmarks/v10/`. All numbers are **measured on this
 hardware / this checkpoint / this canonical workload** — nothing here
 is a general performance claim.
@@ -29,11 +31,11 @@ release point:
   of 27** (3 committed batches covering 8 batched tokens; avg decode
   batch size 2.67, max 3).
 - Measured on this hardware / checkpoint / workload:
-  independent/serial **0.1347 s mean** (200.5 logical tok/s) vs
-  continuous-batched **0.1218 s mean** (221.6 logical tok/s) — a
-  **−12.9 ms (−9.5%) wall-time delta** on the 27-token workload.
+  independent/serial **0.1327 s mean** (203.5 logical tok/s) vs
+  continuous-batched **0.1161 s mean** (232.6 logical tok/s) — a
+  **−16.6 ms (−12.5%) wall-time delta** on the 27-token workload.
   The batched-only serving profile (no serial interleaving in the
-  process) measures **0.1095 s mean (246.6 logical tok/s)**.
+  process) measures **0.1100 s mean (245.4 logical tok/s)**.
 - The project's optimization history is **profile-driven and
   evidence-gated**: v0.7 profiled the frozen runtime first, then
   evaluated candidates against pre-specified KEEP/REJECT criteria.
@@ -64,7 +66,7 @@ llama.cpp, production concurrent QPS, Tensor Core usage, or
 | CMake build type | Release |
 | Model | Qwen/Qwen3.5-0.8B-Base (`/root/models/Qwen3.5-0.8B-Base`), raw text, **no chat template** |
 | Converted weights | `build/data/qwen35_08b_full.cudalm` (gitignored build artifact; sha256 recorded in `benchmarks/v10/environment.txt`) |
-| Evidence SHA | `88d1c881c888f781c3eedebdbf45a938d6bf80e6` (check-out-clean tracked tree) |
+| Evidence SHA | `eeaef3e0b0cdd9b3dd808787e7b00f468f9b4b6a` (check-out-clean tracked tree; benchmark binary CMake-built at this SHA, sha256 in `environment.txt`) |
 
 The full environment record (date, exact benchmark commands, binary
 sha256, model/checkpoint sha256) is in
@@ -102,10 +104,10 @@ From `benchmarks/v10/release_serial_batched.txt` (`--mode both`):
 
 | metric | mode A — serial | mode B — continuous batched |
 |---|---|---|
-| wall time mean | **0.134687 s** | **0.121831 s** |
-| wall time median | 0.132533 s | 0.119209 s |
-| wall time min / max | 0.131803 / 0.143668 s | 0.114817 / 0.137651 s |
-| logical tok/s (mean) | 200.46 | 221.62 |
+| wall time mean | **0.132707 s** | **0.116064 s** |
+| wall time median | 0.131392 s | 0.115457 s |
+| wall time min / max | 0.129797 / 0.138380 s | 0.114167 / 0.120369 s |
+| logical tok/s (mean) | 203.46 | 232.63 |
 | single forward calls | 27 | 19 |
 | batch forward calls | 0 | 3 |
 | completed model traversals | 27 | 22 |
@@ -116,26 +118,32 @@ the independent serving-path profile, same protocol):
 
 | metric | mode B — continuous batched (batched-only process) |
 |---|---|
-| wall time mean / median | **0.109486 s / 0.108530 s** |
-| wall time min / max | 0.107199 / 0.117658 s |
-| logical tok/s (mean) | 246.61 |
+| wall time mean / median | **0.110017 s / 0.109119 s** |
+| wall time min / max | 0.107920 / 0.113852 s |
+| logical tok/s (mean) | 245.42 |
 | single / batch forward calls | 19 / 3 |
 | completed model traversals | 22 |
 | avg / max decode batch size | 2.67 / 3 |
 
 **Observed delta (batched vs serial, `--mode both` run):**
-wall time **−12.86 ms (−9.5%)** on the 27-token workload; logical
-throughput **+21.2 tok/s**. The per-run wall times are in the raw
-reports (run-to-run spread ±4–9% — normal on this desktop machine).
+wall time **−16.64 ms (−12.5%)** on the 27-token workload; logical
+throughput **+29.2 tok/s**. The per-run wall times are in the raw
+reports (run-to-run min–max spread ≈5–7% — normal on this desktop machine).
 This delta is a property of **this hardware / checkpoint / canonical
 workload**, not a general "CUDALM is X% faster than serial" claim.
 
-**Consistency with the frozen v0.7 sign-off** (same machine /
-checkpoint, v0.7 protocol 1 warmup + 5 measured,
-`docs/v07_final_performance.md` §3.1): serial 0.130968 s → v1.0
-0.134687 s (+2.8%); batched 0.117271 s → v1.0 0.121831 s (+3.9%).
-Both within the run-to-run spread recorded above — **no regression**
-introduced by the v0.9 serving hardening or the v1.0 Phase A hygiene.
+**Historical comparison with the frozen v0.7 sign-off
+(descriptive only).** The historical v0.7 measurements
+(`docs/v07_final_performance.md` §3.1, same machine / checkpoint,
+v0.7 protocol 1 warmup + 5 measured): serial 0.130968 s, batched
+0.117271 s. The v1.0 point estimates are approximately **+1.3%
+serial** (0.132707 s) and **−1.0% batched** (0.116064 s) relative
+to those historical values. The measurements were collected in
+separate runs with different warmup/sample counts and are **not a
+paired A/B experiment** (different dates, no alternation, no
+pairing). Therefore this comparison is descriptive only; **no
+regression or improvement is attributed** from these cross-version
+point estimates.
 
 The full parse is in `benchmarks/v10/summary.json` (a convenience
 view — the raw reports are the evidence).
@@ -257,7 +265,7 @@ Evidence (`docs/v07_final_performance.md` §2, bound to exact SHAs):
 ```bash
 # 1. at the evidence SHA (any check-out-clean tree works):
 git checkout v1.0-portfolio-release
-git checkout 88d1c881c888f781c3eedebdbf45a938d6bf80e6   # the evidence SHA
+git checkout eeaef3e0b0cdd9b3dd808787e7b00f468f9b4b6a   # the evidence SHA
 
 # 2. configure + build (inside an existing build dir or a fresh one)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -302,7 +310,7 @@ times. The v0.7 evidence reproduction commands are in the v0.7 docs.
   deliberately reports none. (Its correctness contract is covered by
   the v0.9/v1.0 CPU + e2e gates, not by performance claims.)
 - **Small-workload statistics.** 27 tokens is a micro-workload; the
-  per-run wall spread (±4–9%) is comparable to the batched-vs-serial
+  per-run wall spread (≈5–7% min–max) is comparable to the batched-vs-serial
   delta. The v0.7 paired A/B (20 fresh-process pairs) is the
   statistically binding evidence for the only optimization this
   project kept — this release benchmark is a reproducibility
