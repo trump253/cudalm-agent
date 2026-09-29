@@ -693,9 +693,15 @@ zeroed、logical context gone。**不是** context truncation——v0.8
   max_sessions`，如 unmanaged 占容量）→ 不 eviction、直接 Phase A
   reject（over-limit fail-safe）；`max_sessions == 0` 永远不能被
   eviction 绕过；
-- **transactional**：只有 frozen destroy 成功后才更新 metadata +
-  stats（`evicted_sessions_ttl` / `evicted_sessions_lru` /
-  `eviction_no_candidate`——只计 automatic，手工 destroy 不计）。
+- **transactional + fail loud**：只有 frozen destroy 成功后才
+  commit metadata + stats（只计 automatic，手工 destroy 不计）；
+  **destroy 失败 → 原始 Status 原样传播**（eviction API 是
+  **THREE-STATE**：`Status evict_expired_sessions(std::vector<
+  SessionId>*)` / `Status evict_one_lru_idle(bool*)`——ok +
+  evicted / ok + no-candidate（唯一计 `eviction_no_candidate`）/
+  ERROR = 真实 destroy 失败，**绝不**被降级成 no-candidate 或
+  静默跳过；失败时 metadata / counters / session 原样保留；
+  `create_session` 中 maintenance error 立即中止 admission）。
 
 测试：`test_serving_eviction`（CPU contract gate，A–G 含
 terminal-undrained 保护与 pressure safety gate）+

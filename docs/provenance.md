@@ -2191,6 +2191,61 @@ fail-safe）
   --output-on-failure` → **18/18 PASS**（Total 22.10 s）；
 - 零 frozen code 改动 → 免 full ctest / sanitizer / profiling。
 
+### Phase C review fix 2（destroy failure FAILS LOUD——Status
+三态传播）
+
+**External review blocker**：`evict_session_` 把真实的
+`SessionManager::destroy_session` 失败降级成普通 `bool false`
+——TTL sweep 静默跳过、LRU 可能继续找下一个 candidate、pressure
+admission 可能把底层 ERROR 报成 `eviction_no_candidate` / session
+limit——违反 pinned 的 "destroy failure → fail loud"。
+
+**修复**（仅 ServingController Phase C eviction API /
+bookkeeping）：eviction API 改 **THREE-STATE Status** 语义——
+
+- `Status evict_session_(sid, by_ttl)`：原始 Status **原样
+  传播**；transactional invariant pinned——失败时 activity
+  metadata 不删、`evicted_sessions_ttl` / `evicted_sessions_lru` /
+  `eviction_no_candidate` 都不动、Session record 保持现状；成功
+  后才 commit metadata + counters；
+- `Status evict_expired_sessions(vector<SessionId>*)`：ok +
+  evicted ids（空 sweep = ok + empty，**不是** error）；ERROR =
+  第一个真实 destroy 失败（sweep **停止**、原样传播）；
+- `Status evict_one_lru_idle(bool*)`：ok + true = 成功；ok +
+  false = **no candidate（唯一计 `eviction_no_candidate` 的
+  态）**；ERROR = 真实失败（**绝不**计 no-candidate）；
+- `create_session`：TTL maintenance sweep error → **立即返回该
+  error**（不继续 admission）；LRU pressure error → 原样传播。
+
+**可测试性**：真实 `retire_sequence` failure 无法无侵入诱发
+（eligibility 同线程保证 liveness）——controller 加了一个明确
+标注的**小 test seam**（`destroy_for_test`，生产为空 → frozen
+`SessionManager::destroy_session`）注入受控失败；**不修改**
+frozen SessionManager / Scheduler / CUDA / model。
+
+**Commit**：
+
+- Functional: `076fe5f414d04caaf69fee188c1f0f0066fce11c`
+- Tests: `9f46feb097bcb5cb06ad04f008d0c4fdf976aead`
+  （`test_serving_eviction` 新增 Case J：TTL sweep fail loud
+  （原始 Status 表面化、失败 session 原样保留、metadata 保留、
+  evicted counters 不动）；LRU 的 ERROR != no-candidate
+  （`eviction_no_candidate` 不动）；`create_session` 中
+  maintenance error 立即中止（不尝试 admission、
+  `rejected_session_limit` 不动、无 SessionId consumed）；
+  failure 清除后 sweep 正常 evict；全部既有调用点 + 真实
+  checkpoint gate 更新到新 Status API）
+
+**验收**（本地验证，非 CI）：
+
+- `test_serving_eviction` → **PASS**（16 个 [ok]）；
+- 回归：`test_serving_admission` / `test_serving_streaming` /
+  `test_serving_integration` / `test_serving_stream_integration` /
+  `test_serving_eviction_integration` → 全部 **PASS**；
+- targeted `ctest -R "evict|serving|stream|scheduler|session"
+  --output-on-failure` → **18/18 PASS**（Total 21.44 s）；
+- 零 frozen code 改动 → 免 full ctest / sanitizer / profiling。
+
 **Phase C 明确不做**（non-goals）：HTTP server、OpenAI-compatible
 API、text-byte streaming、async threads、background timer thread、
 distributed session store、session persistence to disk、KV swap-

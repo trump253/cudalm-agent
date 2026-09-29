@@ -374,10 +374,24 @@ struct SessionEvictionPolicy {
 };
 // 构造：ServingController(..., MonotonicClock* clock = nullptr,
 //                              SessionEvictionPolicy policy = {})
-// 显式 maintenance API：
-std::vector<SessionId> evict_expired_sessions();  // TTL sweep
-bool evict_one_lru_idle();                        // 显式 LRU
+// 显式 maintenance API（review fix：THREE-STATE Status 语义）：
+Status evict_expired_sessions(std::vector<SessionId>* out_evicted);
+Status evict_one_lru_idle(bool* out_evicted);
 bool is_eviction_eligible(SessionId);             // idle + safe
+```
+
+**THREE-STATE（pinned，review fix）**：
+
+```text
+ok + evicted  ids          = 成功 evict（空 sweep = ok + empty，
+                             不是 error——no-candidate 不是错误）
+ok + no candidate          = evict_one_lru_idle 的 *out == false
+                             （只有这一态才 eviction_no_candidate++）
+ERROR                    = 底层 destroy 真实失败——FAIL LOUD：
+                             原始 Status 原样传播、sweep 停止、
+                             失败 session 原样保留（transactional
+                             invariant）；**绝不**被降级成
+                             no-candidate / 静默跳过
 ```
 
 **无 background thread / timer**——TTL sweep 只在明确 maintenance
@@ -450,11 +464,35 @@ protected（busy）。
 - `max_sessions == 0` **永远**不能靠 eviction 绕过 zero-capacity
   contract。
 
-### 13.7 Transactional 语义
+### 13.7 Transactional 语义（fail loud，review fix pinned）
 
-只有 frozen `destroy_session` **成功**后才：删除 activity
-metadata + eviction counter++ + 记录 evicted id。destroy 失败 →
-fail loud、metadata 保留、不假装成功。SessionId never reused。
+只有 frozen `destroy_session` **成功**后才 commit：删除 activity
+metadata + eviction counter++ + 记录 evicted id。
+
+**destroy 失败**（真实 retire/destroy error）→ **原始 Status
+原样传播**（fail loud——pinned contract；review fix：之前被 bool
+降级成普通 `false`，TTL sweep 静默跳过 / LRU 继续找下一个 /
+pressure admission 可能报成 no-candidate——已修复）：
+
+```text
+activity metadata 不删除
+evicted_sessions_ttl 不增加
+evicted_sessions_lru 不增加
+eviction_no_candidate 不增加（ERROR != no-candidate）
+Session record 保持现状
+```
+
+`create_session` 中：TTL maintenance sweep 的 error → **立即返回
+该 error**（不继续 admission）；LRU pressure 的 error → 立即返回
+真实 error（不是 limit reject、不是 no-candidate）。
+
+SessionId never reused。
+
+**可测试性**：真实 `retire_sequence` failure 无法无侵入诱发
+（eligibility 在同线程保证 liveness），因此 controller 有一个
+明确标注的**小 test seam**（`destroy_for_test`，生产为空 → 走
+frozen `SessionManager::destroy_session`）用于注入受控失败验证
+Status 传播；**不修改** frozen SessionManager。
 
 ### 13.8 Stats（additive）
 
@@ -487,6 +525,14 @@ fail loud、metadata 保留、不假装成功。SessionId never reused。
   max_sessions`（unmanaged 占容量）→ create reject 且**不**
   eviction（no id consumed、no pool mutation、eligible managed
   session 存活）；
+  J. **review fix（fail loud）**：经小 test seam 注入受控 destroy
+  failure——TTL sweep 返回**原始 Status**（失败 session 原样保留、
+  metadata 保留、两个 evicted counter 不动）；`evict_one_lru_idle`
+  的 ERROR **不**被报成 no-candidate（`eviction_no_candidate` 不
+  动）；`create_session` 中 maintenance error **立即中止** create
+  （不尝试 admission、`rejected_session_limit` 不动、无 SessionId
+  consumed）；failure 清除后同一 sweep 正常 evict（失败尝试留下
+  的 session 完好）；
 - **`test_serving_eviction_integration`**（真实 Qwen3.5-0.8B-Base
   checkpoint，小型 gate——不做深度 KV/Delta memcmp）：B（2+2）
   先跑、A（3+2）后跑（A 更 recent）→ fake-clock TTL sweep 只 evict
