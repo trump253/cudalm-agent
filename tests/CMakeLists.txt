@@ -484,6 +484,58 @@ add_test(NAME test_serving_stream_integration
 set_tests_properties(test_serving_stream_integration PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+# --- v0.9 Phase C: session TTL / LRU eviction ----------------------------
+# EVICTION == DESTROY THE WHOLE SESSION (never context truncation);
+# the policy lives in the ServingController (the frozen Scheduler /
+# SessionManager semantics are untouched); the DEFAULT policy is
+# DISABLED (exactly the Phase A behavior).
+#
+# test_serving_eviction (CPU — NO checkpoint / NO model: the
+# deterministic fake forwarder + real pools + real SessionManager /
+# Scheduler + a FAKE monotonic clock):
+#   * A. TTL: the older idle session expires + is evicted (SessionId
+#     invalidated forever; KV/Delta accounting released); the recently
+#     active session survives with intact state/length; a session
+#     reusing the evicted Delta slot sees a ZEROED slot (the slot is
+#     patterned before the eviction — no stale contamination);
+#   * B. BUSY: a TTL-expired session with a live request is PROTECTED
+#     (no cancel, no mutation);
+#   * C. TERMINAL-BUT-UNDRAINED (the Phase B lifecycle, the Phase C
+#     hard contract): a session whose request is terminal but whose
+#     stream events are not yet drained are PROTECTED from the sweep —
+#     evictable only after the events are fully drained;
+#   * D. LRU-on-session-pressure: at max_sessions, ONE eligible idle
+#     LRU session (oldest activity; ties: smaller SessionId) is
+#     evicted and the new session is created (fresh monotonic id);
+#   * E. NO CANDIDATE: busy + terminal-undrained -> the pressure
+#     create REJECTS (no SessionId consumed, no pool mutation, both
+#     untouched — the pressure safety gate);
+#   * F. DEFAULT policy: max_sessions reached still REJECTS (no silent
+#     eviction);
+#   * G. UNMANAGED sessions (created directly on the manager) are
+#     never guessed, never auto-evicted (they still occupy the limit).
+cudalm_add_test(test_serving_eviction test_serving_eviction
+                cpu/test_serving_eviction.cpp)
+
+# test_serving_eviction_integration (CUDA, REAL Qwen3.5-0.8B-Base
+# checkpoint): a small real-runtime gate — the eviction policy and
+# persistent sessions COEXIST: two real turns (A then B, A the more
+# recent activity), a fake-clock TTL sweep evicts ONLY the idle B, the
+# evicted session cannot continue, A CONTINUES to the next turn from
+# its committed state, a fresh C generates fresh; clean teardown (pool
+# accounting to zero). Self-skips (77).
+add_executable(test_serving_eviction_integration
+               cuda/test_serving_eviction_integration.cpp)
+target_link_libraries(test_serving_eviction_integration PRIVATE cudalm)
+add_test(NAME test_serving_eviction_integration
+         COMMAND test_serving_eviction_integration
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_serving_eviction_integration PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 # --- Cross-language weight-file tests (Python tools -> C++ loader) ------------
 # tools/convert_weights.py (torch, offline) emits data/block_v01.cudalm into
 # the build tree; test_weights_crosslang loads it with the PyTorch-free C++
