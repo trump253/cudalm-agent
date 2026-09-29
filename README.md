@@ -577,3 +577,237 @@ conv / Delta recurrent / position **全部保留**（只有 `reset_session` /
 §12：四个 phase 的 contract、测试与验收证据）与
 [`docs/provenance.md`](docs/provenance.md)（逐 phase 的 SHA 绑定
 证据）。
+
+## v0.9：Serving Hardening
+
+### Phase A：Serving Admission / Backpressure / Resource Guardrails
+
+**状态：Phase A 完成（external review PASS / FROZEN）**（分支
+`v0.9-serving-hardening`，从 `1d6c83a`（v0.8 merge）创建；**不**在
+main 开发，**不** merge）。
+
+在冻结的 v0.8 persistent Session + Scheduler 之上增加一个**独立薄
+控制层** `ServingController`（policy / quota / admission /
+observability；frozen runtime 仍负责 correctness，零 frozen code
+改动）：
+
+- **Serving limits**（`ServingLimits`）：`max_sessions`（live session
+  配额）、`max_live_requests`（live request 配额）——**quota 三态**：
+  `-1 = unlimited`、`0 = zero capacity`（拒绝一切 admission）、
+  `N>0 = capacity N`；`max_context_tokens_per_session`（可选
+  per-session policy cap，`0 = 禁用`——它不是 quota；构造时钳制到
+  模型 `max_seq_len`——只能收紧、不能突破）；
+- **reject early / fail loud / zero mutation**：limit rejection 发生
+  在触碰 frozen runtime **之前**——no SessionId / RequestId
+  consumed、no sequence created、no KV page / Delta slot / logical-
+  length mutation；frozen Phase C preflight（identity / busy / model
+  overflow 等）仍由 scheduler 执行并原样透传，不重复实现；
+- **quota 生命周期**：request 终态（Finished / Cancelled / Failed）
+  恰好一次释放 request 配额（live 计数从 tracked id + scheduler
+  status 推导，结构上无 double-decrement 路径）；`destroy_session`
+  释放 session 配额；`reset_session` 不释放；
+- **serving stats**（刻意轻量）：`live_sessions` / `live_requests` /
+  `total_admitted_sessions` / `total_admitted_requests` /
+  `rejected_session_limit` / `rejected_request_limit` /
+  `rejected_context_limit`。
+
+Phase A **不做**：streaming、deadline / timeout、TTL / LRU、eviction、
+HTTP server、OpenAI API、multi-stream、CUDA Graph、kernel 优化、chat
+template、动态 quota 系统（streaming / deadline 已在 Phase B 做入，
+其余属后续 Phase）。
+
+### Phase B：Committed-token Streaming + Cancellation / Deadline
+
+**状态：Phase B 完成（等待 external review）**。
+
+在 `ServingController` 上增加（单线程、单 CUDA stream，无 HTTP / 无
+异步线程；不修改模型数学 / CUDA kernel / v0.8 commit-then-stop
+语义）：
+
+- **pull-based committed-token streaming**（`ServingEvent` +
+  `step_stream()` / `run_stream()` / `poll(request_id)`）：**commit-
+  before-visible**——只有 `generated[0 .. committed_generated)`
+  （forward 成功进入 Session KV / Delta / position 的 token）可
+  emit；**pending token 永不 emit**；每个 committed token
+  **exactly once、按序**；**EOS / max-new 最后 token 先 emit 再
+  报告 terminal**；继续驱动 frozen `Scheduler::step()`（不复制
+  generation loop）；**streaming 生命周期与 quota 解耦**——request
+  terminal 时 quota 立即释放，但未 drain 的 committed token /
+  terminal event 保留到被 drain exactly once（`step()` + `poll()`
+  可用；`run_stream()` 不遗失 pending events）；
+- **explicit cancellation**：cancel 后不再 forward；committed 且未
+  emit 的 prefix 可正常 drain；pending 不 emit；**Session 保持
+  live**（context / KV / Delta 停在最后 committed boundary）；quota
+  正常释放；next turn 从 boundary 继续；
+- **per-request deadline**（monotonic clock，可注入 fake clock）：
+  **每次 scheduler step 之前检查**——过期 → cancel before its next
+  forward → no additional token commit → session 保持 live；
+  **deadline = cooperative boundary between scheduler steps**（不
+  preemption）；serving-layer 独立 termination reason
+  （`deadline_exceeded`，不改 frozen `FinishReason`）；
+- **多 request streaming**：A/B 同时 live 仍走 batched decode——一次
+  step 多 request 各自新 committed token，serving 层分别 drain，无
+  跨 request contamination。
+
+Phase B streaming 目前是 **token-level（committed token IDs）**：
+text-byte streaming / incremental UTF-8 decoder / HTTP / OpenAI API /
+threads 属后续 Phase。
+
+详见 [`docs/v09_serving_hardening.md`](docs/v09_serving_hardening.md)
+与 [`docs/provenance.md`](docs/provenance.md)（SHA 绑定证据）。
+
+### Phase C：Session TTL / LRU Eviction
+
+**状态：Phase C 完成（等待 external review）**。
+
+为长期运行的 serving runtime 增加 idle tracking + TTL eviction +
+deterministic LRU eviction + session-pressure recovery + eviction
+observability。**核心原则：`eviction == destroy whole
+Session`**——policy 完全在 `ServingController`（零 frozen Scheduler /
+SessionManager / CUDA / model 改动），复用 frozen
+`SessionManager::destroy_session`：SessionId 永久失效（never
+reused）、bound Sequence retired、KV pages + Delta slot released +
+zeroed、logical context gone。**不是** context truncation——v0.8
+的 context overflow contract（REJECT）原样保持。
+
+- **默认 policy 完全不变**（`SessionEvictionPolicy{}` = TTL + LRU
+  均 disabled）：`max_sessions` reached 仍按 Phase A reject；
+- **TTL**（`idle_ttl`：`nullopt` = disabled，`0` = 一旦 idle 立即
+  eligible，`> 0` = 正常 timeout；Phase B monotonic clock，无 wall
+  clock、**无 background thread / timer**）：activity = successful
+  create / reset / admit / cancel / **deadline terminal（TTL 从
+  deadline terminal 重新锚定）** + 每个驱动该 session 非 terminal
+  request 的 step（`poll` / drain 不刷新）；
+  sweep 只在显式 maintenance point（`evict_expired_sessions()` +
+  TTL 启用时 `create_session()` 前的 lightweight sweep）；
+- **LRU**：只在 eligible idle session 中选——oldest last activity
+  first，tie → smaller SessionId first（pinned deterministic）；
+- **保护**：busy（Waiting / Running request）与 **terminal-but-
+  undrained**（Phase B 生命周期：stream 事件未消费完的 session）
+  永不自动 evict；unmanaged session（不经 controller 创建）永不
+  auto-evict；
+- **pressure admission**（仅启用 LRU pressure 后）：**严格**
+  `live_sessions == max_sessions` 时先 evict ONE eligible idle LRU
+  session 再建；无 candidate → Phase A reject（no SessionId
+  consumed、no partial mutation）；**已超限**（`live_sessions >
+  max_sessions`，如 unmanaged 占容量）→ 不 eviction、直接 Phase A
+  reject（over-limit fail-safe）；`max_sessions == 0` 永远不能被
+  eviction 绕过；
+- **transactional + fail loud**：只有 frozen destroy 成功后才
+  commit metadata + stats（只计 automatic，手工 destroy 不计）；
+  **destroy 失败 → 原始 Status 原样传播**（eviction API 是
+  **THREE-STATE**：`Status evict_expired_sessions(std::vector<
+  SessionId>*)` / `Status evict_one_lru_idle(bool*)`——ok +
+  evicted / ok + no-candidate（唯一计 `eviction_no_candidate`）/
+  ERROR = 真实 destroy 失败，**绝不**被降级成 no-candidate 或
+  静默跳过；失败时 metadata / counters / session 原样保留；
+  `create_session` 中 maintenance error 立即中止 admission）。
+
+测试：`test_serving_eviction`（CPU contract gate，A–G 含
+terminal-undrained 保护与 pressure safety gate）+
+`test_serving_eviction_integration`（真实 checkpoint 小型 gate：
+evict B → A 无污染 continuation → C fresh → pool accounting 归
+零）。详见 docs 与 provenance（SHA 绑定证据）。
+
+### Phase D：Minimal HTTP Serving + Soak/Fault Hardening + Final Sign-off
+
+**状态：Phase D 完成（v0.9 结束；等待 external review，不 merge
+main）**。
+
+`cudalm-server`：在 **frozen** 的 Phase A/B/C runtime chain 上
+（`Qwen35Model → ModelForwarder → Qwen35StateManager →
+SessionManager → Scheduler → ServingController`）加一层 **minimal
+HTTP/1.1 serving**。`Qwen35SessionTextGenerator`（v0.8 facade，自建
+Scheduler、绕过 v0.9 层）**不使用**；`cudalm-chat` 保持 frozen。
+Transport 在 `tools/common/`（tool-only，core CUDA runtime **不**
+引入 POSIX 依赖）：Linux POSIX sockets、C++17、**单线程 accept
+loop**（一次一个连接/请求，`Connection: close`），**无**
+FetchContent/Boost/Asio/httplib/libcurl/3rd-party JSON。
+
+- **CLI**：`--model --tokenizer --host --port --page-tokens
+  --pages --slots --max-sessions --max-live-requests
+  --session-ttl-ms --lru-on-pressure`；默认 `127.0.0.1`（**从不**
+  默认 0.0.0.0）；
+- **HTTP 范围**：只接受 Content-Length body；**无** request
+  chunked / keep-alive / HTTP2 / TLS / WebSocket；header/body 上限
+  64KB/64MB；socket rcv/snd 60s 超时；SIGPIPE suppressed；响应带
+  正确 Content-Length + binary-safe send（生成文本绝不过 `%s`）；
+- **API（CUDALM 自有，NOT OpenAI-compatible）**：
+  `GET /healthz` → `{"ok":true}`；`GET /v1/stats`（11 counters）；
+  `POST /v1/sessions` → 201 `{"session_id":N}`；
+  `POST /v1/sessions/<id>/reset`；`DELETE /v1/sessions/<id>`（busy
+  → 409）；`GET /v1/sessions/<id>`（summary）；
+- **Turn 合同（raw-text）**：`POST /v1/sessions/<id>/turn`（可带
+  `max_new_tokens`（默认 8）、`temperature`/`top_k`/`top_p`/
+  `seed`、`deadline_ms`（`0` = disabled））——body = 原始 UTF-8
+  bytes → tokenizer.encode（**NO trim / newline / separator /
+  chat-template / special-token 注入**）→ `admit_turn` → drive →
+  收集 committed ids → decode；同步 JSON 响应（request_id、
+  session_id、generated_token_ids、JSON-escaped generated_text、
+  finish_reason、context_length）。**Sampling 参数镜像 frozen v0.4 `cudalm-generate` 合同**：temperature/top_k/top_p 任一出现 → sampling mode（未给 temperature 默认 **1.0**，不是 0——`?top_k=40` 是 sampling，不是静默 greedy）；显式 `temperature=0`/`-0` → frozen greedy path；只给 seed → greedy（seed 被忽略）；temperature 文本 overflow 到 inf / underflow 到 0（如 `1e40`、`1e-50`、`1e-5000`）→ **400**（发生在 admission 之前）。
+- **Stream 合同**：`POST /v1/sessions/<id>/turn/stream` →
+  `Content-Type: application/x-ndjson`、`Connection: close`（无
+  Content-Length，close-delimited）；`step_stream()` 驱动，先 N 个
+  `{"type":"token","request_id":N,"token_id":M}`，再 1 个
+  `{"type":"terminal",...}`（含 generated_token_ids /
+  generated_text / context_length / deadline_exceeded）。**STRICT
+  COMMIT-BEFORE-VISIBLE**：只发 controller 已 emit 的 committed
+  事件，**不** peek `Request::generated` pending tail；**无
+  incremental text delta**（scope limit，文档明示）；
+- **Disconnect 硬化**：stream 中途客户端断开 → 不 crash；live
+  request → `cancel(rid)` + 非 stream drain/reap；committed state
+  保留、pending 不 commit、quota 释放、stream bookkeeping drained；
+  **Session 保持 LIVE**（disconnect 永不 destroy）；下一 turn 正常
+  continuation；
+- **错误合同**（稳定 JSON error body，分类来自 controller
+  Status、**不** parse 错误字符串）：400 malformed/bad param/invalid
+  UTF-8；404 未知 route/session；405 错误 method；413 body 超限；
+  415 不支持的 transfer mode；408 deadline terminal（sync turn）；
+  409 runtime/admission 冲突（含 busy session DELETE）；500
+  internal forward failure。
+
+**单线程语义（诚实声明）**：这不是并发 web server——无 worker
+pool / async reactor / epoll；一个 accept loop 串行处理请求；一个
+CUDA stream。生产并发需要明确的后续设计，不在 v0.9 范围。
+
+启动（copy-paste）：
+
+```sh
+cmake -S . -B build && cmake --build build -j
+./build/cudalm-server \
+  --model build/data/qwen35_08b_full.cudalm \
+  --tokenizer build/data/qwen35_tokenizer.cudaltk \
+  --host 127.0.0.1 --port 8080
+```
+
+curl 示例：
+
+```sh
+curl -s http://127.0.0.1:8080/healthz
+curl -s -X POST http://127.0.0.1:8080/v1/sessions
+curl -s -X POST --data "Hello" "http://127.0.0.1:8080/v1/sessions/1/turn?max_new_tokens=8"
+curl -sN -X POST --data "Second" "http://127.0.0.1:8080/v1/sessions/1/turn/stream?max_new_tokens=8"
+curl -s http://127.0.0.1:8080/v1/stats
+curl -s -X POST http://127.0.0.1:8080/v1/sessions/1/reset
+curl -s -X DELETE http://127.0.0.1:8080/v1/sessions/1
+```
+
+**Phase D 明确限制（诚实清单）**：Qwen3.5-0.8B-**Base** raw-text
+completion——**无**官方 chat template（输出是 base model 自由
+continuation，不是 chat assistant）；**NOT OpenAI-compatible**；
+单线程/一次一个请求/单 CUDA stream；**无** TLS/auth；**无** HTTP/2、
+无 request chunked transfer、无 incremental text delta；**无**
+distributed session store、**无** persistence、**无** multi-stream、
+**无** CUDA Graph、**无** 多 GPU/多机。
+
+测试：`test_http_protocol`（CPU 表驱动 parser/transport）+
+`test_serving_http`（contract gate：fake forwarder + 真
+pools/SessionManager/Scheduler/controller + handler 直驱，无
+socket；HTTP committed ids == controller committed ids）+
+`test_serving_lifecycle_soak`（in-process CPU lifecycle soak，pools
+归零）+ 真实 checkpoint gate：`test_serving_http_e2e`（真实
+server + socket 全生命周期）/ `test_serving_http_disconnect`
+（Python stdlib socket：stream 中途硬断 → server 存活、
+live_requests==0、session 存活、continuation 成功）/
+`test_serving_http_soak`（bounded soak，默认 50 turns，`--iterations`
+可扩展）。详见 docs 与 provenance（SHA 绑定证据）。

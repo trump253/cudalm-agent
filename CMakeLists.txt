@@ -156,6 +156,20 @@ target_link_libraries(cudalm-generate PRIVATE cudalm)
 add_executable(cudalm-chat tools/cudalm_chat.cpp)
 target_link_libraries(cudalm-chat PRIVATE cudalm)
 
+# v0.9 Phase D: the minimal HTTP serving runtime (single-threaded,
+# one HTTP request at a time, one CUDA stream — a v0.9 limitation,
+# not a hidden defect). The HTTP transport stays in tools/common/
+# (tool-only): the core CUDA runtime has NO POSIX socket dependency.
+add_executable(cudalm-server
+               tools/cudalm_server.cpp
+               tools/common/http_protocol.cpp
+               tools/common/http_transport.cpp
+               tools/common/http_serving_handler.cpp)
+target_link_libraries(cudalm-server PRIVATE cudalm)
+# The tool-only HTTP sources include each other by repo-root-relative
+# paths ("tools/common/..."):
+target_include_directories(cudalm-server PRIVATE ${CMAKE_SOURCE_DIR})
+
 add_subdirectory(tests)
 add_subdirectory(benchmarks)
 

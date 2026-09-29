@@ -394,6 +394,253 @@ add_test(NAME test_qwen35_session_text_e2e
 set_tests_properties(test_qwen35_session_text_e2e PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+# --- v0.9 Phase A: serving admission / backpressure / resource guardrails --
+# A thin POLICY layer (ServingController) above the frozen v0.8
+# Session/Scheduler: admission limits (max_sessions, max_live_requests,
+# optional per-session context policy cap), REJECT EARLY / FAIL LOUD /
+# ZERO MUTATION, quota lifecycle (terminal / cancel / failure release
+# request capacity exactly once; destroy releases session capacity;
+# reset does not), lightweight serving stats.
+#
+# test_serving_admission (CPU — NO checkpoint / NO model: the
+# deterministic fake forwarder (Phase C/D pattern) + real pools + real
+# SessionManager + real Scheduler + the ServingController):
+#   * max_sessions: reject at the limit (zero mutation, no SessionId
+#     consumed); reset does NOT release; destroy releases (reuse);
+#   * max_live_requests: reject at the limit (zero mutation, no
+#     RequestId consumed); TERMINAL release + reuse (limit reached ->
+#     reject -> existing finishes -> new admission succeeds); repeated
+#     sync() is a no-op (no double-decrement);
+#   * context policy cap: rejects below the model limit, exact boundary
+#     (==) accepted, constructor clamps to max_seq_len;
+#   * cancel + forward failure release the request quota.
+cudalm_add_test(test_serving_admission test_serving_admission
+                cpu/test_serving_admission.cpp)
+
+# test_serving_integration (CUDA, REAL Qwen3.5-0.8B-Base checkpoint):
+# the serving layer driving the FROZEN Session/Scheduler changes NOTHING
+# about token/state correctness — sessions A (greedy) / B (seeded), two
+# turns each, admitted + driven THROUGH the controller (two live at a
+# time — the batched path) vs the same token streams on a raw
+# Scheduler on an independent manager: generated ids per turn +
+# turn-boundary/final lengths IDENTICAL; limits enforce + release on
+# the real runtime (session limit / request limit / reuse); the context
+# policy cap (8 << max_seq_len) enforces with the exact boundary
+# accepted; clean teardown (pool accounting to zero). Self-skips (77).
+add_executable(test_serving_integration cuda/test_serving_integration.cpp)
+target_link_libraries(test_serving_integration PRIVATE cudalm)
+add_test(NAME test_serving_integration
+         COMMAND test_serving_integration
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_serving_integration PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# --- v0.9 Phase B: committed-token streaming + cancellation / deadline --
+# Pull-based committed-token streaming on the ServingController (COMMIT-
+# BEFORE-VISIBLE: only generated[0..committed_generated) is ever emitted;
+# the pending tail is never emitted; exactly once, in order; the final
+# EOS / max-new token is emitted before the terminal report), explicit
+# cancellation (committed prefix drainable, pending never emitted, the
+# session continues from the committed boundary), and cooperative per-
+# request deadlines (checked before each scheduler step; fake-monotonic-
+# clock injectable; a serving-layer deadline_exceeded termination reason).
+#
+# test_serving_streaming (CPU — NO checkpoint / NO model: the
+# deterministic fake forwarder + real pools + real SessionManager /
+# Scheduler): pending g0 invisible until its committing forward;
+# exactly-once (a later poll emits nothing); the final max-new / EOS
+# token emitted before RequestTerminal; cancel semantics (committed
+# prefix drainable, pending never emitted, no forward after the cancel,
+# the next turn continues from the committed boundary); deadline via a
+# fake monotonic clock (progress before expiry, cancel BEFORE the next
+# forward at expiry — no additional token commit, deadline_exceeded on
+# the terminal event); A/B interleaving (per-request event streams
+# concatenate to exactly their own final committed ids, no cross-request
+# contamination).
+cudalm_add_test(test_serving_streaming test_serving_streaming
+                cpu/test_serving_streaming.cpp)
+
+# test_serving_stream_integration (CUDA, REAL Qwen3.5-0.8B-Base
+# checkpoint): two sessions (A greedy / B seeded) run TOGETHER through
+# the controller's step_stream (the batched decode path — one
+# Scheduler::step commits for both; the serving layer drains them
+# separately): per turn the concatenated streamed token ids == the
+# request's final committed generated ids (exactly once, in order), the
+# final context lengths are exact (n + m), and the sessions CONTINUE to
+# the next turn from the committed boundary (turn 3 after streaming
+# turns 1-2); clean teardown (pool accounting to zero). Self-skips (77).
+add_executable(test_serving_stream_integration
+               cuda/test_serving_stream_integration.cpp)
+target_link_libraries(test_serving_stream_integration PRIVATE cudalm)
+add_test(NAME test_serving_stream_integration
+         COMMAND test_serving_stream_integration
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_serving_stream_integration PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# --- v0.9 Phase C: session TTL / LRU eviction ----------------------------
+# EVICTION == DESTROY THE WHOLE SESSION (never context truncation);
+# the policy lives in the ServingController (the frozen Scheduler /
+# SessionManager semantics are untouched); the DEFAULT policy is
+# DISABLED (exactly the Phase A behavior).
+#
+# test_serving_eviction (CPU — NO checkpoint / NO model: the
+# deterministic fake forwarder + real pools + real SessionManager /
+# Scheduler + a FAKE monotonic clock):
+#   * A. TTL: the older idle session expires + is evicted (SessionId
+#     invalidated forever; KV/Delta accounting released); the recently
+#     active session survives with intact state/length; a session
+#     reusing the evicted Delta slot sees a ZEROED slot (the slot is
+#     patterned before the eviction — no stale contamination);
+#   * B. BUSY: a TTL-expired session with a live request is PROTECTED
+#     (no cancel, no mutation);
+#   * C. TERMINAL-BUT-UNDRAINED (the Phase B lifecycle, the Phase C
+#     hard contract): a session whose request is terminal but whose
+#     stream events are not yet drained are PROTECTED from the sweep —
+#     evictable only after the events are fully drained;
+#   * D. LRU-on-session-pressure: at max_sessions, ONE eligible idle
+#     LRU session (oldest activity; ties: smaller SessionId) is
+#     evicted and the new session is created (fresh monotonic id);
+#   * E. NO CANDIDATE: busy + terminal-undrained -> the pressure
+#     create REJECTS (no SessionId consumed, no pool mutation, both
+#     untouched — the pressure safety gate);
+#   * F. DEFAULT policy: max_sessions reached still REJECTS (no silent
+#     eviction);
+#   * G. UNMANAGED sessions (created directly on the manager) are
+#     never guessed, never auto-evicted (they still occupy the limit).
+cudalm_add_test(test_serving_eviction test_serving_eviction
+                cpu/test_serving_eviction.cpp)
+
+# test_serving_eviction_integration (CUDA, REAL Qwen3.5-0.8B-Base
+# checkpoint): a small real-runtime gate — the eviction policy and
+# persistent sessions COEXIST: two real turns (A then B, A the more
+# recent activity), a fake-clock TTL sweep evicts ONLY the idle B, the
+# evicted session cannot continue, A CONTINUES to the next turn from
+# its committed state, a fresh C generates fresh; clean teardown (pool
+# accounting to zero). Self-skips (77).
+add_executable(test_serving_eviction_integration
+               cuda/test_serving_eviction_integration.cpp)
+target_link_libraries(test_serving_eviction_integration PRIVATE cudalm)
+add_test(NAME test_serving_eviction_integration
+         COMMAND test_serving_eviction_integration
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 /root/models/Qwen3.5-0.8B-Base
+                 ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_serving_eviction_integration PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# --- v0.9 Phase D: the minimal HTTP serving layer -----------------------------
+# The HTTP protocol / handler sources are TOOL-ONLY (tools/common/):
+# they are compiled into the test executables below (and into the
+# cudalm-server executable) — the core CUDA runtime library has NO
+# POSIX socket dependency.
+
+# test_http_protocol (CPU — pure protocol layer, NO sockets / NO
+# model): the table-driven parser contract (a valid GET / a POST +
+# Content-Length with an EXACT body (leading / trailing whitespace +
+# an embedded NUL) / a malformed request line / a malformed
+# Content-Length / an oversized header / an oversized body / an
+# unsupported request Transfer-Encoding / a wrong-but-valid method /
+# an unknown path) + the JSON escaping (NUL / quote / backslash /
+# control bytes) + the binary-safe response formatting.
+add_executable(test_http_protocol
+               cpu/test_http_protocol.cpp
+               ${CMAKE_SOURCE_DIR}/tools/common/http_protocol.cpp)
+target_link_libraries(test_http_protocol PRIVATE cudalm)
+target_include_directories(test_http_protocol
+                           PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_http_protocol COMMAND test_http_protocol)
+
+# test_serving_http (CPU — NO sockets / NO checkpoint / NO model: the
+# deterministic fake forwarder + real pools + real SessionManager /
+# Scheduler + the ServingController + a FAKE TextCodec, driving the
+# HTTP handler DIRECTLY):
+#   * create / turn / second turn (append-only context) / stats /
+#     reset / destroy / unknown session / wrong method / unknown
+#     route;
+#   * the HTTP generated ids == the scheduler's COMMITTED ids (the
+#     adapter does not bypass the serving runtime, never peeks the
+#     pending tail);
+#   * the streaming endpoint: token-id events BEFORE the terminal;
+#     the streamed ids == the terminal / final ids;
+#   * the deadline: a synchronous turn cancelled by the deadline is a
+#     408 (deterministic via the fake clock); the session survives;
+#   * a client DISCONNECT mid-stream: the request is cancelled +
+#     drained/reaped, the quota is released, the committed state
+#     stays, the session stays LIVE and continues the next turn.
+add_executable(test_serving_http
+               cpu/test_serving_http.cpp
+               ${CMAKE_SOURCE_DIR}/tools/common/http_protocol.cpp
+               ${CMAKE_SOURCE_DIR}/tools/common/http_serving_handler.cpp)
+target_link_libraries(test_serving_http PRIVATE cudalm)
+target_include_directories(test_serving_http
+                           PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_serving_http COMMAND test_serving_http)
+
+# test_serving_lifecycle_soak (CPU — the fast BOUNDED in-process pool-
+# lifecycle soak: ~240 mixed operations (create / admit / drive /
+# reset / destroy / TTL / LRU / create-reuse) through the HTTP handler
+# with the fake forwarder + fake clock; continuously verifies no stuck
+# busy, no SessionId / RequestId reuse, the session accounting
+# consistency, and — at teardown — the KV / Delta pools are EXACTLY
+# zero (no leaked pages / slots)):
+add_executable(test_serving_lifecycle_soak
+               cpu/test_serving_lifecycle_soak.cpp
+               ${CMAKE_SOURCE_DIR}/tools/common/http_protocol.cpp
+               ${CMAKE_SOURCE_DIR}/tools/common/http_serving_handler.cpp)
+target_link_libraries(test_serving_lifecycle_soak PRIVATE cudalm)
+target_include_directories(test_serving_lifecycle_soak
+                           PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_serving_lifecycle_soak COMMAND test_serving_lifecycle_soak)
+
+# v0.9 Phase D real-checkpoint gates (Python stdlib only; self-skip 77
+# when the checkpoint / artifacts are absent):
+
+# test_serving_http_e2e: starts the REAL cudalm-server and drives the
+# full API surface over a real socket (health / create / sync turn /
+# streaming turn / stats / reset / post-reset turn / create-destroy /
+# destroy->404 / final live==0 / still alive).
+add_test(NAME test_serving_http_e2e
+         COMMAND ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR}/scripts/v09_http_e2e.py
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk
+                 ${CMAKE_BINARY_DIR}/cudalm-server)
+set_tests_properties(test_serving_http_e2e PROPERTIES
+   SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# test_serving_http_disconnect: the client-disconnect fault gate — a
+# streaming turn with an abrupt socket close; the server survives,
+# live_requests is back to 0, the session is STILL LIVE and the next
+# turn is a successful continuation.
+add_test(NAME test_serving_http_disconnect
+         COMMAND ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR}/scripts/v09_http_disconnect.py
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk
+                 ${CMAKE_BINARY_DIR}/cudalm-server)
+set_tests_properties(test_serving_http_disconnect PROPERTIES
+   SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# test_serving_http_soak: the BOUNDED serving soak (default 50 turns;
+# the mix of create / multi-turn / reset / destroy / health / stats +
+# the fault shapes; the per-group invariants + the final live==0).
+add_test(NAME test_serving_http_soak
+         COMMAND ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR}/scripts/v09_server_soak.py
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk
+                 ${CMAKE_BINARY_DIR}/cudalm-server)
+set_tests_properties(test_serving_http_soak PROPERTIES
+   SKIP_RETURN_CODE 77 TIMEOUT 3600)
+
 # --- Cross-language weight-file tests (Python tools -> C++ loader) ------------
 # tools/convert_weights.py (torch, offline) emits data/block_v01.cudalm into
 # the build tree; test_weights_crosslang loads it with the PyTorch-free C++
