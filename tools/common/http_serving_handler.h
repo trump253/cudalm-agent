@@ -91,6 +91,26 @@ class ServingHttpApi {
   // stream state; the session stays live and the quota is released).
   bool handle_stream(const HttpRequest& req, const WriteFn& write);
 
+  // The turn-query resolution — PUBLIC so the CPU contract gate can
+  // assert the RESOLVED SamplingConfig directly (no sockets, no
+  // model). The raw query string -> max_new_tokens + the RESOLVED
+  // SamplingConfig + the optional deadline. The sampling resolution
+  // mirrors the FROZEN v0.4 `cudalm-generate` contract
+  // (include/cudalm/generate_cli.h): any of temperature / top_k /
+  // top_p PRESENT enables sampling mode; an omitted temperature then
+  // defaults to 1.0; an explicit 0 / -0 selects the frozen greedy
+  // path; a seed without a sampling flag is IGNORED (greedy consumes
+  // no RNG). The temperature TEXT must round to a representable
+  // float — overflow to inf and underflow to zero are rejected
+  // (mirroring src/cli/generate_cli.cpp, the same numeric semantics —
+  // there is no second, different rule set). Fail-loud: returns false
+  // + *error for a malformed / out-of-contract query (a 400 BEFORE
+  // any admission / forward).
+  bool resolve_turn_query(const std::string& query, int* out_max_new,
+                          SamplingConfig* out_sampling,
+                          std::chrono::steady_clock::time_point* out_deadline,
+                          bool* out_has_deadline, std::string* error) const;
+
  private:
   ServingHttpDeps deps_;
 
@@ -98,12 +118,6 @@ class ServingHttpApi {
   // is not a valid session route).
   static bool parse_session_path(const std::string& path, std::string* rest,
                                  SessionId* out_id);
-  // The turn query parameters (fail-loud validation).
-  bool parse_turn_query(const std::string& query,
-                        std::vector<int>* out_tokens, int* out_max_new,
-                        SamplingConfig* out_sampling,
-                        std::chrono::steady_clock::time_point* out_deadline,
-                        bool* out_has_deadline, std::string* error) const;
   // The raw-text turn core shared by the sync + stream endpoints.
   // Returns false (with *error) when the turn could not be ADMIITED.
   bool admit_text_turn(SessionId session_id, const std::string& body,

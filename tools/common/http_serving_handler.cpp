@@ -1,6 +1,11 @@
 // CUDALM — v0.9 Phase D: the CUDALM minimal HTTP API handler (see
 // the header for the pinned contracts).
 
+#include <cerrno>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+
 #include "tools/common/http_serving_handler.h"
 
 namespace cudalm {
@@ -46,13 +51,71 @@ bool parse_int(const std::string& v, long* out, bool allow_zero) {
   return true;
 }
 
-bool parse_float(const std::string& v, float* out) {
-  if (v.empty()) return false;
+// The --temperature-style float parse with float-range guarantees —
+// a MIRROR of the frozen v0.4 `cudalm-generate` rule (src/cli/
+// generate_cli.cpp, parse_temperature): the TEXT must round to a
+// representable float. Overflow to inf and underflow to ZERO are
+// usage errors — a silent 0 would silently switch to the greedy path
+// and a silent inf is a different (invalid) config. The explicit "0"
+// / "-0" text is the documented greedy spelling and stays legal;
+// denormal floats (down to denorm_min) are legal values.
+//
+// Underflow is detected at BOTH levels:
+//   * strtod level: the text is so small that strtod itself range-
+//     underflows to +-0.0 (e.g. "1e-5000"); errno == ERANGE with a
+//     zero result marks it. A NONZERO text must never silently
+//     become 0/-0.
+//   * float level: a nonzero finite double that rounds to 0.0f when
+//     cast (e.g. "1e-50", "7e-46").
+bool parse_temperature(const std::string& s, float* out) {
+  if (s.empty()) return false;
+  errno = 0;  // reset before strtod (its ERANGE is read below)
   char* end = nullptr;
-  const double d = std::strtod(v.c_str(), &end);
-  if (end == v.c_str() || *end != '\0') return false;
-  if (!(d >= 0.0)) return false;  // NaN / negative fail loud
-  *out = static_cast<float>(d);
+  const double v = std::strtod(s.c_str(), &end);
+  if (end == s.c_str() || *end != '\0') return false;
+  if (errno == ERANGE && v == 0.0)
+    return false;  // strtod-level underflow: nonzero text -> +-0 (no silent greedy)
+  if (!std::isfinite(v)) return false;  // overflow / inf / nan
+  const float f = static_cast<float>(v);
+  if (!std::isfinite(f)) return false;  // double -> float overflow to inf
+  if (f == 0.0f && v != 0.0)
+    return false;  // double -> float underflow to zero (no silent greedy)
+  *out = f;
+  return true;
+}
+
+// The full-consumption float parse for --top-p-style values — a MIRROR
+// of the frozen v0.4 rule (src/cli/generate_cli.cpp, parse_float): the
+// text must be fully consumed; the range (0, 1] is enforced by the
+// frozen validate_sampling_config gate (the same gate the CLI drives
+// through) — NO second, different numeric semantics here.
+bool parse_float_full(const std::string& s, float* out) {
+  if (s.empty()) return false;
+  char* end = nullptr;
+  const double v = std::strtod(s.c_str(), &end);
+  if (end == s.c_str() || *end != '\0') return false;
+  *out = static_cast<float>(v);
+  return true;
+}
+
+// The full-consumption unsigned integer parse — a MIRROR of the frozen
+// v0.4 rule (src/cli/generate_cli.cpp, parse_uint): digits only (a
+// leading '+' is NOT accepted), the text must be fully consumed, no
+// ERANGE overflow past T.
+template <typename T>
+bool parse_uint_full(const std::string& s, T* out) {
+  if (s.empty()) return false;
+  for (const char c : s) {
+    if (c < '0' || c > '9') return false;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(s.c_str(), &end, 10);
+  if (end == s.c_str() || *end != '\0' || errno == ERANGE) return false;
+  if (v > static_cast<unsigned long long>(
+              std::numeric_limits<T>::max()))
+    return false;
+  *out = static_cast<T>(v);
   return true;
 }
 
@@ -87,9 +150,8 @@ int ServingHttpApi::context_length_of(SessionId session_id) const {
   return st == nullptr ? -1 : st->length;
 }
 
-bool ServingHttpApi::parse_turn_query(
-    const std::string& query, std::vector<int>* /*out_tokens*/,
-    int* out_max_new, SamplingConfig* out_sampling,
+bool ServingHttpApi::resolve_turn_query(
+    const std::string& query, int* out_max_new, SamplingConfig* out_sampling,
     std::chrono::steady_clock::time_point* out_deadline,
     bool* out_has_deadline, std::string* error) const {
   std::map<std::string, std::string> q;
@@ -113,7 +175,6 @@ bool ServingHttpApi::parse_turn_query(
       return false;
     }
   }
-  SamplingConfig sampling = SamplingConfig::greedy();
   long max_new = 8;  // the default
   auto it = q.find("max_new_tokens");
   if (it != q.end()) {
@@ -122,37 +183,66 @@ bool ServingHttpApi::parse_turn_query(
       return false;
     }
   }
+  // ---- the SAMPLING MODE RESOLUTION — mirrors the frozen v0.4
+  // `cudalm-generate` contract (include/cudalm/generate_cli.h):
+  //   * none of temperature / top_k / top_p present -> GREEDY;
+  //   * any one of them PRESENT (even a default-equivalent value)
+  //     -> SAMPLING mode; an omitted temperature then defaults to
+  //     1.0 (it is NOT 0.0 — a silent 0 would silently select the
+  //     greedy path);
+  //   * an explicit temperature of 0 / -0 -> the FROZEN GREEDY path
+  //     (temperature <= 0 in the runtime contract);
+  //   * a seed WITHOUT a sampling flag is IGNORED (greedy consumes
+  //     no RNG).
+  const bool sampling_flag_given =
+      q.count("temperature") > 0 || q.count("top_k") > 0 ||
+      q.count("top_p") > 0;
+  const bool temperature_given = q.count("temperature") > 0;
+  float temperature = 0.0f;
   it = q.find("temperature");
-  if (it != q.end()) {
-    if (!parse_float(it->second, &sampling.temperature)) {
-      *error = "invalid temperature";
+  if (temperature_given) {
+    if (!parse_temperature(it->second, &temperature)) {
+      *error = "invalid temperature: must be a finite, representable "
+               "float (the text overflows to inf or underflows to "
+               "zero — the v0.4 cudalm-generate contract)";
       return false;
     }
   }
+  int top_k = 0;
   it = q.find("top_k");
   if (it != q.end()) {
-    long v = 0;
-    if (!parse_int(it->second, &v, true)) {
+    unsigned long long n = 0;
+    if (!parse_uint_full<unsigned long long>(it->second, &n) ||
+        n > static_cast<unsigned long long>(0x7FFFFFFF)) {
       *error = "invalid top_k";
       return false;
     }
-    sampling.top_k = static_cast<int>(v);
+    top_k = static_cast<int>(n);
   }
+  float top_p = 1.0f;
   it = q.find("top_p");
   if (it != q.end()) {
-    if (!parse_float(it->second, &sampling.top_p)) {
+    if (!parse_float_full(it->second, &top_p)) {
       *error = "invalid top_p";
       return false;
     }
   }
+  std::uint64_t seed = 0;
   it = q.find("seed");
   if (it != q.end()) {
-    long v = 0;
-    if (!parse_int(it->second, &v, true)) {
+    if (!parse_uint_full<std::uint64_t>(it->second, &seed)) {
       *error = "invalid seed";
       return false;
     }
-    sampling.seed = static_cast<std::uint64_t>(v);
+  }
+  SamplingConfig sampling;
+  if (!sampling_flag_given) {
+    sampling = SamplingConfig::greedy();  // the seed is IGNORED
+  } else {
+    sampling.temperature = temperature_given ? temperature : 1.0f;
+    sampling.top_k = top_k;
+    sampling.top_p = top_p;
+    sampling.seed = seed;
   }
   // The frozen sampling validation gate (same semantics as
   // cudalm-generate):
@@ -339,8 +429,8 @@ HttpResponse ServingHttpApi::handle(const HttpRequest& req) {
       std::chrono::steady_clock::time_point deadline;
       bool has_deadline = false;
       std::string error;
-      if (!parse_turn_query(req.query, nullptr, &max_new, &sampling,
-                            &deadline, &has_deadline, &error)) {
+      if (!resolve_turn_query(req.query, &max_new, &sampling, &deadline,
+                              &has_deadline, &error)) {
         return HttpResponse::json_error(400, "", error);
       }
       // RAW-TEXT contract: the body bytes are encoded VERBATIM (NO
@@ -461,8 +551,8 @@ bool ServingHttpApi::handle_stream(const HttpRequest& req,
   std::chrono::steady_clock::time_point deadline;
   bool has_deadline = false;
   std::string error;
-  if (!parse_turn_query(req.query, nullptr, &max_new, &sampling, &deadline,
-                        &has_deadline, &error)) {
+  if (!resolve_turn_query(req.query, &max_new, &sampling, &deadline,
+                          &has_deadline, &error)) {
     return answer_error(400, error);
   }
   std::vector<int> tokens;
