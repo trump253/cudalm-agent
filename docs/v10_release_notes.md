@@ -145,6 +145,103 @@ content negotiation。
 - 按 Phase A 任务边界：不跑 profiling / benchmark / full ctest
   （full release gate 留到 Phase D）。
 
+## Phase B：Benchmark & Reproducibility
+
+### B.1 Release benchmark（current v1.0 tree，重新测量）
+
+- 工具：复用 `benchmarks/bench_qwen35_continuous_batching.cpp`
+  （canonical workload 不变：4 requests，prompts 2/5/3/4，generated
+  3/6/5/3，27 logical token-forwards，动态 arrival，单 CUDA
+  stream，prefill serial，decode 真 batch）；
+- release protocol：`--warmup-runs 2 --measured-runs 10`，两遍：
+  `--mode both` → `benchmarks/v10/release_serial_batched.txt`；
+  `--mode batched`（独立 serving profile）→
+  `benchmarks/v10/release_batched.txt`；
+- 结果（measured on this hardware / checkpoint / canonical
+  workload；RTX 2080 Ti，CUDA 11.8，driver 570.172.08，gcc 9.4，
+  Release build；evidence SHA `88d1c881c888f781c3eedebdbf45a938d6bf80e6`）：
+
+  | metric | serial | continuous batched |
+  |---|---|---|
+  | wall mean / median | 0.134687 / 0.132533 s | 0.121831 / 0.119209 s |
+  | wall min / max | 0.131803 / 0.143668 s | 0.114817 / 0.137651 s |
+  | logical tok/s (mean) | 200.46 | 221.62 |
+  | single / batch forward calls | 27 / 0 | 19 / 3 |
+  | model traversals | 27 | 22 |
+  | avg / max decode batch | 0 / 0 | 2.67 / 3 |
+
+  batched-only serving profile：mean 0.109486 s（246.61 tok/s）。
+  observed delta（both 遍）：wall **−12.86 ms（−9.5%）**，
+  +21.2 tok/s——仅本硬件/本 checkpoint/本 workload 的测量，不是
+  泛化 speedup 声明。
+- 与 frozen v0.7 sign-off 对比（同机同 checkpoint，v0.7 用
+  1 warmup + 5 measured）：serial 0.130968 → 0.134687（+2.8%）、
+  batched 0.117271 → 0.121831（+3.9%）——均在 run-to-run spread
+  内，**无 regression**（v0.9 serving / v1.0 Phase A 未改 runtime）。
+
+### B.2 exact-SHA benchmark workflow
+
+新增 `scripts/benchmark_v10_release.sh`（tooling commit
+`88d1c881c888f781c3eedebdbf45a938d6bf80e6`）：
+
+- tracked tree dirty → **fail loud**（不生成正式 evidence）；
+- 记录：git SHA / tree cleanliness / date / GPU / nvidia driver /
+  CUDA toolkit / host compiler / CMake build type / benchmark
+  command / model + checkpoint identity（含 sha256）/ binary sha256
+  → `benchmarks/v10/environment.txt`；
+- 运行两遍 benchmark → raw reports（**永远保留**）；
+- Python stdlib 解析 raw reports → `benchmarks/v10/summary.json`
+  （sha / hardware / workload / serial / batched metrics /
+  delta）——summary 只是 convenience view，不是唯一证据；
+- 自检：HEAD == environment.txt SHA == summary.json SHA；
+- 大模型文件留在 `build/data`（gitignored，**不 commit**）。
+
+v1.0 evidence 归入 `benchmarks/v10/`（不再平铺到 benchmarks/
+根目录）；v0.6 / v0.7 的 evidence 文件原位不动（frozen history）。
+
+### B.3 性能文档 + v0.7 case study
+
+新增 `docs/v10_performance.md`（≈2200 词，面向 GitHub 用户 /
+面试官）：Executive Summary / Environment / 当前 v1.0 release
+benchmark（serial + continuous batched + workload 定义）/ What
+Continuous Batching Demonstrates / **v0.7 优化 case study**
+（profile-first 方法论；W4A16 **REJECT**——microbench 有 −4.91%
+边缘但 pooled E2E p=0.284 在 noise 内；DeltaNet **REJECT**——
+kernel 隔离 −22…−24% 但 paired E2E 95% CI 含 0，以 wall-clock
+为准拒绝；fused add+rmsnorm **KEEP**——−24 launches/traversal、
+paired E2E −1.238 ms、95% CI [−2.437, −0.040] 排除 0）/
+Reproduction / Scope & Limitations。
+
+诚实边界（文档中明确）：无 vLLM/llama.cpp 对比、无并发 QPS、
+无 "Tensor Core optimized" / "fully optimized kernels" 声明；
+HTTP frontend 是 single-threaded one-request-at-a-time——本 Phase
+**不做 HTTP 性能 benchmark**（无法稳定定义 methodology，宁可不加）；
+rejected candidate 的 microbench speedup 绝不当 production
+speedup 写。
+
+### Phase B 明确未做的事
+
+- NO new NCU / NO new Nsys campaign / NO kernel tuning / NO
+  candidate evaluation / 不重跑 v0.7 A/B（frozen history）；
+- `src/`、`include/`、任何 CUDA 代码：**零改动**（Phase B 只加
+  scripts/ + benchmarks/v10/ + docs/）；
+- README 只字未改（完整重写属 Phase C）。
+
+### Phase B 测试 / validation
+
+- benchmark executable build PASS（Release；无 C++ 源码改动，binary
+  与 Phase A 全量构建一致）；
+- release benchmark 完整运行 PASS（两遍 + self-consistency OK，
+  SHA `88d1c881c888f781c3eedebdbf45a938d6bf80e6` 绑定）；
+- `bash scripts/check_no_torch.sh` → **CLEAN**（include/ + src/ 零
+  改动，guard 复验）；
+- evidence 自洽：binary sha256 / model + checkpoint sha256 /
+  environment.txt / summary.json 同一 SHA。
+- 按任务边界：无 C++ runtime 改动 → 不需要 full ctest /
+  compute-sanitizer；不跑 profiling。
+
+---
+
 ## Deferred / Future Work
 
 - **README curl 示例**：现有 `curl --data` 示例在新 CT 合同下

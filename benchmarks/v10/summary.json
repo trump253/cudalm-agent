@@ -1,0 +1,74 @@
+{
+  "sha": "88d1c881c888f781c3eedebdbf45a938d6bf80e6",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 2080 Ti (11264 MiB)",
+    "nvidia_driver": "570.172.08",
+    "cuda_toolkit": "11.8 (V11.8.89)",
+    "cmake_build_type": "Release"
+  },
+  "workload": {
+    "requests": 4,
+    "prompt_lengths": [
+      2,
+      5,
+      3,
+      4
+    ],
+    "generated_lengths": [
+      3,
+      6,
+      5,
+      3
+    ],
+    "logical_token_forwards": 27,
+    "arrivals": "A,B first; C after 1 step; D after 2 steps (dynamic)",
+    "model": "Qwen3.5-0.8B-Base (raw text, no chat template)",
+    "note": "canonical workload \u2014 see benchmarks/v10/README.md"
+  },
+  "warmup_runs": 2,
+  "measured_runs": 10,
+  "serial": {
+    "wall_time_s_mean": 0.134687,
+    "wall_time_s_median": 0.132533,
+    "wall_time_s_min": 0.131803,
+    "wall_time_s_max": 0.143668,
+    "logical_tokens": 27,
+    "logical_tokens_per_s_mean": 200.464647,
+    "single_forward_calls": 27,
+    "batch_forward_calls": 0,
+    "model_traversal_calls": 27,
+    "avg_decode_batch_size": 0.0,
+    "max_decode_batch_size": 0
+  },
+  "batched": {
+    "wall_time_s_mean": 0.121831,
+    "wall_time_s_median": 0.119209,
+    "wall_time_s_min": 0.114817,
+    "wall_time_s_max": 0.137651,
+    "logical_tokens": 27,
+    "logical_tokens_per_s_mean": 221.617976,
+    "single_forward_calls": 19,
+    "batch_forward_calls": 3,
+    "model_traversal_calls": 22,
+    "avg_decode_batch_size": 2.666667,
+    "max_decode_batch_size": 3
+  },
+  "batched_only_serving_profile": {
+    "wall_time_s_mean": 0.109486,
+    "wall_time_s_median": 0.10853,
+    "wall_time_s_min": 0.107199,
+    "wall_time_s_max": 0.117658,
+    "logical_tokens": 27,
+    "logical_tokens_per_s_mean": 246.607712,
+    "single_forward_calls": 19,
+    "batch_forward_calls": 3,
+    "model_traversal_calls": 22,
+    "avg_decode_batch_size": 2.666667,
+    "max_decode_batch_size": 3
+  },
+  "batched_vs_serial_delta": {
+    "wall_time_s_mean": -0.012856000000000006,
+    "logical_tokens_per_s_mean": 21.153328999999985,
+    "interpretation": "measured on this hardware / checkpoint / canonical workload only \u2014 not a general speedup claim"
+  }
+}
