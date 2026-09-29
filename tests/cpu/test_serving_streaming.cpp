@@ -23,10 +23,17 @@
 //   * REVIEW FIX (streaming lifecycle): terminal != streaming state
 //     destroyed — a request driven to terminal with the plain step()
 //     (no drain) keeps its committed tokens + terminal event
-//     pollable (exactly once; a re-poll returns empty), the quota is
+//     pollable (exactly once; a re-poll errors), the quota is
 //     released immediately and reusable; and run_stream() does not
 //     lose the pending events of a terminal-but-undrained request
-//     just because live_requests is already 0.
+//     just because live_requests is already 0;
+//   * REVIEW FIX (unified cancel lifecycle): an explicit cancel()
+//     enters the SAME terminal-pending lifecycle — cancel (with a
+//     committed-but-unemitted g0 and a PENDING g1) + run_stream()
+//     returns g0 exactly once, never emits g1, and the Cancelled
+//     terminal event (deadline_exceeded = false); cancelling a
+//     WAITING request + run_stream() still yields its Cancelled
+//     terminal event.
 //
 // Provenance: CUDALM-native (v0.9 Phase B).
 
@@ -531,6 +538,82 @@ int main() {
     CHECK_EQ(mgr.lookup(seq)->length, 5);  // (1+1) + (2+1)
     std::printf("  [ok] run_stream(): terminal-but-undrained events not "
                 "lost (live_requests == 0)\n");
+  }
+
+  // =========================================================================
+  // 8. REVIEW FIX (unified cancel lifecycle): cancel + run_stream() does
+  //    not lose the committed-but-undrained tokens / the Cancelled event
+  // =========================================================================
+  {
+    Qwen35StateManager mgr(cfg, 4, 8, 4, stream);
+    SessionManager sm(mgr);
+    FakeForwarder fwd;
+    Scheduler sched(fwd, mgr, stream, &sm);
+    ServingController ctrl(sched, sm,
+                           ServingLimits{-1, /*max_live=*/1, 0});
+    SessionId s = 0;
+    CHECK(ctrl.create_session(&s).ok);
+    const SequenceId seq = sm.lookup(s)->sequence_id;
+    // 2 input, max_new 2: fake picks g0 = 4 (after the 2nd input
+    // forward), g1 = 7 (after the g0 decode forward).
+    RequestId r = 0;
+    CHECK(ctrl.admit_turn(s, {10, 20}, 2, -1, kGreedy, &r).ok);
+    // Drive with the plain step() (NO drain) to:
+    //   g0 COMMITTED (but not emitted), g1 PENDING, request RUNNING:
+    for (int i = 0; i < 3; ++i) {
+      CHECK(ctrl.step().ok);
+    }
+    CHECK(sched.get(r)->status == RequestStatus::Running);
+    CHECK_EQ(fwd.forwards(seq), 3);
+
+    // Cancel with g1 still PENDING, then run_stream():
+    CHECK(ctrl.cancel(r).ok);
+    CHECK(sched.get(r)->status == RequestStatus::Cancelled);
+    CHECK_EQ(ctrl.stats().live_requests, 0);  // quota released at once
+    std::vector<ServingEvent> all = ctrl.run_stream();
+    Collected c;
+    CHECK_EQ(collect(all, r, &c), 0);
+    CHECK(c.tokens.size() == 1 && c.tokens[0] == 4);  // g0 exactly once
+    // the PENDING g1 is NEVER emitted (no token 7 in the stream):
+    for (const ServingEvent& e : all) {
+      CHECK(e.token_id != 7 || e.kind != ServingEventKind::Token);
+    }
+    CHECK(c.terminal);
+    CHECK(c.status == RequestStatus::Cancelled);
+    CHECK(!c.deadline_exceeded);  // an explicit cancel, not a deadline
+    CHECK_EQ(fwd.forwards(seq), 3);  // no forward after the cancel
+    CHECK_EQ(mgr.lookup(seq)->length, 3);  // the committed boundary
+    // fully drained: a re-poll errors (the pinned semantics):
+    std::vector<ServingEvent> pol;
+    CHECK(!ctrl.poll(r, &pol).ok);
+    std::printf("  [ok] cancel + run_stream(): committed prefix + "
+                "Cancelled event not lost, pending never emitted\n");
+
+    // The next turn continues from the committed boundary:
+    RequestId r2 = 0;
+    CHECK(ctrl.admit_turn(s, {30, 40}, 1, -1, kGreedy, &r2).ok);
+    std::vector<ServingEvent> all2 = ctrl.run_stream();
+    Collected c2;
+    CHECK_EQ(collect(all2, r2, &c2), 0);
+    CHECK(c2.tokens.size() == 1 && c2.terminal);
+    CHECK_EQ(mgr.lookup(seq)->length, 3 + 2 + 1);
+    std::printf("  [ok] next turn continues after the cancel\n");
+
+    // Cancel a WAITING request (no forward yet) + run_stream():
+    // at least its Cancelled terminal event must not be lost:
+    RequestId r3 = 0;
+    CHECK(ctrl.admit_turn(s, {50}, 2, -1, kGreedy, &r3).ok);
+    CHECK(sched.get(r3)->status == RequestStatus::Waiting);
+    CHECK(ctrl.cancel(r3).ok);
+    std::vector<ServingEvent> all3 = ctrl.run_stream();
+    Collected c3;
+    CHECK_EQ(collect(all3, r3, &c3), 0);
+    CHECK(c3.tokens.empty());  // nothing was committed
+    CHECK(c3.terminal);
+    CHECK(c3.status == RequestStatus::Cancelled);
+    CHECK(!c3.deadline_exceeded);
+    std::printf("  [ok] cancel Waiting + run_stream(): the Cancelled "
+                "terminal event is not lost\n");
   }
 
   CUDA_CHECK(cudaStreamDestroy(stream));
