@@ -4,6 +4,11 @@
 
 [English](README_EN.md)
 
+[![repository-checks](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml/badge.svg?branch=v1.0-portfolio-release)](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml?branch=v1.0-portfolio-release)
+
+> CI badge = `repository-checks`（repository / static guards）；
+> 完整 CUDA/checkpoint 验证见 Local NVIDIA release validation（§8）。
+
 CUDALM 是一个 **PyTorch-free 的 native C++17/CUDA 推理与 serving runtime**：它从官方
 Qwen/Qwen3.5-0.8B-Base checkpoint 出发，用自实现的 weight 格式（W4A16 投影 + BF16 激活）、
 自实现的 tokenizer、自实现的 CUDA kernel 完成完整的前向推理，并在其上实现了
@@ -325,7 +330,8 @@ v1.0 release validation（Phase D）分两层：
   绑定）→ 完整 release build + full ctest（含 real-checkpoint
   GPU/integration 与 serving gates）+ 代表性
   `compute-sanitizer` gate。记录见
-  `docs/v10_release_validation.md`。
+  `docs/v10_release_validation.md`。v1.0 release validation:
+  **84 passed / 0 skipped / 0 failed**（0 errors / 0 bytes leaked）。
 
 ## 9. 核心工程设计 / Engineering Decisions
 

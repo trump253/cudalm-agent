@@ -4,6 +4,12 @@ A native C++17/CUDA quantized LLM inference & serving engine
 
 [中文](README.md)
 
+[![repository-checks](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml/badge.svg?branch=v1.0-portfolio-release)](https://github.com/trump253/cudalm-agent/actions/workflows/ci.yml?branch=v1.0-portfolio-release)
+
+> The CI badge covers `repository-checks` (repository / static
+> guards) only; full CUDA/checkpoint validation is the Local NVIDIA
+> release validation (§8).
+
 CUDALM is a **PyTorch-free, native C++17/CUDA inference and serving
 runtime**. Starting from the official Qwen/Qwen3.5-0.8B-Base checkpoint,
 it performs complete forward inference with its own weight format
@@ -378,7 +384,8 @@ v1.0 release validation (Phase D) is two-layered:
   environment, exact-SHA bound) → full release build + full ctest
   (including real-checkpoint GPU/integration and serving gates) + a
   representative `compute-sanitizer` gate. Recorded in
-  `docs/v10_release_validation.md`.
+  `docs/v10_release_validation.md`. v1.0 release validation:
+  **84 passed / 0 skipped / 0 failed** (0 errors / 0 bytes leaked).
 
 ## 9. Engineering Decisions
 
