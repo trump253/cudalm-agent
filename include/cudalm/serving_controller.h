@@ -56,6 +56,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -340,13 +341,29 @@ class ServingController {
   // Explicit TTL sweep (a MAINTENANCE POINT — no background thread
   // or timer exists in this phase): evict every eligible session
   // whose idle age (now - last activity) is >= the configured TTL
-  // (TTL == 0: immediately eligible once truly idle). Returns the
-  // evicted SessionIds (deterministic: ascending).
-  std::vector<SessionId> evict_expired_sessions();
+  // (TTL == 0: immediately eligible once truly idle).
+  // THREE-STATE (pinned): ok + *out_evicted = the evicted SessionIds
+  // (deterministic: ascending; empty when nothing qualified);
+  // ERROR = a real underlying destroy failure — FAIL LOUD: the
+  // original Status is propagated, the failed session is left
+  // EXACTLY as it was (the transactional invariant), and the sweep
+  // stops. A no-candidate sweep is NOT an error (ok + empty).
+  Status evict_expired_sessions(std::vector<SessionId>* out_evicted);
   // Explicit LRU eviction: evict the eligible idle session with the
   // OLDEST last activity (ties: the smaller SessionId first — the
-  // pinned deterministic order). Returns true when one was evicted.
-  bool evict_one_lru_idle();
+  // pinned deterministic order). THREE-STATE (pinned): ok +
+  // *out_evicted == true = one evicted; ok + false = NO eligible
+  // candidate (NOT an error — the caller's no-candidate path);
+  // ERROR = a real destroy failure (fail loud, the candidate is left
+  // untouched, the caller must NOT count it as no-candidate).
+  Status evict_one_lru_idle(bool* out_evicted);
+  // TEST SEAM (Phase C review fix — not part of the production
+  // contract): a swappable destroy hook. When EMPTY (production),
+  // the frozen SessionManager::destroy_session is used. Tests install
+  // it to inject a controlled destroy failure and verify the fail-
+  // loud Status propagation (a real retire_sequence failure cannot be
+  // triggered non-invasively — the frozen manager is not modified).
+  std::function<Status(SessionId)> destroy_for_test;
   // A session is managed + live + not busy + not
   // terminal-but-undrained.
   bool is_eviction_eligible(SessionId session_id) const;
@@ -387,7 +404,7 @@ class ServingController {
   std::vector<SessionId> lru_order_() const;
   // Phase C: destroy ONE session transactionally (the metadata +
   // counters update only after the frozen destroy SUCCEEDS).
-  bool evict_session_(SessionId session_id, bool by_ttl);
+  Status evict_session_(SessionId session_id, bool by_ttl);
 
   Scheduler& sched_;
   SessionManager& sessions_;

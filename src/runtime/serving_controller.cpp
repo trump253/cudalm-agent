@@ -40,8 +40,12 @@ Status ServingController::create_session(SessionId* out_id) {
   // policy keeps EXACTLY the Phase A behavior) ------------------------
   if (policy_.idle_ttl.has_value()) {
     // MAINTENANCE POINT: a lightweight TTL sweep before the create
-    // (expired idle sessions no longer count against the limit):
-    (void)evict_expired_sessions();
+    // (expired idle sessions no longer count against the limit).
+    // FAIL LOUD: a real destroy error aborts the create (the
+    // admission is NOT attempted) and propagates the original Status:
+    std::vector<SessionId> swept;
+    const Status ms = evict_expired_sessions(&swept);
+    if (!ms.ok) return ms;
   }
   if (policy_.lru_on_session_pressure && limits_.max_sessions > 0 &&
       sessions_.num_sessions() == limits_.max_sessions) {
@@ -54,7 +58,13 @@ Status ServingController::create_session(SessionId* out_id) {
     // Phase A session-limit rejection (no SessionId consumed, no
     // session destroyed, no pool mutation). max_sessions == 0 can
     // NEVER be bypassed by eviction (the zero-capacity contract).
-    if (!evict_one_lru_idle()) {
+    // THREE-STATE: ERROR = a real destroy failure -> fail loud
+    // (propagated; NOT counted as no-candidate); ok + false = the
+    // ONLY case that counts eviction_no_candidate:
+    bool evicted = false;
+    const Status ls = evict_one_lru_idle(&evicted);
+    if (!ls.ok) return ls;
+    if (!evicted) {
       ++eviction_no_candidate_;  // no eligible session: the Phase A
                                  // rejection stands below
     }
@@ -455,13 +465,19 @@ int ServingController::live_request_count() const {
   return n;
 }
 
-std::vector<SessionId> ServingController::evict_expired_sessions() {
+Status ServingController::evict_expired_sessions(
+    std::vector<SessionId>* out_evicted) {
   // A MAINTENANCE POINT (no background thread / timer exists in this
   // phase): evict every eligible session whose idle age is >= the
   // configured TTL (TTL == 0: immediately eligible once truly idle).
   // Deterministic: ascending SessionId.
-  std::vector<SessionId> evicted;
-  if (!policy_.idle_ttl.has_value()) return evicted;  // disabled
+  // THREE-STATE (pinned): ok + the evicted ids (possibly empty — an
+  // empty sweep is NOT an error); ERROR = the first real destroy
+  // failure, propagated verbatim (fail loud) — the sweep STOPS, the
+  // failed session is left exactly as it was (the transactional
+  // invariant), and it is never counted as a no-candidate.
+  if (out_evicted != nullptr) out_evicted->clear();
+  if (!policy_.idle_ttl.has_value()) return Status::ok_status();  // disabled
   const auto now = (clock_ != nullptr ? clock_ : &system_clock_)->now();
   const auto ttl = *policy_.idle_ttl;
   // SNAPSHOT of the managed ids (an eviction erases the id from
@@ -474,17 +490,26 @@ std::vector<SessionId> ServingController::evict_expired_sessions() {
     const auto ait = activity_.find(sid);
     if (ait == activity_.end()) continue;  // gone (defensive)
     if (now - ait->second < ttl) continue;  // not yet expired
-    if (evict_session_(sid, true)) evicted.push_back(sid);
+    const Status s = evict_session_(sid, true);
+    if (!s.ok) return s;  // FAIL LOUD: stop + propagate
+    if (out_evicted != nullptr) out_evicted->push_back(sid);
   }
-  return evicted;
+  return Status::ok_status();
 }
 
-bool ServingController::evict_one_lru_idle() {
+Status ServingController::evict_one_lru_idle(bool* out_evicted) {
+  // THREE-STATE (pinned): ok + true = one evicted; ok + false = NO
+  // eligible candidate (not an error); ERROR = a real destroy failure
+  // (fail loud — the caller must NOT count it as no-candidate).
+  if (out_evicted != nullptr) *out_evicted = false;
   for (const SessionId sid : lru_order_()) {
     if (!is_eviction_eligible(sid)) continue;
-    if (evict_session_(sid, false)) return true;
+    const Status s = evict_session_(sid, false);
+    if (!s.ok) return s;  // FAIL LOUD
+    if (out_evicted != nullptr) *out_evicted = true;
+    return Status::ok_status();
   }
-  return false;
+  return Status::ok_status();  // ok + NO candidate
 }
 
 bool ServingController::is_eviction_eligible(SessionId session_id) const {
@@ -524,22 +549,28 @@ std::vector<SessionId> ServingController::lru_order_() const {
   return out;
 }
 
-bool ServingController::evict_session_(SessionId session_id, bool by_ttl) {
+Status ServingController::evict_session_(SessionId session_id, bool by_ttl) {
   // TRANSACTIONAL: eviction == the frozen SessionManager::destroy_
   // session (the SessionId is invalidated forever — never reused; the
   // bound sequence is retired; the KV pages + the Delta slot are
   // released and zeroed; the logical context is gone). The managed
-  // metadata + the counters update ONLY after the destroy SUCCEEDS —
-  // a failure keeps the metadata (fail loud, never pretend).
-  const Status s = sessions_.destroy_session(session_id);
-  if (!s.ok) return false;
+  // metadata + the counters update ONLY after the destroy SUCCEEDS.
+  // A failure is PROPAGATED VERBATIM (fail loud — the pinned
+  // contract; never downgraded to a plain false / no-candidate):
+  // the activity metadata is kept, NONE of the eviction / no-
+  // candidate counters moves, and the session record is left exactly
+  // as it was.
+  const Status s = destroy_for_test != nullptr
+                       ? destroy_for_test(session_id)
+                       : sessions_.destroy_session(session_id);
+  if (!s.ok) return s;  // FAIL LOUD: no metadata / counter commit
   activity_.erase(session_id);
   if (by_ttl) {
     ++evicted_sessions_ttl_;
   } else {
     ++evicted_sessions_lru_;
   }
-  return true;
+  return Status::ok_status();
 }
 
 void ServingController::refresh_activity_(SessionId session_id) {
