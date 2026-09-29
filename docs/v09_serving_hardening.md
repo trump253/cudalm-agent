@@ -1,4 +1,4 @@
-# CUDALM v0.9 Serving Hardening — Phase A + Phase B（serving admission / backpressure / resource guardrails + committed-token streaming / cancellation / deadline）
+# CUDALM v0.9 Serving Hardening — Phase A–D（serving admission / backpressure / resource guardrails + committed-token streaming / cancellation / deadline + session TTL / LRU eviction + minimal HTTP serving / soak & fault hardening / final sign-off）
 
 > **状态：Phase A 完成（external review PASS）；Phase B 完成（等待
 > external review）**。
@@ -549,3 +549,172 @@ maintenance point）、distributed session store、session persistence
 to disk、KV swap-to-CPU、partial context eviction、sliding-window
 truncation、multi-stream、CUDA Graph、kernel 优化、chat template。
 **尤其禁止**：context overflow → evict oldest tokens。
+
+---
+
+## 14. Phase D：Minimal HTTP Serving（`cudalm-server`）
+
+**Pinned 原则**：Phase A/B/C 的 runtime chain 是 **FROZEN** 的——
+Phase D 只在其上**加**一层 serving，不重新设计任何下层。唯一的
+runtime chain：
+
+```
+Qwen35Model → ModelForwarder → Qwen35StateManager → SessionManager
+            → Scheduler → ServingController → HTTP text adapter
+            → minimal HTTP transport
+```
+
+`Qwen35SessionTextGenerator`（v0.8 facade：自建 Scheduler、绕过
+v0.9 的 serving 层）**禁止使用**；`cudalm-chat` 保持 frozen。
+Transport 代码在 `tools/common/`（tool-only）——**core CUDA
+runtime（include/cudalm + src）不获得任何 POSIX/socket 依赖**
+（`scripts/check_no_torch.sh` 的 no-torch gate 对 include/src
+保持 CLEAN；POSIX 头只出现在 tools/ 与 tests/ 中）。
+
+**Transport 技术边界**（刻意的 minimal 集合）：
+
+- Linux POSIX sockets（`#error` 非 Linux）；C++17；
+- **单线程 accept loop**：一次一个连接、一个请求；无 worker
+  pool、无 async reactor、无 epoll、无线程——**这不是并发 web
+  server**（诚实声明，不是实现细节）；
+- `Connection: close` 每个响应；无 keep-alive、无 HTTP/2、无
+  TLS、无 WebSocket；
+- 只接受 **Content-Length** body；任何 `Transfer-Encoding` →
+  415；header 上限 64KB、body 上限 64MB（超限 413，body 超限
+  **不读**——pre-scan Content-Length 直接拒）；
+- socket 60s rcv/snd 超时 + `TCP_NODELAY` + 小 `SO_SNDBUF`（4KB，
+  让客户端断开**尽快**在 send 侧可见）；SIGPIPE suppressed（
+  `MSG_NOSIGNAL` + `signal(SIGPIPE, SIG_IGN)`）；
+- 响应发送 binary-safe（`write` 循环，生成文本**绝不**过
+  `printf %s`——NUL/任意字节安全）；
+- 无 FetchContent / Boost / Asio / httplib / libcurl /
+  3rd-party JSON；
+- **over-read 合同**（实现 pinned）：header recv 可能把 body 的
+  前几个字节一并读进 header buffer——这些字节必须**复用**，不能
+  向 socket 再要（否则会死等不存在的字节）；读到的字节数
+  **超过** Content-Length（pipelined 第二个请求）→ 400
+  unsupported（`Connection: close` 语义 = 一个连接一个请求）。
+
+## 15. Phase D：HTTP API 与合同
+
+**所有端点**（CUDALM 自有 API，**NOT OpenAI-compatible**）：
+
+| 端点 | method | 成功 | 语义 |
+|---|---|---|---|
+| `/healthz` | GET | 200 `{"ok":true}` | liveness |
+| `/v1/stats` | GET | 200 | 11 counters（`ServingStats` 全量） |
+| `/v1/sessions` | POST | 201 `{"session_id":N}` | `ServingController::create_session()` |
+| `/v1/sessions/<id>` | GET | 200 | session summary（live、context length） |
+| `/v1/sessions/<id>` | DELETE | 200 | destroy（busy → **409**） |
+| `/v1/sessions/<id>/reset` | POST | 200 | `reset_session`（context → 0，session 存活） |
+| `/v1/sessions/<id>/turn` | POST | 200 / 408 | 同步 turn（JSON） |
+| `/v1/sessions/<id>/turn/stream` | POST | 200 NDJSON | stream turn |
+| 其它 | 任何 | 404 | unknown route / unknown session |
+| 错误 method 的已知路由 | 任何 | 405 | — |
+
+**CLI**（`cudalm-server`）：`--model --tokenizer --host --port
+--page-tokens --pages --slots --max-sessions
+--max-live-requests --session-ttl-ms --lru-on-pressure`。默认
+`--host 127.0.0.1`（**从不**默认 0.0.0.0）；未知 option → exit 2 +
+usage。启动日志显式声明 raw-text 合同与限制。
+
+**Raw-text turn 合同**（pinned，与 v0.8 的 raw-text 语义一致）：
+request body = 原始 UTF-8 bytes → `tokenizer.encode`（**NO trim、
+NO newline 注入、NO separator、NO chat-template、NO
+special-token 注入**——byte 逐字）→ `admit_turn`（7-arg，eos =
+tokenizer pinned EOS）→ drive → 收集 **committed** token ids →
+`tokenizer.decode`。**invalid UTF-8 / 空 body → 400**；encode 出
+空 token 序列 → 409；admit 被拒（session/request limit、context
+limit、pool OOM）→ 409（带 controller 消息）；forward 失败 →
+500；deadline terminal → **408**（sync；带正常 result body +
+`deadline_exceeded: true`）。
+
+**同步响应 JSON**：`request_id`、`session_id`、
+`generated_token_ids`、`generated_text`（正确 JSON escape：NUL /
+引号 / 反斜杠 / 控制字节 `\u00XX`）、`finish_reason`
+（`MaxNewTokens` / `Stop` / `Cancelled` / `Failed`）、
+`context_length`。
+
+**参数合同**：`max_new_tokens`（默认 8）、`temperature`、
+`top_k`、`top_p`、`seed`、`deadline_ms`（`0` = **disabled**，与
+controller 语义一致；`> 0` = `steady_clock::now() + ms`）。
+greedy = 默认（`SamplingConfig::greedy()`）；**unknown / 非法
+query param → 400 fail loud**（不静默忽略）。
+
+## 16. Phase D：Streaming 合同（NDJSON，commit-before-visible
+端到端）
+
+`POST /v1/sessions/<id>/turn/stream`：
+
+- 响应头：`Content-Type: application/x-ndjson`、`Connection:
+  close`、**无 Content-Length**（close-delimited）；
+- 驱动：controller `step_stream()` 循环（直到该 request terminal +
+  drained，硬上限 1M 事件）；
+- 事件序（**STRICT**）：先 N 个
+  `{"type":"token","request_id":N,"token_id":M}`（每个只属于本
+  rid），**之后**恰好 1 个
+  `{"type":"terminal","request_id":N,"status":"...","finish_reason":"...","deadline_exceeded":...,"generated_token_ids":[...],"generated_text":"...","context_length":N}`；
+- **commit-before-visible 不变量穿过 HTTP 层**：handler 只发送
+  controller **已 emit** 的 committed 事件——**从不** peek
+  `Request::generated` 的 pending tail；streamed token ids ==
+  terminal ids == scheduler 最终 committed ids（contract gate
+  逐项断言）；
+- **无 incremental text delta**（每个 token 事件只带 token_id，不
+  带文本片段；完整文本在 terminal）——**scope limit，显式文档化**
+  （base model raw-text 场景不需要 per-delta 文本；如需增量文本
+  是后续设计，不在 v0.9）。
+
+**Disconnect 合同**（pinned 硬化语义）：stream 中途客户端断开
+（send 失败 / EPIPE / RST）→
+
+1. 不 crash（SIGPIPE suppressed，send_all 返回 false）；
+2. 若 request 还 live：`cancel(rid)` + 非 streaming `run()`
+   drain/reap（committed state 保留、pending 不 commit、quota
+   释放、stream bookkeeping drained）；
+3. **Session 保持 LIVE**——disconnect 永不 destroy session
+   （只有显式 DELETE / eviction 能）；
+4. 下一 turn 在同一 session 上是正常 continuation（context 含
+   已 committed 部分）。
+
+## 17. Phase D：错误合同（稳定，不 parse 字符串）
+
+| status | 触发 | 说明 |
+|---|---|---|
+| 200 | 成功 | — |
+| 201 | session 创建 | — |
+| 400 | malformed request / bad param / invalid UTF-8 / 空 body / over-read pipelined | 请求侧问题 |
+| 404 | unknown route / unknown session | — |
+| 405 | 已知路由的错误 method | 含 `/turn/stream` 走 sync 路由 |
+| 408 | deadline terminal（sync turn） | 带正常 result body + `deadline_exceeded: true` |
+| 409 | admission/runtime 冲突（limit / context / pool OOM / busy DELETE / encode 空） | 来自 controller Status |
+| 413 | header > 64KB / body > 64MB | body 超限**不读** |
+| 415 | 任何 `Transfer-Encoding` | Content-Length only |
+| 500 | internal forward failure（terminal `Failed`） | — |
+
+Error body 稳定：`{"error":"..."}`。**分类来自 controller /
+parser 的显式 Status，**从不** parse controller 错误字符串**
+（与 Phase C 的 fail-loud 纪律一致）。
+
+## 18. Phase D：测试 gate
+
+| gate | 类型 | 验证 |
+|---|---|---|
+| `test_http_protocol` | CPU 表驱动 | parser（16 例：GET/POST ± body、NUL-safe、413/400/415）+ `json_escape`（NUL/引号/反斜杠/控制字节）+ `format_response`（Content-Length + Connection: close + binary-safe）+ `parse_query` |
+| `test_serving_http` | CPU contract（**无 socket**） | fake forwarder + **真** pools/SessionManager/Scheduler/ServingController + handler 直驱：create/turn/parity（**HTTP committed ids == controller committed ids**）/append-only 第二轮/stats/404+405/reset/destroy/stream（token 事件严格先于 terminal；streamed == terminal == scheduler committed）/deadline（fake clock → 408 + Cancelled + session 存活）/disconnect（write 失败 → live_requests 归 0、session LIVE、下一 turn 成功） |
+| `test_serving_lifecycle_soak` | CPU in-process soak | 240 iterations create/admit/drive/reset/destroy/TTL/LRU/reuse；per-iteration 不变量（无 stuck busy、三处 live 计数一致、SessionId 唯一、RequestId 单调）；teardown 后 **pools 归零**（used slots = 0、state bytes = 0） |
+| `test_serving_http_e2e` | **真实 checkpoint**（Python stdlib） | 真实 `cudalm-server` + socket：health → create A → sync turn（ctx = N_in + 8，input token 数**实测**——真 tokenizer 按 token 不按 byte）→ stream turn（streamed == terminal ids）→ stats → reset → post-reset turn → create B / turn B / destroy B / 404 → destroy A → 终态 live == 0 → health 仍 200 |
+| `test_serving_http_disconnect` | **真实 checkpoint**（Python stdlib socket） | create session → 原始 socket 发起 `turn/stream?max_new_tokens=256` → 读到 ≥1 token 事件 → **硬断 socket**（无 graceful drain）→ server 存活、`live_requests == 0`、原 session **仍 LIVE**、下一 turn 成功 continuation |
+| `test_serving_http_soak` | **真实 checkpoint**（bounded soak） | 默认 50 turns（`--iterations` 可扩展）；mixed create/multi-turn/reset/destroy/health/stats + fault shapes（invalid session 404、bad param 400、deadline_ms=0 disabled edge）；per-group 不变量（server alive、live_requests 回 0、live_sessions 与本地簿记一致）；终态 live_sessions == 0 / live_requests == 0 |
+
+**24h 式 soak 不是硬 gate**——bounded soak 是可重复的那一个
+（手动 `--iterations` 放大）。
+
+## 19. Phase D non-goals（与 v0.9 全程一致）
+
+OpenAI-compatible endpoints、chat template、TLS、auth、worker
+pool、async reactor、epoll、distributed serving、multi-GPU、
+multi-stream、CUDA Graph、speculative decoding、KV swap、prefix
+cache、kernel 优化、perf tuning、session persistence、incremental
+text delta。**frozen 层零改动**：model math / v0.8 state / Phase A
+quota / Phase B commit-before-visible / Phase C eviction
+semantics。

@@ -708,3 +708,106 @@ terminal-undrained 保护与 pressure safety gate）+
 `test_serving_eviction_integration`（真实 checkpoint 小型 gate：
 evict B → A 无污染 continuation → C fresh → pool accounting 归
 零）。详见 docs 与 provenance（SHA 绑定证据）。
+
+### Phase D：Minimal HTTP Serving + Soak/Fault Hardening + Final Sign-off
+
+**状态：Phase D 完成（v0.9 结束；等待 external review，不 merge
+main）**。
+
+`cudalm-server`：在 **frozen** 的 Phase A/B/C runtime chain 上
+（`Qwen35Model → ModelForwarder → Qwen35StateManager →
+SessionManager → Scheduler → ServingController`）加一层 **minimal
+HTTP/1.1 serving**。`Qwen35SessionTextGenerator`（v0.8 facade，自建
+Scheduler、绕过 v0.9 层）**不使用**；`cudalm-chat` 保持 frozen。
+Transport 在 `tools/common/`（tool-only，core CUDA runtime **不**
+引入 POSIX 依赖）：Linux POSIX sockets、C++17、**单线程 accept
+loop**（一次一个连接/请求，`Connection: close`），**无**
+FetchContent/Boost/Asio/httplib/libcurl/3rd-party JSON。
+
+- **CLI**：`--model --tokenizer --host --port --page-tokens
+  --pages --slots --max-sessions --max-live-requests
+  --session-ttl-ms --lru-on-pressure`；默认 `127.0.0.1`（**从不**
+  默认 0.0.0.0）；
+- **HTTP 范围**：只接受 Content-Length body；**无** request
+  chunked / keep-alive / HTTP2 / TLS / WebSocket；header/body 上限
+  64KB/64MB；socket rcv/snd 60s 超时；SIGPIPE suppressed；响应带
+  正确 Content-Length + binary-safe send（生成文本绝不过 `%s`）；
+- **API（CUDALM 自有，NOT OpenAI-compatible）**：
+  `GET /healthz` → `{"ok":true}`；`GET /v1/stats`（11 counters）；
+  `POST /v1/sessions` → 201 `{"session_id":N}`；
+  `POST /v1/sessions/<id>/reset`；`DELETE /v1/sessions/<id>`（busy
+  → 409）；`GET /v1/sessions/<id>`（summary）；
+- **Turn 合同（raw-text）**：`POST /v1/sessions/<id>/turn`（可带
+  `max_new_tokens`（默认 8）、`temperature`/`top_k`/`top_p`/
+  `seed`、`deadline_ms`（`0` = disabled））——body = 原始 UTF-8
+  bytes → tokenizer.encode（**NO trim / newline / separator /
+  chat-template / special-token 注入**）→ `admit_turn` → drive →
+  收集 committed ids → decode；同步 JSON 响应（request_id、
+  session_id、generated_token_ids、JSON-escaped generated_text、
+  finish_reason、context_length）；
+- **Stream 合同**：`POST /v1/sessions/<id>/turn/stream` →
+  `Content-Type: application/x-ndjson`、`Connection: close`（无
+  Content-Length，close-delimited）；`step_stream()` 驱动，先 N 个
+  `{"type":"token","request_id":N,"token_id":M}`，再 1 个
+  `{"type":"terminal",...}`（含 generated_token_ids /
+  generated_text / context_length / deadline_exceeded）。**STRICT
+  COMMIT-BEFORE-VISIBLE**：只发 controller 已 emit 的 committed
+  事件，**不** peek `Request::generated` pending tail；**无
+  incremental text delta**（scope limit，文档明示）；
+- **Disconnect 硬化**：stream 中途客户端断开 → 不 crash；live
+  request → `cancel(rid)` + 非 stream drain/reap；committed state
+  保留、pending 不 commit、quota 释放、stream bookkeeping drained；
+  **Session 保持 LIVE**（disconnect 永不 destroy）；下一 turn 正常
+  continuation；
+- **错误合同**（稳定 JSON error body，分类来自 controller
+  Status、**不** parse 错误字符串）：400 malformed/bad param/invalid
+  UTF-8；404 未知 route/session；405 错误 method；413 body 超限；
+  415 不支持的 transfer mode；408 deadline terminal（sync turn）；
+  409 runtime/admission 冲突（含 busy session DELETE）；500
+  internal forward failure。
+
+**单线程语义（诚实声明）**：这不是并发 web server——无 worker
+pool / async reactor / epoll；一个 accept loop 串行处理请求；一个
+CUDA stream。生产并发需要明确的后续设计，不在 v0.9 范围。
+
+启动（copy-paste）：
+
+```sh
+cmake -S . -B build && cmake --build build -j
+./build/cudalm-server \
+  --model build/data/qwen35_08b_full.cudalm \
+  --tokenizer build/data/qwen35_tokenizer.cudaltk \
+  --host 127.0.0.1 --port 8080
+```
+
+curl 示例：
+
+```sh
+curl -s http://127.0.0.1:8080/healthz
+curl -s -X POST http://127.0.0.1:8080/v1/sessions
+curl -s -X POST --data "Hello" "http://127.0.0.1:8080/v1/sessions/1/turn?max_new_tokens=8"
+curl -sN -X POST --data "Second" "http://127.0.0.1:8080/v1/sessions/1/turn/stream?max_new_tokens=8"
+curl -s http://127.0.0.1:8080/v1/stats
+curl -s -X POST http://127.0.0.1:8080/v1/sessions/1/reset
+curl -s -X DELETE http://127.0.0.1:8080/v1/sessions/1
+```
+
+**Phase D 明确限制（诚实清单）**：Qwen3.5-0.8B-**Base** raw-text
+completion——**无**官方 chat template（输出是 base model 自由
+continuation，不是 chat assistant）；**NOT OpenAI-compatible**；
+单线程/一次一个请求/单 CUDA stream；**无** TLS/auth；**无** HTTP/2、
+无 request chunked transfer、无 incremental text delta；**无**
+distributed session store、**无** persistence、**无** multi-stream、
+**无** CUDA Graph、**无** 多 GPU/多机。
+
+测试：`test_http_protocol`（CPU 表驱动 parser/transport）+
+`test_serving_http`（contract gate：fake forwarder + 真
+pools/SessionManager/Scheduler/controller + handler 直驱，无
+socket；HTTP committed ids == controller committed ids）+
+`test_serving_lifecycle_soak`（in-process CPU lifecycle soak，pools
+归零）+ 真实 checkpoint gate：`test_serving_http_e2e`（真实
+server + socket 全生命周期）/ `test_serving_http_disconnect`
+（Python stdlib socket：stream 中途硬断 → server 存活、
+live_requests==0、session 存活、continuation 成功）/
+`test_serving_http_soak`（bounded soak，默认 50 turns，`--iterations`
+可扩展）。详见 docs 与 provenance（SHA 绑定证据）。

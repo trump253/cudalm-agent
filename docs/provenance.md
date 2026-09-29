@@ -2254,3 +2254,97 @@ multi-stream、CUDA Graph、kernel 优化、chat template。尤其禁止：
 context overflow → evict oldest tokens。
 
 **本阶段不 merge 进 main**——待 external review 签核。
+
+---
+
+## v0.9 Phase D：Minimal HTTP Serving + Soak/Fault Hardening +
+Final Sign-off（v0.9 最后一阶段）
+
+**Pinned SHA**（本地验证，非 CI）：
+
+- `V09C_FINAL_FUNCTIONAL_SHA`
+  `076fe5f414d04caaf69fee188c1f0f0066fce11c`（frozen 基线）
+- `V09C_FINAL_TESTED_SHA`
+  `9f46feb097bcb5cb06ad04f008d0c4fdf976aead`（frozen 基线）
+- `V09D_FUNCTIONAL_SHA`
+  `66ac26cd2283e7313167072c3fdb42e89cdbe427`
+  （tools/common 协议 + transport + handler + cudalm-server +
+  CMake + 3 个 Python gate 脚本）
+- `V09D_FINAL_TESTED_SHA`
+  `26f16924502a33a122747b563f2b64864ab06415`
+  （3 个 CPU gate + 3 个真实 checkpoint gate 注册）
+
+**范围**：在 **frozen** 的 Phase A/B/C runtime chain（
+`Qwen35Model → ModelForwarder → Qwen35StateManager →
+SessionManager → Scheduler → ServingController`）上最小 HTTP/1.1
+serving——`tools/common/`（tool-only；core CUDA runtime 无 POSIX
+依赖）、单线程 accept loop、Content-Length only、CUDALM 自有 API
+（**NOT OpenAI-compatible**）、raw-text turn（NO trim /
+separator / chat-template / special-token 注入）、NDJSON
+stream（commit-before-visible 端到端、token 事件先于 terminal、
+**无** incremental text delta）、disconnect = cancel +
+drain/reap + **Session 永不 destroy**、稳定错误合同（400/404/405/
+408/409/413/415/500，不 parse controller 错误字符串）、bounded
+soak + disconnect fault gate。`Qwen35SessionTextGenerator`（v0.8
+facade）**未使用**；`cudalm-chat` frozen 未动。
+
+**实现中修掉的真 bug**（review 前记录）：transport `read_request`
+的 header pre-scan 在最后一行无 CRLF 时 `pos = eol + 2` 回绕
+（`npos + 2 → 1`）→ 无限循环；以及 header recv 可能 over-read
+body 前几个字节——body 字节必须**复用**而非向 socket 再要（否则
+死等不存在的字节，客户端表现为请求挂起直至超时）。两处的修复
+都在 `http_transport.cpp`，由 `test_http_protocol` + 真实
+checkpoint E2E（带 body 的 POST）覆盖。
+
+**v0.9 四阶段 summary**：
+
+- **Phase A**（本文件 v0.9 Phase A 段，Functional
+  `1bfe0f6cbe427a968ed4e262874046cecca969d2` 起）：
+  `ServingController` 薄控制层——session/request quota、zero-
+  mutation backpressure/reject、quota 生命周期、`ServingStats`；
+- **Phase B**（本文件 v0.9 Phase B 段，Functional
+  `d99d5219166120efbac273ac44afa7725ea15bfe` 起）：committed-
+  token streaming（commit-before-visible）、cancel preserves
+  Session、cooperative deadline（deadline terminal 重新锚定 TTL）；
+- **Phase C**（本文件 Phase C 段 + 2 个 review fix 段，frozen 基线
+  `V09C_FINAL_FUNCTIONAL_SHA` / `V09C_FINAL_TESTED_SHA`）：session
+  idle tracking + TTL/LRU eviction（`eviction == destroy whole
+  Session`，three-state fail-loud Status API）+ session-pressure
+  recovery（严格 `live_sessions == max_sessions` 才 evict；over-
+  limit fail-safe reject）；
+- **Phase D**（本段）：minimal HTTP serving + 真实 checkpoint
+  E2E/disconnect/soak gates + full ctest + sanitizer + final
+  sign-off。
+
+**验收证据**（`V09D_FINAL_TESTED_SHA` 树上，本地验证，非 CI）：
+
+- targeted `ctest -R
+  "http|server|evict|serving|stream|scheduler|session"
+  --output-on-failure` → **24/24 PASS**（Total 30.15 s；含 3 个新
+  CPU gate + 3 个新真实 checkpoint gate + 全部既有 serving/
+  scheduler/session/stream/eviction gate）；
+- **full `ctest --output-on-failure`** → **84/84 PASS**（Total
+  816.20 s）；
+- `bash scripts/check_no_torch.sh` → **CLEAN**（no
+  torch/pybind/py symbols in include/ src/）；
+- `compute-sanitizer --tool memcheck --leak-check full` on
+  `test_serving_stream_integration`（真实 checkpoint，streaming +
+  双 session interleaving——与 Phase D stream 路径最相关）→
+  **0 errors / 0 bytes leaked in 0 allocations**；
+- 真实 HTTP smoke = `test_serving_http_e2e` PASS（真实
+  `cudalm-server`，全生命周期，终态 live==0，server 存活）；
+- bounded soak = `test_serving_http_soak` PASS（**iterations=50,
+  turns=17, failures=0**，final live_sessions==0 /
+  live_requests==0）；
+- disconnect fault = `test_serving_http_disconnect` PASS
+  （256-token stream 读到 ≥1 token 后硬断 socket：server 存活、
+  live_requests==0、session 仍 LIVE、continuation turn 成功
+  ctx=10）。
+
+**v0.9 final sign-off 边界**：本阶段后 v0.9 停止——**不** merge
+进 main、**不**打 tag、等待 external review 签核；无 Phase E；
+无 OpenAI-compat / TLS / auth / worker pool / async / multi-
+stream / CUDA Graph / kernel 优化 / perf tuning / chat template /
+incremental text delta 等 scope creep。
+
+**本阶段不 merge 进 main**——待 external review 签核。
