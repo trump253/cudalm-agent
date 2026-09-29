@@ -536,6 +536,111 @@ add_test(NAME test_serving_eviction_integration
 set_tests_properties(test_serving_eviction_integration PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+# --- v0.9 Phase D: the minimal HTTP serving layer -----------------------------
+# The HTTP protocol / handler sources are TOOL-ONLY (tools/common/):
+# they are compiled into the test executables below (and into the
+# cudalm-server executable) — the core CUDA runtime library has NO
+# POSIX socket dependency.
+
+# test_http_protocol (CPU — pure protocol layer, NO sockets / NO
+# model): the table-driven parser contract (a valid GET / a POST +
+# Content-Length with an EXACT body (leading / trailing whitespace +
+# an embedded NUL) / a malformed request line / a malformed
+# Content-Length / an oversized header / an oversized body / an
+# unsupported request Transfer-Encoding / a wrong-but-valid method /
+# an unknown path) + the JSON escaping (NUL / quote / backslash /
+# control bytes) + the binary-safe response formatting.
+add_executable(test_http_protocol
+               cpu/test_http_protocol.cpp
+               ${CMAKE_SOURCE_DIR}/tools/common/http_protocol.cpp)
+target_link_libraries(test_http_protocol PRIVATE cudalm)
+target_include_directories(test_http_protocol
+                           PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_http_protocol COMMAND test_http_protocol)
+
+# test_serving_http (CPU — NO sockets / NO checkpoint / NO model: the
+# deterministic fake forwarder + real pools + real SessionManager /
+# Scheduler + the ServingController + a FAKE TextCodec, driving the
+# HTTP handler DIRECTLY):
+#   * create / turn / second turn (append-only context) / stats /
+#     reset / destroy / unknown session / wrong method / unknown
+#     route;
+#   * the HTTP generated ids == the scheduler's COMMITTED ids (the
+#     adapter does not bypass the serving runtime, never peeks the
+#     pending tail);
+#   * the streaming endpoint: token-id events BEFORE the terminal;
+#     the streamed ids == the terminal / final ids;
+#   * the deadline: a synchronous turn cancelled by the deadline is a
+#     408 (deterministic via the fake clock); the session survives;
+#   * a client DISCONNECT mid-stream: the request is cancelled +
+#     drained/reaped, the quota is released, the committed state
+#     stays, the session stays LIVE and continues the next turn.
+add_executable(test_serving_http
+               cpu/test_serving_http.cpp
+               ${CMAKE_SOURCE_DIR}/tools/common/http_protocol.cpp
+               ${CMAKE_SOURCE_DIR}/tools/common/http_serving_handler.cpp)
+target_link_libraries(test_serving_http PRIVATE cudalm)
+target_include_directories(test_serving_http
+                           PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_serving_http COMMAND test_serving_http)
+
+# test_serving_lifecycle_soak (CPU — the fast BOUNDED in-process pool-
+# lifecycle soak: ~240 mixed operations (create / admit / drive /
+# reset / destroy / TTL / LRU / create-reuse) through the HTTP handler
+# with the fake forwarder + fake clock; continuously verifies no stuck
+# busy, no SessionId / RequestId reuse, the session accounting
+# consistency, and — at teardown — the KV / Delta pools are EXACTLY
+# zero (no leaked pages / slots)):
+add_executable(test_serving_lifecycle_soak
+               cpu/test_serving_lifecycle_soak.cpp
+               ${CMAKE_SOURCE_DIR}/tools/common/http_protocol.cpp
+               ${CMAKE_SOURCE_DIR}/tools/common/http_serving_handler.cpp)
+target_link_libraries(test_serving_lifecycle_soak PRIVATE cudalm)
+target_include_directories(test_serving_lifecycle_soak
+                           PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME test_serving_lifecycle_soak COMMAND test_serving_lifecycle_soak)
+
+# v0.9 Phase D real-checkpoint gates (Python stdlib only; self-skip 77
+# when the checkpoint / artifacts are absent):
+
+# test_serving_http_e2e: starts the REAL cudalm-server and drives the
+# full API surface over a real socket (health / create / sync turn /
+# streaming turn / stats / reset / post-reset turn / create-destroy /
+# destroy->404 / final live==0 / still alive).
+add_test(NAME test_serving_http_e2e
+         COMMAND ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR}/scripts/v09_http_e2e.py
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk
+                 ${CMAKE_BINARY_DIR}/cudalm-server)
+set_tests_properties(test_serving_http_e2e PROPERTIES
+   SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# test_serving_http_disconnect: the client-disconnect fault gate — a
+# streaming turn with an abrupt socket close; the server survives,
+# live_requests is back to 0, the session is STILL LIVE and the next
+# turn is a successful continuation.
+add_test(NAME test_serving_http_disconnect
+         COMMAND ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR}/scripts/v09_http_disconnect.py
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk
+                 ${CMAKE_BINARY_DIR}/cudalm-server)
+set_tests_properties(test_serving_http_disconnect PROPERTIES
+   SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# test_serving_http_soak: the BOUNDED serving soak (default 50 turns;
+# the mix of create / multi-turn / reset / destroy / health / stats +
+# the fault shapes; the per-group invariants + the final live==0).
+add_test(NAME test_serving_http_soak
+         COMMAND ${CUDALM_TOOL_PYTHON3}
+                 ${CMAKE_SOURCE_DIR}/scripts/v09_server_soak.py
+                 ${CMAKE_BINARY_DIR}/data/qwen35_08b_full.cudalm
+                 ${CMAKE_BINARY_DIR}/data/qwen35_tokenizer.cudaltk
+                 ${CMAKE_BINARY_DIR}/cudalm-server)
+set_tests_properties(test_serving_http_soak PROPERTIES
+   SKIP_RETURN_CODE 77 TIMEOUT 3600)
+
 # --- Cross-language weight-file tests (Python tools -> C++ loader) ------------
 # tools/convert_weights.py (torch, offline) emits data/block_v01.cudalm into
 # the build tree; test_weights_crosslang loads it with the PyTorch-free C++
