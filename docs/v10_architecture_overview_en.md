@@ -37,12 +37,20 @@ Path B — persistent session CLI (cudalm-chat)
     (no ServingController)
 
 Path C — HTTP serving (cudalm-server, the v0.9 pinned serving chain)
-    cudalm-server
-      → HTTP handler (ServingHttpApi)
-      → ServingController
+    cudalm-server (server main: single-threaded accept loop)
+      → HTTP transport (HttpTransport: accept / read / send / close,
+                        one connection/request at a time)
+      → ServingHttpApi (route · method/path · Content-Type · query
+                        validation)
+      → Qwen35Tokenizer (encode — inside request handling, after
+                         CT/route validation, before admission)
+      → ServingController::admit_turn
       → Scheduler → SessionManager → Qwen35StateManager
       → Qwen35Model
       → CUDA kernels
+    (HTTP request handling happens before raw-text tokenization;
+     tokenization happens inside the request-handling path, before
+     admission)
 ```
 
 Shared lower-level component view (paths B and C share the stateful
@@ -50,7 +58,9 @@ stack below the Scheduler; path A drives the model directly with
 model-owned state):
 
 ```text
-Qwen35Tokenizer (shared by all three paths; raw text, no chat template)
+Qwen35Tokenizer (shared by all three paths; raw text, no chat template;
+                  on path C invoked inside ServingHttpApi's request
+                  handling, before admission)
       ↓
 Generation / scheduler layer   Qwen35Generator (path A) · Scheduler (B + C)
                                — host-side per-request sampling
@@ -79,11 +89,12 @@ Component responsibilities and boundaries:
 
 | component | owns | appears in | explicitly does NOT own |
 |---|---|---|---|
-| Frontend | CLI argument parsing & REPL (A/B); HTTP protocol, Content-Type contract, JSON/NDJSON encoding, status-code mapping (C) | A, B, C | inference, serving policy |
-| Qwen35Tokenizer | encode / decode (raw text, custom CUDLMTK1 format) | A, B, C | conversation format, chat templates |
+| Frontend (CLI entry points) | argument parsing & REPL (A/B); the server process entry point (C) | A, B, C | inference, serving policy |
+| Qwen35Tokenizer | encode / decode (raw text, custom CUDLMTK1 format); on path C invoked from inside ServingHttpApi's request handling | A, B, C | conversation format, chat templates |
 | Qwen35TextGenerator → Qwen35Generator | host-side prefill + sampling decode for one-shot; legacy model-owned state (`model.reset_state` / `model.forward_token`) | A only | sessions, policy |
 | Qwen35SessionTextGenerator | text-in / text-out for the session CLI; **owns its own Scheduler** | B only | serving policy, HTTP |
-| HTTP handler (ServingHttpApi) | single-threaded accept loop, routing, error codes | C only | inference, policy |
+| HTTP transport / server loop (HttpTransport + server main) | bind / listen, single-threaded accept loop, connection I/O (request reading), one connection/request at a time, send / close | C only | routing, codec, policy |
+| ServingHttpApi | route handling, method/path validation, Content-Type validation, query parsing, raw-text codec encode/decode (invoking Qwen35Tokenizer), ServingController calls, HTTP status / JSON result mapping, NDJSON streaming event semantics | C only | connection I/O, policy |
 | **ServingController** | **policy**: admission (session/request/context limits, zero-mutation rejection), streaming event draining (commit-before-visible), cancel / deadline, TTL sweeps, LRU-on-pressure eviction, quota lifecycles | **C only** | model math, scheduler internals, kernels |
 | Scheduler | the request lifecycle state machine (Waiting→Running→Finished/Cancelled/Failed), dynamic arrivals, decode cohort formation, driving batched/single forwards on one stream | B, C | serving policy, HTTP |
 | Session / state (SessionManager + Qwen35StateManager) | session create / reset / destroy; per-sequence state (Paged KV pages + Delta slots) allocation, zeroing, release | B, C | request admission, flow control |

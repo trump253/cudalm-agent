@@ -79,24 +79,28 @@ flowchart TD
         B["cudalm-chat<br/>persistent session CLI"]
         C["cudalm-server<br/>HTTP（single-threaded，<br/>one request at a time）"]
     end
-    TOK["Qwen35Tokenizer（CUDLMTK1 · raw text，无 chat template）——三条 path 共用"]
-
-    A --> TOK
-    B --> TOK
-    C --> TOK
 
     subgraph PA["Path A — one-shot（legacy，model-owned state）"]
+        TOKA["Qwen35Tokenizer（encode）"]
         TG["Qwen35TextGenerator → Qwen35Generator<br/>host-side prefill + greedy/sampling decode<br/>（model.reset_state / model.forward_token）"]
+        A --> TOKA
+        TOKA --> TG
     end
 
     subgraph PB["Path B — persistent session CLI"]
+        TOKB["Qwen35Tokenizer（encode）"]
         STG["Qwen35SessionTextGenerator<br/>（owns its own Scheduler）"]
+        B --> TOKB
+        TOKB --> STG
     end
 
     subgraph PC["Path C — HTTP serving（v0.9 pinned chain）"]
-        HPA["HTTP handler（ServingHttpApi）"]
+        HPA["HTTP transport（HttpTransport：accept loop ·<br/>connection I/O）→ ServingHttpApi<br/>（route · method/path · Content-Type · query 校验）"]
+        TOKC["Qwen35Tokenizer（encode——在 request handling 内部，<br/>CT/route 校验之后、admit_turn 之前）"]
         SC["ServingController —— 仅 HTTP path：<br/>admission / quota · streaming<br/>cancel / deadline · TTL / LRU"]
-        HPA --> SC
+        C --> HPA
+        HPA --> TOKC
+        TOKC --> SC
     end
 
     subgraph SL["共享 stateful 下层（Path B + C）"]
@@ -114,9 +118,6 @@ flowchart TD
     MDL["Qwen35Model —— 24 混合层前向：logits + 状态更新（不含采样）"]
     KER["CUDA Kernels<br/>W4A16 GEMV · paged attention · DeltaNet recurrence<br/>partial RoPE · RMSNorm · fused add+rmsnorm"]
 
-    TOK --> TG
-    TOK --> STG
-    TOK --> HPA
     TG --> MDL
     STG --> SCH
     SC --> SCH
@@ -125,14 +126,24 @@ flowchart TD
     MDL --> KER
 ```
 
-组件职责与所属 path（"—" = 该 path 不经过此组件）：
+**HTTP path 的顺序要点**：HTTP request handling（transport accept →
+`ServingHttpApi` 的 route / method/path / Content-Type / query 校验）
+发生在 raw-text tokenization **之前**；tokenization 在
+request-handling path 内部、admission 进 ServingController
+**之前**完成（`ServingHttpApi::handle` 中
+`codec->encode(req.body)` → `ctrl->admit_turn(...)`）。
+
+组件职责与所属 path（"—" = 该 path 不经过此组件；`Qwen35Tokenizer`
+是三条 path 共用的同一组件，CUDLMTK1 · raw text · 无 chat template，
+只是在 Path C 中由 `ServingHttpApi` 在 request handling 内部调用）：
 
 | 组件 | 职责 | A: generate | B: chat | C: server |
 |---|---|---|---|---|
-| Qwen35Tokenizer | encode / decode（raw text，无 template） | ✓ | ✓ | ✓ |
+| Qwen35Tokenizer | encode / decode（raw text，无 template）；Path C 中在 ServingHttpApi 的 request handling 内调用 | ✓ | ✓ | ✓ |
 | Qwen35TextGenerator → Qwen35Generator | one-shot prefill + host-side 采样 decode；**legacy model-owned state** | ✓ | — | — |
 | Qwen35SessionTextGenerator | session CLI 的 text-in/text-out，owns 自己的 Scheduler | — | ✓ | — |
-| HTTP handler（ServingHttpApi） | HTTP 协议、Content-Type 合同、JSON/NDJSON、状态码 | — | — | ✓ |
+| HTTP transport / server loop（HttpTransport + server main） | bind / listen、single-threaded accept loop、connection I/O、one request at a time | — | — | ✓ |
+| ServingHttpApi | routing、method/path + Content-Type 校验、query 解析、tokenizer codec encode/decode、ServingController 调用、JSON/NDJSON 响应与状态码 | — | — | ✓ |
 | ServingController | serving policy：admission / quota / streaming / cancel / deadline / TTL / LRU | — | — | ✓ |
 | Scheduler | request 生命周期、continuous batching、host-side per-request 采样 | — | ✓ | ✓ |
 | SessionManager / Qwen35StateManager | session 与 per-sequence 状态（Paged KV + Delta slot）生命周期 | — | ✓ | ✓ |

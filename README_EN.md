@@ -105,24 +105,28 @@ flowchart TD
         B["cudalm-chat<br/>persistent session CLI"]
         C["cudalm-server<br/>HTTP (single-threaded,<br/>one request at a time)"]
     end
-    TOK["Qwen35Tokenizer (CUDLMTK1 · raw text, no chat template) — shared by all three paths"]
-
-    A --> TOK
-    B --> TOK
-    C --> TOK
 
     subgraph PA["Path A — one-shot (legacy, model-owned state)"]
+        TOKA["Qwen35Tokenizer (encode)"]
         TG["Qwen35TextGenerator → Qwen35Generator<br/>host-side prefill + greedy/sampling decode<br/>(model.reset_state / model.forward_token)"]
+        A --> TOKA
+        TOKA --> TG
     end
 
     subgraph PB["Path B — persistent session CLI"]
+        TOKB["Qwen35Tokenizer (encode)"]
         STG["Qwen35SessionTextGenerator<br/>(owns its own Scheduler)"]
+        B --> TOKB
+        TOKB --> STG
     end
 
     subgraph PC["Path C — HTTP serving (v0.9 pinned chain)"]
-        HPA["HTTP handler (ServingHttpApi)"]
+        HPA["HTTP transport (HttpTransport: accept loop ·<br/>connection I/O) → ServingHttpApi<br/>(route · method/path · Content-Type · query validation)"]
+        TOKC["Qwen35Tokenizer (encode — inside request handling,<br/>after CT/route validation, before admit_turn)"]
         SC["ServingController — HTTP path only:<br/>admission / quota · streaming<br/>cancel / deadline · TTL / LRU"]
-        HPA --> SC
+        C --> HPA
+        HPA --> TOKC
+        TOKC --> SC
     end
 
     subgraph SL["Shared stateful stack (paths B + C)"]
@@ -140,9 +144,6 @@ flowchart TD
     MDL["Qwen35Model — 24-layer hybrid forward: logits + state update (no sampling here)"]
     KER["CUDA Kernels<br/>W4A16 GEMV · paged attention · DeltaNet recurrence<br/>partial RoPE · RMSNorm · fused add+rmsnorm"]
 
-    TOK --> TG
-    TOK --> STG
-    TOK --> HPA
     TG --> MDL
     STG --> SCH
     SC --> SCH
@@ -151,15 +152,25 @@ flowchart TD
     MDL --> KER
 ```
 
+**HTTP path ordering note**: HTTP request handling (transport accept →
+`ServingHttpApi`'s route / method-path / Content-Type / query
+validation) happens **before** raw-text tokenization; tokenization
+happens inside the request-handling path, **before** admission to the
+ServingController (`codec->encode(req.body)` → `ctrl->admit_turn(...)`
+inside `ServingHttpApi::handle`).
+
 Component responsibilities and path membership ("—" = the path does not
-go through this component):
+go through this component; `Qwen35Tokenizer` is the same component
+shared by all three paths — CUDLMTK1 · raw text · no chat template —
+invoked on path C from inside `ServingHttpApi`'s request handling):
 
 | component | responsibility | A: generate | B: chat | C: server |
 |---|---|---|---|---|
-| Qwen35Tokenizer | encode / decode (raw text, no template) | ✓ | ✓ | ✓ |
+| Qwen35Tokenizer | encode / decode (raw text, no template); on path C invoked inside ServingHttpApi's request handling | ✓ | ✓ | ✓ |
 | Qwen35TextGenerator → Qwen35Generator | one-shot prefill + host-side sampling decode; **legacy model-owned state** | ✓ | — | — |
 | Qwen35SessionTextGenerator | text-in / text-out for the session CLI; owns its own Scheduler | — | ✓ | — |
-| HTTP handler (ServingHttpApi) | HTTP protocol, Content-Type contract, JSON/NDJSON, status codes | — | — | ✓ |
+| HTTP transport / server loop (HttpTransport + server main) | bind / listen, single-threaded accept loop, connection I/O, one request at a time | — | — | ✓ |
+| ServingHttpApi | routing, method/path + Content-Type validation, query parsing, tokenizer codec encode/decode, ServingController calls, JSON/NDJSON response & status codes | — | — | ✓ |
 | ServingController | serving policy: admission / quota / streaming / cancel / deadline / TTL / LRU | — | — | ✓ |
 | Scheduler | request lifecycle, continuous batching, host-side per-request sampling | — | ✓ | ✓ |
 | SessionManager / Qwen35StateManager | session + per-sequence state (Paged KV + Delta slots) lifecycle | — | ✓ | ✓ |

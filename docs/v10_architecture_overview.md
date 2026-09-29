@@ -34,19 +34,27 @@ Path B — persistent session CLI（cudalm-chat）
     （无 ServingController）
 
 Path C — HTTP serving（cudalm-server，v0.9 pinned serving chain）
-    cudalm-server
-      → HTTP handler（ServingHttpApi）
-      → ServingController
+    cudalm-server（server main：single-threaded accept loop）
+      → HTTP transport（HttpTransport：accept / read / send / close，
+                      一次一个 connection/request）
+      → ServingHttpApi（route · method/path · Content-Type · query 校验）
+      → Qwen35Tokenizer（encode——在 request handling 内部，
+                         CT/route 校验之后、admission 之前）
+      → ServingController::admit_turn
       → Scheduler → SessionManager → Qwen35StateManager
       → Qwen35Model
       → CUDA kernels
+    （HTTP request handling 先于 raw-text tokenization；tokenization
+      发生在 request-handling path 内部、admission 之前）
 ```
 
 共享下层组件视图（Path B 与 C 共享 Scheduler 以下的 stateful 栈；
 Path A 直接驱动 model，state 由 model 持有）：
 
 ```text
-Qwen35Tokenizer（三条 path 共用，raw text，无 chat template）
+Qwen35Tokenizer（三条 path 共用，raw text，无 chat template；
+                  Path C 中在 ServingHttpApi 的 request handling 内部
+                  调用，位于 admission 之前）
       ↓
 Generation / scheduler 层   Qwen35Generator（Path A）· Scheduler（B + C）
                             —— host-side per-request 采样（greedy / 温度 /
@@ -72,11 +80,12 @@ Artifacts                   .cudalm v2（权重）+ .cudaltk（tokenizer）离�
 
 | 组件 | 职责（owns） | 出现于 | 明确不负责 |
 |---|---|---|---|
-| Frontend | CLI 的参数解析与 REPL（A/B）；HTTP 的协议、Content-Type 合同、JSON/NDJSON 编码、状态码映射（C） | A、B、C | 推理、serving 策略 |
-| Qwen35Tokenizer | encode / decode（raw text，自研 CUDLMTK1 格式） | A、B、C | 对话格式、chat template |
+| Frontend（CLI 入口） | 参数解析与 REPL（A/B）；server 进程入口（C） | A、B、C | 推理、serving 策略 |
+| Qwen35Tokenizer | encode / decode（raw text，自研 CUDLMTK1 格式）；Path C 中由 ServingHttpApi 在 request handling 内部调用 | A、B、C | 对话格式、chat template |
 | Qwen35TextGenerator → Qwen35Generator | one-shot 的 host-side prefill + 采样 decode；legacy model-owned state（`model.reset_state` / `model.forward_token`） | 仅 A | 会话、策略 |
 | Qwen35SessionTextGenerator | session CLI 的 text-in/text-out；**owns 自己的 Scheduler** | 仅 B | serving 策略、HTTP |
-| HTTP handler（ServingHttpApi） | 单线程 accept loop、路由、错误码 | 仅 C | 推理、策略 |
+| HTTP transport / server loop（HttpTransport + server main） | bind / listen、single-threaded accept loop、connection I/O（request 读取）、one connection/request at a time、send / close | 仅 C | routing、codec、策略 |
+| ServingHttpApi | route 处理、method/path 校验、Content-Type 校验、query 解析、raw-text codec encode/decode（调用 Qwen35Tokenizer）、ServingController 调用、HTTP 状态 / JSON 结果映射、NDJSON streaming 事件语义 | 仅 C | connection I/O、策略 |
 | **ServingController** | **policy**：admission（session/request/context 限流、zero-mutation 拒绝）、streaming 事件 drain（commit-before-visible）、cancel / deadline、TTL 扫描、LRU-on-pressure 驱逐、quota 生命周期 | **仅 C** | 模型数学、调度内部、kernel |
 | Scheduler | request 生命周期状态机（Waiting→Running→Finished/Cancelled/Failed）、动态到达、decode cohort 形成、驱动单 stream 上的 batched/单 forward | B、C | serving 策略、HTTP |
 | Session / state（SessionManager + Qwen35StateManager） | Session 的 create / reset / destroy；per-sequence 状态（Paged KV 页 + Delta slot）的分配、清零、释放 | B、C | 请求准入、流控 |

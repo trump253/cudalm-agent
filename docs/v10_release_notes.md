@@ -443,6 +443,25 @@ golden tolerance vs bit-exact parity）逐项一致。
 
 ---
 
+## Phase C Final Review Fix
+
+- corrected HTTP handler/tokenizer ordering in the portfolio
+  architecture diagram (README zh/en: three per-path tokenizer
+  nodes — HTTP request handling precedes raw-text tokenization,
+  which happens inside `ServingHttpApi::handle` before
+  `admit_turn`; the shared-tokenizer `A/B/C → TOK` edges that
+  implied the reverse order are gone);
+- separated HttpTransport / server-loop ownership (bind / listen,
+  single-threaded accept loop, connection I/O, one request at a
+  time) from ServingHttpApi responsibilities (routing, request
+  validation, tokenizer codec invocation, controller adaptation,
+  JSON/NDJSON response semantics) in the architecture overviews
+  (zh/en) and the README responsibility tables.
+
+Docs-only; no other Phase C content touched.
+
+---
+
 ## Deferred / Future Work
 
 - **README curl 示例**：现有 `curl --data` 示例在新 CT 合同下
