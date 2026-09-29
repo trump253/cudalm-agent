@@ -57,6 +57,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -107,6 +108,51 @@ struct ServingEvent {
   bool deadline_exceeded = false;
 };
 
+// ---- v0.9 Phase C: session TTL / LRU eviction -------------------------
+
+// The session eviction policy. The DEFAULT CONSTRUCTION KEEPS THE
+// PHASE A/B BEHAVIOR EXACTLY (both features disabled; max_sessions
+// reached still REJECTS — no silent behavior change):
+//
+//   * idle_ttl: std::nullopt = TTL DISABLED (the unambiguous
+//     disabled sentinel — there is no 0/-1 ambiguity). TTL == 0 =
+//     immediately eligible once TRULY idle; TTL > 0 = the normal
+//     idle timeout. No background thread / timer: the sweep happens
+//     only at explicit MAINTENANCE POINTS — evict_expired_sessions()
+//     and (only when a TTL is enabled) the lightweight sweep before
+//     create_session().
+//   * lru_on_session_pressure: when TRUE, create_session() at
+//     live_sessions == max_sessions (> 0) first tries to evict ONE
+//     eligible idle LRU session (oldest last activity, ties broken by
+//     the smaller SessionId). max_sessions == 0 can NEVER be bypassed
+//     by eviction (the zero-capacity contract). No eligible candidate
+//     -> the Phase A rejection (no SessionId consumed, zero mutation).
+//
+// EVICTION == DESTROY THE WHOLE SESSION (SessionManager::
+// destroy_session: the SessionId is invalidated forever — never
+// reused; the bound sequence is retired; KV pages + the Delta slot
+// are released and zeroed; the logical context is gone). This is NOT
+// context truncation: the v0.8 context-overflow contract (REJECT) is
+// untouched, and no token / KV / Delta state is ever truncated or
+// partially dropped.
+struct SessionEvictionPolicy {
+  std::optional<std::chrono::steady_clock::duration> idle_ttl;  // nullopt
+                                                               // = disabled
+  bool lru_on_session_pressure = false;
+
+  SessionEvictionPolicy with_idle_ttl(
+      std::chrono::steady_clock::duration ttl) const {
+    SessionEvictionPolicy p = *this;
+    p.idle_ttl = ttl;
+    return p;
+  }
+  SessionEvictionPolicy with_lru_on_session_pressure(bool on = true) const {
+    SessionEvictionPolicy p = *this;
+    p.lru_on_session_pressure = on;
+    return p;
+  }
+};
+
 // The serving admission limits. For max_sessions / max_live_requests:
 // -1 = UNLIMITED, 0 = zero capacity (reject EVERY admission), N>0 = N.
 // For max_context_tokens_per_session: 0 = disabled (no policy cap).
@@ -141,6 +187,12 @@ struct ServingStats {
   std::uint64_t rejected_session_limit = 0;
   std::uint64_t rejected_request_limit = 0;
   std::uint64_t rejected_context_limit = 0;
+  // v0.9 Phase C (AUTOMATIC evictions only — a manual
+  // destroy_session() is never counted here):
+  std::uint64_t evicted_sessions_ttl = 0;
+  std::uint64_t evicted_sessions_lru = 0;
+  std::uint64_t eviction_no_candidate = 0;  // a LRU-pressure attempt
+                                            // with NO eligible session
 };
 
 // The serving layer (v0.9 Phase A admission + Phase B committed-token
@@ -153,15 +205,29 @@ class ServingController {
   // only restrict below the model limit, never exceed it). `clock` is
   // NON-OWNING and optional (nullptr = the real system monotonic
   // clock); it is used ONLY for the per-request deadline checks.
+  // `policy` (v0.9 Phase C) defaults to the DISABLED policy — the
+  // Phase A/B behavior is exactly preserved unless eviction is
+  // explicitly enabled.
   ServingController(Scheduler& scheduler, SessionManager& sessions,
                     ServingLimits limits,
-                    MonotonicClock* clock = nullptr);
+                    MonotonicClock* clock = nullptr,
+                    SessionEvictionPolicy policy = {});
 
   // ---- session admission (policy) --------------------------------------
   // live sessions < max_sessions -> SessionManager::create_session;
   // limit reached -> REJECT (no SessionId consumed, zero mutation,
   // rejected_session_limit++). The manager's own capacity contract
   // (Delta slots / pool OOM) still applies below.
+  //
+  // v0.9 Phase C: with a TTL enabled, a lightweight sweep runs FIRST
+  // (expired idle sessions are evicted — they no longer count
+  // against the limit). With lru_on_session_pressure ENABLED and
+  // live_sessions == max_sessions (> 0), ONE eligible idle LRU
+  // session is evicted before the create is retried; with NO
+  // eligible candidate the Phase A rejection stands (the zero-
+  // capacity contract, max_sessions == 0, can never be bypassed by
+  // eviction). With the DEFAULT policy this method is EXACTLY the
+  // Phase A behavior.
   Status create_session(SessionId* out_id);
 
   // ---- turn admission (policy over the frozen Phase C preflight) -------
@@ -254,6 +320,34 @@ class ServingController {
   // fully-drained reap removes it from the tracked set).
   Status poll(RequestId request_id, std::vector<ServingEvent>* out);
 
+  // ---- session eviction (v0.9 Phase C) ---------------------------------
+  // EVICTION == DESTROY THE WHOLE SESSION via the frozen
+  // SessionManager::destroy_session (SessionId invalidated forever —
+  // never reused; sequence retired; KV pages + Delta slot released
+  // and zeroed; logical context gone). Never context truncation.
+  //
+  // A session is ELIGIBLE (idle + safe) only when ALL of: it is
+  // MANAGED by this controller (created through it — manager sessions
+  // created outside the controller are UNMANAGED: never guessed,
+  // never auto-evicted), it is still live, Scheduler::session_busy
+  // is FALSE, and it has NO terminal-but-undrained streaming
+  // bookkeeping (the Phase B lifecycle: a session whose stream
+  // events are not yet consumed is PROTECTED).
+  //
+  // Explicit TTL sweep (a MAINTENANCE POINT — no background thread
+  // or timer exists in this phase): evict every eligible session
+  // whose idle age (now - last activity) is >= the configured TTL
+  // (TTL == 0: immediately eligible once truly idle). Returns the
+  // evicted SessionIds (deterministic: ascending).
+  std::vector<SessionId> evict_expired_sessions();
+  // Explicit LRU eviction: evict the eligible idle session with the
+  // OLDEST last activity (ties: the smaller SessionId first — the
+  // pinned deterministic order). Returns true when one was evicted.
+  bool evict_one_lru_idle();
+  // A session is managed + live + not busy + not
+  // terminal-but-undrained.
+  bool is_eviction_eligible(SessionId session_id) const;
+
   // Quota sync (idempotent; safe to call any number of times).
   // REVIEW FIX (streaming lifecycle): a TERMINAL request's stream
   // state is NOT destroyed here — its committed-but-not-yet-emitted
@@ -282,6 +376,15 @@ class ServingController {
   // frozen step's Status (the first error; failures also surface as
   // RequestTerminal(Failed) events when draining).
   Status step_drive_(std::vector<ServingEvent>* out);
+  // Phase C: refresh the session's last-activity timestamp (only for
+  // MANAGED sessions).
+  void refresh_activity_(SessionId session_id);
+  // Phase C: the LRU order over the MANAGED live sessions (oldest
+  // last activity first; ties: smaller SessionId first).
+  std::vector<SessionId> lru_order_() const;
+  // Phase C: destroy ONE session transactionally (the metadata +
+  // counters update only after the frozen destroy SUCCEEDS).
+  bool evict_session_(SessionId session_id, bool by_ttl);
 
   Scheduler& sched_;
   SessionManager& sessions_;
@@ -299,6 +402,19 @@ class ServingController {
                                           // lifecycle is unaffected)
   std::map<RequestId, std::chrono::steady_clock::time_point> deadline_;
   std::set<RequestId> deadline_cancelled_;  // cancelled BY the deadline
+  // ---- v0.9 Phase C eviction bookkeeping --------------------------------
+  SessionEvictionPolicy policy_;
+  // Last-activity timestamp per MANAGED session (created through
+  // this controller). Unmanaged manager sessions have NO entry: they
+  // are never guessed, never auto-evicted. (A terminal-but-undrained
+  // session's protection is DERIVED: a tracked request id that is
+  // terminal is by construction not yet fully drained — the reap
+  // happens in the fully-drained path — so the eligibility check
+  // scans tracked_ directly.)
+  std::map<SessionId, std::chrono::steady_clock::time_point> activity_;
+  std::uint64_t evicted_sessions_ttl_ = 0;
+  std::uint64_t evicted_sessions_lru_ = 0;
+  std::uint64_t eviction_no_candidate_ = 0;
   std::uint64_t total_admitted_sessions_ = 0;
   std::uint64_t total_admitted_requests_ = 0;
   std::uint64_t rejected_session_limit_ = 0;

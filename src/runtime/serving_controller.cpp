@@ -19,11 +19,13 @@ namespace cudalm {
 ServingController::ServingController(Scheduler& scheduler,
                                      SessionManager& sessions,
                                      ServingLimits limits,
-                                     MonotonicClock* clock)
+                                     MonotonicClock* clock,
+                                     SessionEvictionPolicy policy)
     : sched_(scheduler),
       sessions_(sessions),
       limits_(limits),
-      clock_(clock) {
+      clock_(clock),
+      policy_(std::move(policy)) {
   // The context policy cap can only RESTRICT below the model limit,
   // never exceed it: clamp to the model's max_seq_len.
   const int max_seq = sessions_.manager().config().max_seq_len;
@@ -34,6 +36,24 @@ ServingController::ServingController(Scheduler& scheduler,
 }
 
 Status ServingController::create_session(SessionId* out_id) {
+  // ---- v0.9 Phase C (only when a policy is ENABLED — the default
+  // policy keeps EXACTLY the Phase A behavior) ------------------------
+  if (policy_.idle_ttl.has_value()) {
+    // MAINTENANCE POINT: a lightweight TTL sweep before the create
+    // (expired idle sessions no longer count against the limit):
+    (void)evict_expired_sessions();
+  }
+  if (policy_.lru_on_session_pressure && limits_.max_sessions > 0 &&
+      sessions_.num_sessions() >= limits_.max_sessions) {
+    // LRU-on-session-pressure: evict ONE eligible idle session, then
+    // retry the Phase A check below. max_sessions == 0 can NEVER be
+    // bypassed by eviction (the zero-capacity contract).
+    if (!evict_one_lru_idle()) {
+      ++eviction_no_candidate_;  // no eligible session: the Phase A
+                                 // rejection stands below
+    }
+  }
+  // ---- Phase A admission (unchanged) --------------------------------
   // -1 = unlimited, 0 = zero capacity (reject every create), N>0 = N.
   if (limits_.max_sessions >= 0 &&
       sessions_.num_sessions() >= limits_.max_sessions) {
@@ -46,6 +66,9 @@ Status ServingController::create_session(SessionId* out_id) {
   Status s = sessions_.create_session(out_id);
   if (!s.ok) return s;
   ++total_admitted_sessions_;
+  // Phase C: a successful create is ACTIVITY (and makes the session
+  // MANAGED — the unmanaged manager sessions are never touched):
+  activity_[*out_id] = (clock_ != nullptr ? clock_ : &system_clock_)->now();
   return s;
 }
 
@@ -97,18 +120,26 @@ Status ServingController::admit_turn(
   // per-request deadline (time_point::max() = no deadline).
   emitted_[*out_request_id] = 0;
   deadline_[*out_request_id] = deadline;
+  // Phase C: a successful admission is ACTIVITY:
+  refresh_activity_(session_id);
   return s;
 }
 
 Status ServingController::reset_session(SessionId session_id) {
   // Forwarding only: the session STAYS live (no quota change).
-  return sessions_.reset_session(session_id);
+  Status s = sessions_.reset_session(session_id);
+  if (s.ok) refresh_activity_(session_id);  // Phase C: activity
+  return s;
 }
 
 Status ServingController::destroy_session(SessionId session_id) {
   // Forwarding: the manager releases the session's state; the session
   // quota is the manager's live count (read through in stats()).
-  return sessions_.destroy_session(session_id);
+  // Phase C: a MANUAL destroy is never counted in the automatic-
+  // eviction stats — it only drops the managed-activity metadata.
+  Status s = sessions_.destroy_session(session_id);
+  if (s.ok) activity_.erase(session_id);
+  return s;
 }
 
 Status ServingController::cancel(RequestId request_id) {
@@ -121,6 +152,11 @@ Status ServingController::cancel(RequestId request_id) {
   // step_stream); the pending token is never emitted.
   Status s = sched_.cancel(request_id);
   if (!s.ok) return s;
+  // Phase C: an explicit cancel / deadline terminal is ACTIVITY:
+  {
+    const Request* r = sched_.get(request_id);
+    if (r != nullptr) refresh_activity_(r->session_id);
+  }
   // REVIEW FIX (unified streaming lifecycle): an explicit cancel that
   // leaves a TRACKED request terminal enters the same terminal-pending
   // lifecycle as a step-terminated one — its committed-but-undrained
@@ -144,6 +180,16 @@ Status ServingController::step_drive_(std::vector<ServingEvent>* out) {
   // boundary between scheduler steps): expired requests are cancelled
   // BEFORE their next forward, so no additional token is committed.
   check_deadlines_();
+  // (2b) Phase C: request EXECUTION is ACTIVITY — refresh the
+  // sessions of every request this step is about to drive (a long
+  // request keeps its session's TTL anchored to the recent activity,
+  // not to the admission time):
+  for (RequestId id : tracked_) {
+    const Request* r = sched_.get(id);
+    if (r != nullptr && !is_terminal(r->status)) {
+      refresh_activity_(r->session_id);
+    }
+  }
   // (2) THE FROZEN SCHEDULER STEP (batched decode etc. — untouched).
   Status s = sched_.step();
   // (3) Record the ids that are terminal NOW (for the drive-loop
@@ -395,6 +441,101 @@ int ServingController::live_request_count() const {
   return n;
 }
 
+std::vector<SessionId> ServingController::evict_expired_sessions() {
+  // A MAINTENANCE POINT (no background thread / timer exists in this
+  // phase): evict every eligible session whose idle age is >= the
+  // configured TTL (TTL == 0: immediately eligible once truly idle).
+  // Deterministic: ascending SessionId.
+  std::vector<SessionId> evicted;
+  if (!policy_.idle_ttl.has_value()) return evicted;  // disabled
+  const auto now = (clock_ != nullptr ? clock_ : &system_clock_)->now();
+  const auto ttl = *policy_.idle_ttl;
+  // SNAPSHOT of the managed ids (an eviction erases the id from
+  // activity_ — never iterate a map you erase from):
+  std::vector<SessionId> managed;
+  managed.reserve(activity_.size());
+  for (const auto& kv : activity_) managed.push_back(kv.first);
+  for (const SessionId sid : managed) {  // ascending SessionId
+    if (!is_eviction_eligible(sid)) continue;  // idle + safe first
+    const auto ait = activity_.find(sid);
+    if (ait == activity_.end()) continue;  // gone (defensive)
+    if (now - ait->second < ttl) continue;  // not yet expired
+    if (evict_session_(sid, true)) evicted.push_back(sid);
+  }
+  return evicted;
+}
+
+bool ServingController::evict_one_lru_idle() {
+  for (const SessionId sid : lru_order_()) {
+    if (!is_eviction_eligible(sid)) continue;
+    if (evict_session_(sid, false)) return true;
+  }
+  return false;
+}
+
+bool ServingController::is_eviction_eligible(SessionId session_id) const {
+  // MANAGED (created through this controller — unmanaged sessions are
+  // never guessed) + still live:
+  if (activity_.find(session_id) == activity_.end()) return false;
+  if (sessions_.lookup(session_id) == nullptr) return false;
+  // Not busy (no live request):
+  if (sched_.session_busy(session_id)) return false;
+  // No TERMINAL-BUT-UNDRAINED streaming bookkeeping (the Phase B
+  // lifecycle: a tracked id that is terminal is by construction not
+  // yet fully drained — the reap happens in the fully-drained path):
+  for (RequestId id : tracked_) {
+    const Request* r = sched_.get(id);
+    if (r != nullptr && r->session_id == session_id &&
+        is_terminal(r->status)) {
+      return false;  // PROTECTED
+    }
+  }
+  return true;
+}
+
+std::vector<SessionId> ServingController::lru_order_() const {
+  // The MANAGED live sessions, oldest LAST ACTIVITY first; ties broken
+  // by the smaller SessionId (the pinned deterministic order — std::
+  // pair comparison: time first, then id).
+  std::vector<std::pair<std::chrono::steady_clock::time_point, SessionId>> v;
+  for (const auto& kv : activity_) {
+    if (sessions_.lookup(kv.first) != nullptr) {
+      v.emplace_back(kv.second, kv.first);  // (last activity, SessionId)
+    }
+  }
+  std::sort(v.begin(), v.end());
+  std::vector<SessionId> out;
+  out.reserve(v.size());
+  for (const auto& p : v) out.push_back(p.second);
+  return out;
+}
+
+bool ServingController::evict_session_(SessionId session_id, bool by_ttl) {
+  // TRANSACTIONAL: eviction == the frozen SessionManager::destroy_
+  // session (the SessionId is invalidated forever — never reused; the
+  // bound sequence is retired; the KV pages + the Delta slot are
+  // released and zeroed; the logical context is gone). The managed
+  // metadata + the counters update ONLY after the destroy SUCCEEDS —
+  // a failure keeps the metadata (fail loud, never pretend).
+  const Status s = sessions_.destroy_session(session_id);
+  if (!s.ok) return false;
+  activity_.erase(session_id);
+  if (by_ttl) {
+    ++evicted_sessions_ttl_;
+  } else {
+    ++evicted_sessions_lru_;
+  }
+  return true;
+}
+
+void ServingController::refresh_activity_(SessionId session_id) {
+  // Only MANAGED sessions have an entry; unmanaged sessions are never
+  // guessed (a no-op for them).
+  if (activity_.find(session_id) == activity_.end()) return;
+  activity_[session_id] =
+      (clock_ != nullptr ? clock_ : &system_clock_)->now();
+}
+
 ServingStats ServingController::stats() const {
   ServingStats s;
   s.live_sessions = sessions_.num_sessions();
@@ -404,6 +545,9 @@ ServingStats ServingController::stats() const {
   s.rejected_session_limit = rejected_session_limit_;
   s.rejected_request_limit = rejected_request_limit_;
   s.rejected_context_limit = rejected_context_limit_;
+  s.evicted_sessions_ttl = evicted_sessions_ttl_;
+  s.evicted_sessions_lru = evicted_sessions_lru_;
+  s.eviction_no_candidate = eviction_no_candidate_;
   return s;
 }
 
