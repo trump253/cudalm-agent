@@ -29,9 +29,11 @@
 #include "../../tests/common/check.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -602,6 +604,152 @@ int test_disconnect_cleanup() {
 }
 
 
+// ---- F. the turn-query RESOLUTION contract (the frozen v0.4
+// cudalm-generate sampling mode / numeric contract, pinned on the
+// RESOLVED SamplingConfig — no dependence on random generation) ------
+
+int test_turn_query_resolution() {
+  // A null-deps api is sufficient: resolve_turn_query is a pure query
+  // -> config resolution and never touches deps_ (the 400 mapping for
+  // a failed resolution is asserted below end to end as well):
+  const http::ServingHttpApi api(http::ServingHttpDeps{});
+  int max_new = -1;
+  SamplingConfig cfg;
+  std::chrono::steady_clock::time_point deadline;
+  bool has_deadline = true;
+  std::string err;
+  auto resolve = [&](const std::string& q) {
+    max_new = -1;
+    cfg = SamplingConfig{};
+    has_deadline = true;
+    err.clear();
+    return api.resolve_turn_query(q, &max_new, &cfg, &deadline,
+                                  &has_deadline, &err);
+  };
+
+  // ---- 1. no sampling flags -> GREEDY (the default) --------------------
+  CHECK(resolve(""));
+  CHECK(cfg.is_greedy());
+  CHECK_EQ(cfg.temperature, 0.0f);
+  CHECK_EQ(cfg.top_k, 0);
+  CHECK_EQ(cfg.top_p, 1.0f);
+  CHECK_EQ(static_cast<unsigned long long>(cfg.seed), 0ULL);
+  CHECK_EQ(max_new, 8);  // the default
+  CHECK(!has_deadline);
+
+  // ---- 2. top_k ONLY -> SAMPLING mode, implicit temperature 1.0 --------
+  CHECK(resolve("top_k=40"));
+  CHECK(!cfg.is_greedy());
+  CHECK_EQ(cfg.temperature, 1.0f);
+  CHECK_EQ(cfg.top_k, 40);
+  CHECK_EQ(cfg.top_p, 1.0f);
+  CHECK_EQ(static_cast<unsigned long long>(cfg.seed), 0ULL);
+
+  // ---- 3. top_p ONLY -> SAMPLING mode, implicit temperature 1.0 --------
+  CHECK(resolve("top_p=0.9"));
+  CHECK(!cfg.is_greedy());
+  CHECK_EQ(cfg.temperature, 1.0f);
+  CHECK_EQ(cfg.top_k, 0);
+  CHECK_EQ(cfg.top_p, 0.9f);
+
+  // ---- 4. top_k + top_p + seed -> all resolved --------------------------
+  CHECK(resolve("top_k=40&top_p=0.9&seed=42"));
+  CHECK(!cfg.is_greedy());
+  CHECK_EQ(cfg.temperature, 1.0f);
+  CHECK_EQ(cfg.top_k, 40);
+  CHECK_EQ(cfg.top_p, 0.9f);
+  CHECK_EQ(static_cast<unsigned long long>(cfg.seed), 42ULL);
+
+  // ---- 5. seed ONLY -> GREEDY (the seed does not enable sampling and
+  //      is IGNORED — greedy consumes no RNG) ------------------------------
+  CHECK(resolve("seed=42"));
+  CHECK(cfg.is_greedy());
+  CHECK_EQ(cfg.temperature, 0.0f);
+  CHECK_EQ(cfg.top_k, 0);
+  CHECK_EQ(cfg.top_p, 1.0f);
+  CHECK_EQ(static_cast<unsigned long long>(cfg.seed), 0ULL);
+
+  // ---- 6. explicit temperature=0 -> the FROZEN GREEDY path --------------
+  CHECK(resolve("temperature=0"));
+  CHECK_EQ(cfg.temperature, 0.0f);
+  CHECK(cfg.is_greedy());
+  CHECK_EQ(cfg.top_k, 0);
+  CHECK_EQ(cfg.top_p, 1.0f);
+
+  // ---- 7. explicit temperature=-0 -> the FROZEN GREEDY path -------------
+  CHECK(resolve("temperature=-0"));
+  CHECK_EQ(cfg.temperature, 0.0f);
+  CHECK(cfg.is_greedy());
+
+  // ---- 8. temperature=0 WITH a sampling flag -> sampling mode is
+  //      enabled by PRESENCE, but temperature 0 selects the frozen
+  //      greedy path at the runtime (exactly the v0.4 resolution) ------
+  CHECK(resolve("temperature=0&top_k=40"));
+  CHECK_EQ(cfg.temperature, 0.0f);
+  CHECK(cfg.is_greedy());
+  CHECK_EQ(cfg.top_k, 40);
+
+  // ---- 9. temperature + seed -> sampling mode, both resolved -----------
+  CHECK(resolve("temperature=0.7&seed=42"));
+  CHECK(!cfg.is_greedy());
+  CHECK_EQ(cfg.temperature, 0.7f);
+  CHECK_EQ(static_cast<unsigned long long>(cfg.seed), 42ULL);
+
+  // ---- 10. the v0.4 temperature TEXTUAL RANGE — the rejections ----------
+  //      (overflow to inf / non-finite / double->float underflow to
+  //      zero / strtod-level underflow / partial consumption):
+  static const char* kBadTemps[] = {"1e40",   "1e308",   "inf",
+                                    "nan",    "1e-50",   "7e-46",
+                                    "1e-5000", "-1e-5000", "1.5x"};
+  for (const char* bad : kBadTemps) {
+    CHECK(!resolve(std::string("temperature=") + bad));
+  }
+
+  // ---- 11. the legal edges of the float range ----------------------------
+  CHECK(resolve("temperature=0"));
+  CHECK_EQ(cfg.temperature, 0.0f);
+  CHECK(resolve("temperature=-0"));
+  CHECK_EQ(cfg.temperature, 0.0f);
+  CHECK(resolve("temperature=1.4e-45"));  // a denormal float
+  CHECK(cfg.temperature > 0.0f);
+  CHECK(std::isfinite(cfg.temperature));
+  CHECK(resolve("temperature=1e-45"));  // a denormal float
+  CHECK(cfg.temperature > 0.0f);
+  CHECK(std::isfinite(cfg.temperature));
+  CHECK(resolve("temperature=1.17549435e-38"));  // FLT_MIN
+  CHECK_EQ(cfg.temperature, std::numeric_limits<float>::min());
+  CHECK(resolve("temperature=3.4e38"));  // ~FLT_MAX
+  CHECK(cfg.temperature > 0.0f);
+  CHECK(std::isfinite(cfg.temperature));
+
+  // ---- 12. the deadline part (unchanged contract) -------------------------
+  CHECK(resolve("deadline_ms=1000"));
+  CHECK(has_deadline);
+  CHECK(deadline > std::chrono::steady_clock::now());
+  CHECK(resolve("deadline_ms=0"));  // disabled (pinned)
+  CHECK(!has_deadline);
+
+  // ---- 13. end to end: an out-of-contract query is a 400 BEFORE any
+  //      admission (nothing is admitted, nothing is forwarded) ----------
+  cudaStream_t stream0 = nullptr;
+  CUDA_CHECK(cudaStreamCreate(&stream0));
+  Runtime rt(stream0, ServingLimits{-1, -1, 0});
+  const http::HttpResponse cr = rt.api.handle(req("POST", "/v1/sessions"));
+  CHECK_EQ(cr.status, 201);
+  long sid = 0;
+  CHECK(json_int(cr.body, "session_id", &sid));
+  const http::HttpResponse bad =
+      turn(rt.api, static_cast<int>(sid), "temperature=1e40", "hi");
+  CHECK_EQ(bad.status, 400);
+  const http::HttpResponse stt = rt.api.handle(req("GET", "/v1/stats"));
+  long admitted = -1;
+  CHECK(json_int(stt.body, "total_admitted_requests", &admitted));
+  CHECK_EQ(admitted, 0L);  // the 400 fired BEFORE the admission
+
+  TEST_PASS("test_serving_http_turn_query_resolution");
+  return 0;
+}
+
 int main() {
   int rc = 0;
   rc |= test_create_turn_parity();
@@ -609,6 +757,7 @@ int main() {
   rc |= test_stream();
   rc |= test_deadline();
   rc |= test_disconnect_cleanup();
+  rc |= test_turn_query_resolution();
   if (rc != 0) {
     std::fprintf(stderr, "test_serving_http: FAILED\n");
     return rc;
