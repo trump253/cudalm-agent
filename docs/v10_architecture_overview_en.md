@@ -10,38 +10,92 @@ names stay in their original English.
 
 ---
 
-## 1. Layer Stack
+## 1. Execution Paths & Layer Stack
+
+**CUDALM has three user-facing execution paths** (all of them end at
+`Qwen35Model → CUDA kernels`, but they go through different
+components):
 
 ```text
-Frontend            CLI (cudalm-generate / cudalm-chat) + HTTP (cudalm-server)
-      ↓
-Serving control     ServingController — admission / quota / streaming /
-plane                       cancel / deadline / TTL / LRU (an independent thin control layer)
-      ↓
-Scheduler           request lifecycle, continuous batching, batched-decode orchestration
-      ↓
-Session / state     SessionManager + Qwen35StateManager — sessions and
-                      per-sequence state (Paged KV + Delta slots)
-      ↓
-Model runtime       Qwen35Model — the 24-layer hybrid forward, state updates
-      ↓
-CUDA kernels        W4A16/bf16 GEMV · paged attention · DeltaNet recurrence ·
-                    partial RoPE · RMSNorm · fused add+rmsnorm · batched variants
-      ↓
-Artifacts           .cudalm v2 (weights) + .cudaltk (tokenizer) offline files
+Path A — one-shot generation (cudalm-generate)
+    cudalm-generate
+      → Qwen35Tokenizer
+      → Qwen35TextGenerator → Qwen35Generator
+            (host-side prefill + greedy/sampling decode)
+      → Qwen35Model (legacy model-owned state:
+                     model.reset_state / model.forward_token)
+      → CUDA kernels
+    (no ServingController / Scheduler / SessionManager / StateManager)
+
+Path B — persistent session CLI (cudalm-chat)
+    cudalm-chat
+      → Qwen35Tokenizer
+      → Qwen35SessionTextGenerator (owns its own Scheduler)
+      → Scheduler → SessionManager → Qwen35StateManager
+      → Qwen35Model
+      → CUDA kernels
+    (no ServingController)
+
+Path C — HTTP serving (cudalm-server, the v0.9 pinned serving chain)
+    cudalm-server
+      → HTTP handler (ServingHttpApi)
+      → ServingController
+      → Scheduler → SessionManager → Qwen35StateManager
+      → Qwen35Model
+      → CUDA kernels
 ```
 
-Layer responsibilities and boundaries:
+Shared lower-level component view (paths B and C share the stateful
+stack below the Scheduler; path A drives the model directly with
+model-owned state):
 
-| layer | owns | explicitly does NOT own |
-|---|---|---|
-| Frontend | protocol & argument parsing; the CLI REPL; HTTP Content-Type contract, JSON/NDJSON encoding, status-code mapping | inference, serving policy |
-| Tokenizer | encode / decode (raw text, custom CUDLMTK1 format) | conversation format, chat templates |
-| **Serving control plane** | **policy**: admission (session/request/context limits, zero-mutation rejection), streaming event draining (commit-before-visible), cancel / deadline, TTL sweeps, LRU-on-pressure eviction, quota lifecycles | model math, scheduler internals, kernels |
-| Scheduler | the request lifecycle state machine (Waiting→Running→Finished/Cancelled/Failed), dynamic arrivals, decode cohort formation, driving batched/single forwards on one stream | serving policy, HTTP |
-| Session / state | session create / reset / destroy; per-sequence state (KV pages + Delta slots) allocation, zeroing, release | request admission, flow control |
-| Model runtime + kernels | the 24-layer hybrid forward (B=1 and B>1 paths), KV / Delta state updates, sampling (greedy / temperature / top-k / top-p) | concurrency, sessions, networking |
-| Artifacts | offline conversion outputs (Python exists only in the tools that produce them) | — |
+```text
+Qwen35Tokenizer (shared by all three paths; raw text, no chat template)
+      ↓
+Generation / scheduler layer   Qwen35Generator (path A) · Scheduler (B + C)
+                               — host-side per-request sampling
+                                 (greedy / temperature / top-k / top-p / seed)
+      ↓
+Session / state                SessionManager + Qwen35StateManager (B + C)
+                               — Paged KV + Delta slots (session-bound)
+      ↓
+Model runtime                  Qwen35Model — the 24-layer hybrid forward →
+                               logits + state update (no sampling here)
+      ↓
+CUDA kernels                   W4A16/bf16 GEMV · paged attention · DeltaNet
+                               recurrence · partial RoPE · RMSNorm ·
+                               fused add+rmsnorm · batched variants
+      ↓
+Artifacts                      .cudalm v2 (weights) + .cudaltk (tokenizer) offline files
+```
+
+**Key boundary: ServingController is the policy boundary of the HTTP
+serving path — it is NOT a universal frontend layer for every CUDALM
+execution mode.** `cudalm-generate` and `cudalm-chat` do not go
+through it; it is an independent thin control layer layered onto path
+C in v0.9.
+
+Component responsibilities and boundaries:
+
+| component | owns | appears in | explicitly does NOT own |
+|---|---|---|---|
+| Frontend | CLI argument parsing & REPL (A/B); HTTP protocol, Content-Type contract, JSON/NDJSON encoding, status-code mapping (C) | A, B, C | inference, serving policy |
+| Qwen35Tokenizer | encode / decode (raw text, custom CUDLMTK1 format) | A, B, C | conversation format, chat templates |
+| Qwen35TextGenerator → Qwen35Generator | host-side prefill + sampling decode for one-shot; legacy model-owned state (`model.reset_state` / `model.forward_token`) | A only | sessions, policy |
+| Qwen35SessionTextGenerator | text-in / text-out for the session CLI; **owns its own Scheduler** | B only | serving policy, HTTP |
+| HTTP handler (ServingHttpApi) | single-threaded accept loop, routing, error codes | C only | inference, policy |
+| **ServingController** | **policy**: admission (session/request/context limits, zero-mutation rejection), streaming event draining (commit-before-visible), cancel / deadline, TTL sweeps, LRU-on-pressure eviction, quota lifecycles | **C only** | model math, scheduler internals, kernels |
+| Scheduler | the request lifecycle state machine (Waiting→Running→Finished/Cancelled/Failed), dynamic arrivals, decode cohort formation, driving batched/single forwards on one stream | B, C | serving policy, HTTP |
+| Session / state (SessionManager + Qwen35StateManager) | session create / reset / destroy; per-sequence state (Paged KV pages + Delta slots) allocation, zeroing, release | B, C | request admission, flow control |
+| Model runtime + kernels | the 24-layer hybrid forward (B=1 and B>1 paths) → logits; KV / Delta state updates | A, B, C | sampling, concurrency, sessions, networking |
+| Artifacts | offline conversion outputs (Python exists only in the tools that produce them) | — | — |
+
+**Sampling is host-side generation/control logic**: the
+`Qwen35Model` / CUDA kernels are responsible up to logits + state
+update only; the greedy / temperature / top-k / top-p / seed token
+selection is done on the host by `Qwen35Generator` (path A) or by the
+Scheduler's per-request Sampler (paths B/C, sampling each logits row
+after the forward). The CUDA kernels do not implement top-k/top-p.
 
 **The core boundary principle: the inference/runtime layer owns
 inference correctness; the serving/control layer owns policy.** The
@@ -78,6 +132,10 @@ here).
 
 ## 3. Hybrid State Management
 
+This section describes the **session-bound paths** (path B / C:
+`cudalm-chat` / `cudalm-server`); the legacy one-shot path's state
+model is covered at the end of the section.
+
 ```mermaid
 flowchart TD
     SID["SessionId"] --> SEQ["SequenceId (the session's bound sequence)"]
@@ -87,7 +145,8 @@ flowchart TD
     DS --> REC["recurrent state [16, 128, 128] FP32<br/>(the delta-rule recurrence memory)"]
 ```
 
-State ownership rules (held uniformly by `Qwen35StateManager`):
+State ownership rules (held uniformly by `Qwen35StateManager` in the
+session-bound paths):
 
 - **allocation on admission**: creating a session allocates all of
   its sequence's state (KV pages grow on demand + Delta slots);
@@ -105,8 +164,42 @@ State ownership rules (held uniformly by `Qwen35StateManager`):
 Full Attention and DeltaNet state live under one sequence lifecycle,
 which is the key engineering point of serving a hybrid architecture:
 any leak or misalignment in one kind of state would break both
-attention types at once, and the session is the single lifecycle
-unit, so no "stray state" can exist.
+attention types at once; within the session-bound paths, the session
+is that path's single state-lifecycle boundary, so no state strays
+outside a session.
+
+### 3.1 Legacy vs external state (two state models)
+
+CUDALM deliberately retains two state models (an important
+engineering boundary):
+
+```text
+Legacy one-shot path (path A: cudalm-generate)
+Qwen35Model
+ ├─ owned KV state (held inside the model)
+ └─ owned Delta state (held inside the model)
+    API: model.reset_state() / model.forward_token()
+
+Session-bound path (path B/C: cudalm-chat / cudalm-server)
+SessionId
+   ↓
+SequenceId
+   ├─ Paged KV pages (held by the StateManager)
+   └─ Delta state slot (held by the StateManager)
+    API: forward_token_with_state / forward_batch_with_state
+```
+
+Both paths share the same frozen kernels and math contract (the same
+24-layer forward, the same quantized layouts). **The external-state
+path was validated against the frozen legacy path with bit-exact
+parity where required** (where exact identity is required: same token
+stream, same frozen kernels, same op order → no tolerance,
+memcmp), guaranteeing that moving the state outside the model
+changes no numeric behavior. Therefore the Session is **not** the
+universal lifecycle unit for every runtime mode: frozen legacy
+one-shot / request-scoped execution paths (including the
+`Scheduler::admit()` request-scoped path) still exist, and their
+state does not hang off a Session.
 
 ## 4. Persistent Multi-turn Sessions
 
@@ -208,8 +301,9 @@ unshow".
 
 ## 7. Serving Control Plane (ServingController)
 
-The v0.9 independent thin control layer (full API & contracts:
-`docs/v09_serving_hardening.md`):
+The v0.9 independent thin control layer, **present only on the HTTP
+serving path (path C)** — `cudalm-generate` / `cudalm-chat` do not go
+through it (full API & contracts: `docs/v09_serving_hardening.md`):
 
 - **ServingLimits**: `max_sessions` / `max_live_requests` /
   `max_context_length` (-1 = unlimited);
@@ -240,6 +334,10 @@ The v0.9 independent thin control layer (full API & contracts:
   layer — no libcurl/Boost/Asio/httplib);
 - single GPU, single CUDA stream, serial prefill; no CUDA Graph / no
   speculative decoding / no tensor parallel;
+- two stateful models coexist, both frozen contracts: the legacy
+  model-owned state (one-shot path) and the external state
+  (session-bound path); the latter is validated against the former
+  with bit-exact parity (§3.1);
 - the tokenizer and weights are offline artifacts (`.cudaltk` /
   `.cudalm v2`); Python exists only in the `tools/` conversion
   scripts that produce them;

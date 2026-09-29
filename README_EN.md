@@ -53,8 +53,9 @@ evidence-auditable reference implementation**:
 
 - **Inference correctness is owned by the inference/runtime layer**:
   model math, tensor layouts, state management, and scheduling are all
-  native C++17/CUDA, validated to bit-exact level against the official
-  checkpoint's golden outputs;
+  native C++17/CUDA, validated by real-checkpoint golden tests against
+  the pinned oracle with explicit numerical tolerances, with bit-exact
+  hard gates on the paths where semantic identity is required (see §8);
 - **Serving policy is owned by the serving/control layer**: an
   independent thin control layer (`ServingController`) layers
   admission / quota / streaming / cancel / deadline / TTL / LRU on top
@@ -92,46 +93,77 @@ evidence-auditable reference implementation**:
 
 ## 3. Architecture
 
+CUDALM has **three user-facing execution paths** (details in the
+[Architecture Overview](docs/v10_architecture_overview_en.md)).
+**ServingController is the policy boundary of the HTTP serving path —
+not a universal frontend layer for every CUDALM execution mode**:
+
 ```mermaid
 flowchart TD
-    subgraph Frontend
-        CLI["CLI<br/>cudalm-generate · cudalm-chat"]
-        HTTP["HTTP frontend<br/>cudalm-server<br/>(single-threaded, one request at a time)"]
+    subgraph F["Three user-facing execution paths"]
+        A["cudalm-generate<br/>one-shot"]
+        B["cudalm-chat<br/>persistent session CLI"]
+        C["cudalm-server<br/>HTTP (single-threaded,<br/>one request at a time)"]
     end
-    TOK["Native Tokenizer<br/>CUDLMTK1 · raw text, no chat template"]
-    SC["ServingController<br/>admission / quota · streaming<br/>cancel / deadline · TTL / LRU"]
-    SCH["Scheduler<br/>request lifecycle · continuous batching"]
-    SM["SessionManager<br/>persistent multi-turn sessions"]
-    ST["Qwen35StateManager<br/>per-sequence state ownership"]
-    KV[("Paged KV pages<br/>(Full Attention)")]
-    DS[("Delta state slot<br/>conv state + recurrent state<br/>(Gated DeltaNet)")]
-    MDL["Qwen35Model<br/>24 hybrid layers: 18× DeltaNet + 6× Full Attention"]
+    TOK["Qwen35Tokenizer (CUDLMTK1 · raw text, no chat template) — shared by all three paths"]
+
+    A --> TOK
+    B --> TOK
+    C --> TOK
+
+    subgraph PA["Path A — one-shot (legacy, model-owned state)"]
+        TG["Qwen35TextGenerator → Qwen35Generator<br/>host-side prefill + greedy/sampling decode<br/>(model.reset_state / model.forward_token)"]
+    end
+
+    subgraph PB["Path B — persistent session CLI"]
+        STG["Qwen35SessionTextGenerator<br/>(owns its own Scheduler)"]
+    end
+
+    subgraph PC["Path C — HTTP serving (v0.9 pinned chain)"]
+        HPA["HTTP handler (ServingHttpApi)"]
+        SC["ServingController — HTTP path only:<br/>admission / quota · streaming<br/>cancel / deadline · TTL / LRU"]
+        HPA --> SC
+    end
+
+    subgraph SL["Shared stateful stack (paths B + C)"]
+        SCH["Scheduler — request lifecycle · continuous batching ·<br/>host-side per-request sampling (greedy / temperature / top-k / top-p)"]
+        SM["SessionManager — persistent multi-turn sessions"]
+        ST["Qwen35StateManager — Paged KV + Delta state slots"]
+        KV[("Paged KV pages<br/>(Full Attention)")]
+        DS[("Delta state slot<br/>conv + recurrent state<br/>(Gated DeltaNet)")]
+        SCH --> SM
+        SM --> ST
+        ST --> KV
+        ST --> DS
+    end
+
+    MDL["Qwen35Model — 24-layer hybrid forward: logits + state update (no sampling here)"]
     KER["CUDA Kernels<br/>W4A16 GEMV · paged attention · DeltaNet recurrence<br/>partial RoPE · RMSNorm · fused add+rmsnorm"]
 
-    CLI --> TOK
-    HTTP --> TOK
-    TOK --> SC
+    TOK --> TG
+    TOK --> STG
+    TOK --> HPA
+    TG --> MDL
+    STG --> SCH
     SC --> SCH
-    SCH --> SM
-    SM --> ST
-    ST --> KV
-    ST --> DS
     KV --> MDL
     DS --> MDL
     MDL --> KER
 ```
 
-Layer responsibilities (details in the
-[Architecture Overview](docs/v10_architecture_overview_en.md)):
+Component responsibilities and path membership ("—" = the path does not
+go through this component):
 
-| layer | owns | does NOT own |
-|---|---|---|
-| Frontend (CLI / HTTP) | protocol, argument parsing, Content-Type contract, status codes | inference, policy |
-| Tokenizer | encode / decode (raw text, no template) | conversation format |
-| ServingController | admission / quota / streaming / cancel / deadline / TTL / LRU | model math, scheduler internals |
-| Scheduler | request lifecycle, continuous batching, batched decode orchestration | serving policy |
-| SessionManager / StateManager | session + per-sequence state (KV pages + Delta slots) lifecycle | request policy |
-| Qwen35Model + Kernels | the 24-layer hybrid forward, state updates, sampling | concurrency, sessions |
+| component | responsibility | A: generate | B: chat | C: server |
+|---|---|---|---|---|
+| Qwen35Tokenizer | encode / decode (raw text, no template) | ✓ | ✓ | ✓ |
+| Qwen35TextGenerator → Qwen35Generator | one-shot prefill + host-side sampling decode; **legacy model-owned state** | ✓ | — | — |
+| Qwen35SessionTextGenerator | text-in / text-out for the session CLI; owns its own Scheduler | — | ✓ | — |
+| HTTP handler (ServingHttpApi) | HTTP protocol, Content-Type contract, JSON/NDJSON, status codes | — | — | ✓ |
+| ServingController | serving policy: admission / quota / streaming / cancel / deadline / TTL / LRU | — | — | ✓ |
+| Scheduler | request lifecycle, continuous batching, host-side per-request sampling | — | ✓ | ✓ |
+| SessionManager / Qwen35StateManager | session + per-sequence state (Paged KV + Delta slots) lifecycle | — | ✓ | ✓ |
+| Qwen35Model + CUDA Kernels | the 24-layer hybrid forward → logits + KV / Delta state update (**no sampling here**) | ✓ | ✓ | ✓ |
 
 ## 4. What CUDALM Implements
 
@@ -153,10 +185,13 @@ repeated here):
 - Sampling: greedy (default) / temperature / top-k / top-p (the frozen
   v0.4 contract, mirrored exactly at the HTTP layer).
 
-**State**: every live sequence simultaneously holds (a) Paged KV pages
-for the Full Attention layers (default 2 tokens/page, configurable)
-and (b) a Delta slot (conv state + recurrent state) for the DeltaNet
-layers. Both lifecycles are owned uniformly by the session:
+**State (session-bound paths: `cudalm-chat` / `cudalm-server`)**: every
+live sequence simultaneously holds (a) Paged KV pages for the Full
+Attention layers (default 2 tokens/page, configurable) and (b) a Delta
+slot (conv state + recurrent state) for the DeltaNet layers. In the
+session-bound multi-turn / serving path, both are owned by the
+`SessionId → SequenceId` lifecycle; reset / destroy take the Session as
+the lifecycle boundary:
 
 ```text
 reset   → state cleared (same session id, context back to 0)
@@ -164,6 +199,13 @@ destroy → sequence retired → KV pages released → Delta slot released
 multi-turn → only the new input is appended and executed — the
              historical prompt is never replayed
 ```
+
+**State (legacy one-shot path: `cudalm-generate`)**: `Qwen35Generator`
+uses the model-owned legacy state directly
+(`model.reset_state()` / `model.forward_token()`) and does not go
+through SessionManager / StateManager. Both paths share the same frozen
+kernels and math contract; the external-state path is validated against
+the frozen legacy path with bit-exact parity where required.
 
 **Execution**: single CUDA stream, serial prefill, truly batched
 decode — `forward_batch_with_state` walks the 24 layers once for a
@@ -288,14 +330,19 @@ discipline: fused residual-add + RMSNorm **KEPT** —
 Engineering discipline (details live in the per-version sign-off
 docs; the README does not stack per-version test counts):
 
-- **Official / pinned checkpoint oracle**: all model math is checked
-  against the official Qwen3.5-0.8B-Base checkpoint (pins recorded in
-  `docs/qwen35_architecture.md`);
-- **Real-checkpoint golden tests**: self-skip (ctest 77) when the
-  checkpoint is absent, run the real model when present;
-- **Bit-exact gates**: state/token-sensitive paths (e.g. the fused
-  kernel's `memcmp`-level parity against the frozen sequence) are hard
-  gates;
+- **Golden numerical correctness (tolerance-based)**: all model math
+  is checked against the **pinned official / quantized oracle**
+  (official Qwen3.5-0.8B-Base checkpoint, transformers pinned to a
+  fixed commit; pins recorded in `docs/qwen35_architecture.md`);
+  real-checkpoint golden tests use **explicit numerical tolerances**
+  (bf16 stage tolerance, depth-aware full-model envelopes) — not
+  bit-for-bit equality against the oracle; self-skip (ctest 77) when
+  the checkpoint is absent;
+- **Semantic parity (bit-exact where required)**: paths that must keep
+  behavior exactly identical (external-state migration vs the frozen
+  legacy path, paged-state parity, fused add+rmsnorm vs the frozen
+  2-launch sequence, reset / interleave parity) use bit-exact /
+  `memcmp` hard gates;
 - **compute-sanitizer**: 0 error / 0 leak verification records for the
   critical paths;
 - **no-PyTorch runtime guard**: `scripts/check_no_torch.sh` hard-scans
@@ -314,11 +361,15 @@ is executed and recorded in Phase D.
 
 ## 9. Engineering Decisions
 
-**Hybrid State Management** — Paged KV (Full Attention) and Delta
-conv/recurrent state (DeltaNet) hang off a single Sequence/Session
-lifecycle: allocated on admission, zeroed on reset, released on
-destroy. The session is the single unit of resource and policy; no
-state exists outside a session.
+**Hybrid State Management** — in the session-bound multi-turn /
+serving paths (`cudalm-chat` / `cudalm-server`), Paged KV (Full
+Attention) and Delta conv/recurrent state (DeltaNet) are owned by the
+`SessionId → SequenceId` lifecycle: allocated on admission, zeroed on
+reset, released on destroy; the Session is that path's unit of
+resource and policy. CUDALM also retains the frozen legacy one-shot /
+request-scoped execution paths (`cudalm-generate`'s model-owned
+state; `Scheduler::admit()`'s request-scoped path), so the Session is
+not the universal lifecycle unit for every runtime mode.
 
 **True Batched Execution** — the scheduler's decode cohorts execute
 `forward_batch_with_state`, a real batched GPU path (batched GEMV /

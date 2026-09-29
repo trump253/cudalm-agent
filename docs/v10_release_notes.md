@@ -383,6 +383,66 @@ README 中所有命令都从实际代码核实（不凭空创造 flag）：
 
 ---
 
+## Phase C External Review Fixes（documentation correctness）
+
+只修文档正确性（docs-only；src/ include/ tests/ benchmarks/
+scripts/ 零改动；无 ctest / sanitizer / benchmark rerun）：
+
+- **Corrected frontend/runtime topology**：README（中英）与架构总览
+  （中英）的架构图改为三条 user-facing 执行 path——
+  (A) `cudalm-generate` → Qwen35Tokenizer → Qwen35TextGenerator →
+  Qwen35Generator → Qwen35Model（legacy model-owned state，
+  `model.reset_state` / `model.forward_token`；无
+  ServingController/Scheduler/SessionManager/StateManager）；
+  (B) `cudalm-chat` → Qwen35SessionTextGenerator（owns 自己的
+  Scheduler）→ Scheduler → SessionManager → Qwen35StateManager →
+  Qwen35Model（无 ServingController）；(C) `cudalm-server` → HTTP
+  handler（ServingHttpApi）→ ServingController → Scheduler →
+  SessionManager → Qwen35StateManager → Qwen35Model（v0.9 pinned
+  serving chain）。三分支对实际代码逐一核实（tools/*.cpp 的
+  include 与对象图、session_text_generator.h 的 "Owns its
+  Scheduler" 成员）。明确写入：**ServingController 是 HTTP serving
+  path 的策略边界，不是所有 CUDALM 执行模式的通用 frontend 层**。
+- **Scoped Session ownership to session-bound paths**：删除
+  "session 是资源与策略的唯一单位 / no stray state" 的无限定表述；
+  改为"在 session-bound multi-turn / serving path 中绑定到
+  `SessionId → SequenceId` 生命周期"，并明确 legacy one-shot /
+  request-scoped execution path（含 `Scheduler::admit()`）仍存在，
+  Session 不是整个引擎所有状态的唯一生命周期单位。
+- **Distinguished tolerance-based golden validation from
+  bit-exact parity**：README/总览（中英）的 correctness 表述改为
+  两项分工——Golden numerical correctness（pinned official /
+  quantized oracle，显式容差：bf16 stage tolerance、depth-aware
+  full-model envelope，非 bit-for-bit）与 Semantic parity
+  （external-state vs frozen legacy、paged-state parity、fused
+  add+rmsnorm vs frozen 2-launch、reset/interleave parity 用
+  bit-exact / `memcmp` 硬门）。
+- **Corrected sampling ownership**：Model runtime + kernels 只负责
+  forward → logits → KV/Delta state update（无采样）；greedy /
+  temperature / top-k / top-p / seed 是 host-side generation/
+  control logic（Qwen35Generator，Path A；Scheduler 的 per-request
+  Sampler，Path B/C）；明确 CUDA kernel 不实现 top-k/top-p。
+- 架构总览新增 §3.1 "Legacy vs external state" 短图（legacy
+  model-owned state vs SessionId → SequenceId external state）+
+  "external-state path was validated against the frozen legacy
+  path with bit-exact parity where required"。
+- 保持不动：Quick Start / HTTP 示例 / 性能数字 / Phase B evidence
+  SHA（eeaef3e0b0cdd9b3dd808787e7b00f468f9b4b6a）/ limitations /
+  continuous batching 证据 / v0.7 KEEP/REJECT 叙事；
+  docs/v10_performance.md 与 docs/v10_performance_zh.md、
+  benchmarks/v10/* 未改。
+
+Validation：三条 path 拓扑对实际代码逐项审计；claim scan（无
+"Session is the only lifecycle unit / all state belongs to Session /
+official oracle is bit-exact / Model-Kernels own sampling / all
+frontends go through ServingController" 类未限定表述）；四份文档
+（README 中英 + 架构总览中英）相对链接全部可解析；中英六项事实
+（three execution paths / ServingController scope / legacy state
+path / session-bound state ownership / sampling ownership /
+golden tolerance vs bit-exact parity）逐项一致。
+
+---
+
 ## Deferred / Future Work
 
 - **README curl 示例**：现有 `curl --data` 示例在新 CT 合同下

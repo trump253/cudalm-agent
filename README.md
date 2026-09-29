@@ -39,8 +39,9 @@ CUDALM 的目标是把"一个 hybrid 架构的小模型如何在没有 PyTorch �
 推理并 serve"这个问题做成一个**工程上完整、证据上可核查**的参考实现：
 
 - **推理正确性由 inference/runtime 层负责**：模型数学、tensor layout、状态管理、
-  调度全部用 native C++17/CUDA 实现，并用 official checkpoint 的 golden 输出做
-  bit-exact 级验证；
+  调度全部用 native C++17/CUDA 实现，用 pinned oracle 的 real-checkpoint
+  golden 测试做显式容差数值验证，语义必须保持一致的路径再叠加
+  bit-exact 硬门（见 §8）；
 - **serving 策略由 serving/control 层负责**：一个独立的薄控制层
   （`ServingController`）在不修改 frozen runtime 的前提下叠加 admission / quota /
   streaming / cancel / deadline / TTL / LRU；
@@ -67,45 +68,75 @@ CUDALM 的目标是把"一个 hybrid 架构的小模型如何在没有 PyTorch �
 
 ## 3. 系统架构 / Architecture
 
+CUDALM 有**三条 user-facing 执行 path**（详见 [系统架构总览](docs/v10_architecture_overview.md)）。
+**ServingController 只是 HTTP serving path 的策略边界，不是所有 CUDALM 执行模式
+的通用 frontend 层**：
+
 ```mermaid
 flowchart TD
-    subgraph Frontend
-        CLI["CLI<br/>cudalm-generate · cudalm-chat"]
-        HTTP["HTTP frontend<br/>cudalm-server<br/>(single-threaded, one request at a time)"]
+    subgraph F["三条 user-facing 执行 path"]
+        A["cudalm-generate<br/>one-shot"]
+        B["cudalm-chat<br/>persistent session CLI"]
+        C["cudalm-server<br/>HTTP（single-threaded，<br/>one request at a time）"]
     end
-    TOK["Native Tokenizer<br/>CUDLMTK1 · raw text, no chat template"]
-    SC["ServingController<br/>admission / quota · streaming<br/>cancel / deadline · TTL / LRU"]
-    SCH["Scheduler<br/>request lifecycle · continuous batching"]
-    SM["SessionManager<br/>persistent multi-turn sessions"]
-    ST["Qwen35StateManager<br/>per-sequence state ownership"]
-    KV[("Paged KV pages<br/>(Full Attention)")]
-    DS[("Delta state slot<br/>conv state + recurrent state<br/>(Gated DeltaNet)")]
-    MDL["Qwen35Model<br/>24 hybrid layers: 18× DeltaNet + 6× Full Attention"]
+    TOK["Qwen35Tokenizer（CUDLMTK1 · raw text，无 chat template）——三条 path 共用"]
+
+    A --> TOK
+    B --> TOK
+    C --> TOK
+
+    subgraph PA["Path A — one-shot（legacy，model-owned state）"]
+        TG["Qwen35TextGenerator → Qwen35Generator<br/>host-side prefill + greedy/sampling decode<br/>（model.reset_state / model.forward_token）"]
+    end
+
+    subgraph PB["Path B — persistent session CLI"]
+        STG["Qwen35SessionTextGenerator<br/>（owns its own Scheduler）"]
+    end
+
+    subgraph PC["Path C — HTTP serving（v0.9 pinned chain）"]
+        HPA["HTTP handler（ServingHttpApi）"]
+        SC["ServingController —— 仅 HTTP path：<br/>admission / quota · streaming<br/>cancel / deadline · TTL / LRU"]
+        HPA --> SC
+    end
+
+    subgraph SL["共享 stateful 下层（Path B + C）"]
+        SCH["Scheduler —— request 生命周期 · continuous batching ·<br/>host-side per-request 采样（greedy / temperature / top-k / top-p）"]
+        SM["SessionManager —— persistent multi-turn sessions"]
+        ST["Qwen35StateManager —— Paged KV + Delta state slot"]
+        KV[("Paged KV pages<br/>（Full Attention）")]
+        DS[("Delta state slot<br/>conv + recurrent state<br/>（Gated DeltaNet）")]
+        SCH --> SM
+        SM --> ST
+        ST --> KV
+        ST --> DS
+    end
+
+    MDL["Qwen35Model —— 24 混合层前向：logits + 状态更新（不含采样）"]
     KER["CUDA Kernels<br/>W4A16 GEMV · paged attention · DeltaNet recurrence<br/>partial RoPE · RMSNorm · fused add+rmsnorm"]
 
-    CLI --> TOK
-    HTTP --> TOK
-    TOK --> SC
+    TOK --> TG
+    TOK --> STG
+    TOK --> HPA
+    TG --> MDL
+    STG --> SCH
     SC --> SCH
-    SCH --> SM
-    SM --> ST
-    ST --> KV
-    ST --> DS
     KV --> MDL
     DS --> MDL
     MDL --> KER
 ```
 
-分层职责边界（详见 [系统架构总览](docs/v10_architecture_overview.md)）：
+组件职责与所属 path（"—" = 该 path 不经过此组件）：
 
-| 层 | 职责 | 不负责 |
-|---|---|---|
-| Frontend（CLI / HTTP） | 协议、参数解析、Content-Type 合同、错误码 | 推理、策略 |
-| Tokenizer | encode / decode（raw text，无 template） | 对话格式 |
-| ServingController | admission / quota / streaming / cancel / deadline / TTL / LRU | 模型数学、调度内部 |
-| Scheduler | request 生命周期、continuous batching、batched decode 编排 | serving 策略 |
-| SessionManager / StateManager | Session 与 per-sequence 状态（KV 页 + Delta slot）生命周期 | 请求策略 |
-| Qwen35Model + Kernels | 24 层混合前向、状态更新、采样 | 并发、会话 |
+| 组件 | 职责 | A: generate | B: chat | C: server |
+|---|---|---|---|---|
+| Qwen35Tokenizer | encode / decode（raw text，无 template） | ✓ | ✓ | ✓ |
+| Qwen35TextGenerator → Qwen35Generator | one-shot prefill + host-side 采样 decode；**legacy model-owned state** | ✓ | — | — |
+| Qwen35SessionTextGenerator | session CLI 的 text-in/text-out，owns 自己的 Scheduler | — | ✓ | — |
+| HTTP handler（ServingHttpApi） | HTTP 协议、Content-Type 合同、JSON/NDJSON、状态码 | — | — | ✓ |
+| ServingController | serving policy：admission / quota / streaming / cancel / deadline / TTL / LRU | — | — | ✓ |
+| Scheduler | request 生命周期、continuous batching、host-side per-request 采样 | — | ✓ | ✓ |
+| SessionManager / Qwen35StateManager | session 与 per-sequence 状态（Paged KV + Delta slot）生命周期 | — | ✓ | ✓ |
+| Qwen35Model + CUDA Kernels | 24 层混合前向 → logits + KV / Delta 状态更新（**采样不在此**） | ✓ | ✓ | ✓ |
 
 ## 4. 推理引擎实现 / What CUDALM Implements
 
@@ -124,15 +155,24 @@ flowchart TD
 - 采样：greedy（默认）/ temperature / top-k / top-p（v0.4 冻结合同，HTTP 层
   精确镜像）。
 
-**状态**：每个 live sequence 同时持有 (a) Full Attention 的 Paged KV 页
-（默认 2 tokens/page，可配）与 (b) DeltaNet 的 Delta slot（conv state +
-recurrent state）。二者的生命周期统一由 Session 管理：
+**状态（session-bound path：`cudalm-chat` / `cudalm-server`）**：每个
+live sequence 同时持有 (a) Full Attention 的 Paged KV 页（默认 2
+tokens/page，可配）与 (b) DeltaNet 的 Delta slot（conv state +
+recurrent state）。在 session-bound multi-turn / serving path 中，二者
+统一绑定到 `SessionId → SequenceId` 生命周期；reset / destroy 以 Session
+为生命周期边界：
 
 ```text
 reset   → 状态清零（session id 不变，context 回到 0）
 destroy → sequence retire → KV 页释放 → Delta slot 释放
 multi-turn → 只追加并执行新输入，不重放历史 prompt
 ```
+
+**状态（legacy one-shot path：`cudalm-generate`）**：`Qwen35Generator`
+直接使用 model-owned 的 legacy state（`model.reset_state()` /
+`model.forward_token()`），不经过 SessionManager / StateManager。两条
+path 共享同一套冻结 kernel 与数学合同，external-state path 对 legacy
+path 有 bit-exact parity 验证（要求完全一致的位置）。
 
 **执行**：单 CUDA stream，prefill 串行，decode cohort 真 batch——
 `forward_batch_with_state` 对同一 cohort 的 B 条 sequence 一次遍历 24 层
@@ -244,12 +284,17 @@ residual-add + RMSNorm **KEEP**，−24 kernel launches/traversal，paired E2E
 
 工程纪律（细节在各版本 sign-off 文档，README 不堆 per-version 测试数）：
 
-- **Official / pinned checkpoint oracle**：所有模型数学对照官方
-  Qwen3.5-0.8B-Base checkpoint（pins 记录在 `docs/qwen35_architecture.md`）；
-- **Real-checkpoint golden tests**：缺失 checkpoint 时 self-skip（ctest 77），
-  存在时跑真实模型；
-- **Bit-exact 门禁**：状态 / token 敏感路径（如 fused kernel 对冻结序列的
-  `memcmp` 级 parity）作为硬门禁；
+- **Golden numerical correctness（tolerance-based）**：所有模型数学对照
+  **pinned official / quantized oracle**（官方 Qwen3.5-0.8B-Base
+  checkpoint，transformers 钉死在固定 commit；pins 记录在
+  `docs/qwen35_architecture.md`），real-checkpoint golden 测试用**显式
+  数值容差**（bf16 stage 容差、depth-aware full-model envelope）验证——
+  不是与 oracle 的 bit-for-bit 相等；缺失 checkpoint 时 self-skip
+  （ctest 77）；
+- **Semantic parity（bit-exact where required）**：对必须完全保持行为
+  一致的路径（external-state migration 对 frozen legacy path、paged-state
+  parity、fused add+rmsnorm 对冻结 2-launch 序列、reset / interleave
+  parity）使用 bit-exact / `memcmp` 硬门；
 - **compute-sanitizer**：关键路径 0 error / 0 leak 验证记录；
 - **no-PyTorch runtime guard**：`scripts/check_no_torch.sh` 对 `include/` +
   `src/` 硬扫描 torch / pybind 符号；
@@ -264,10 +309,14 @@ v1.0 的 full-suite release gate（完整 ctest + sanitizer 汇总）在 Phase D
 
 ## 9. 核心工程设计 / Engineering Decisions
 
-**Hybrid State Management** — Paged KV（Full Attention）与 Delta conv/
-recurrent state（DeltaNet）统一挂在 Sequence/Session 生命周期下：admission
-时分配、reset 时清零、destroy 时释放；session 是资源与策略的唯一单位，
-不存在游离于 session 之外的状态。
+**Hybrid State Management** — 在 session-bound multi-turn / serving path
+（`cudalm-chat` / `cudalm-server`）中，Paged KV（Full Attention）与
+Delta conv/recurrent state（DeltaNet）统一绑定到
+`SessionId → SequenceId` 生命周期：admission 时分配、reset 时清零、
+destroy 时释放；Session 是该 path 中资源与策略的单位。CUDALM 同时保留
+frozen legacy one-shot / request-scoped execution path（`cudalm-generate`
+的 model-owned state；`Scheduler::admit()` 的 request-scoped path），
+因此 Session 不是整个引擎所有状态的唯一生命周期单位。
 
 **True Batched Execution** — 调度器的 decode cohort 执行的是
 `forward_batch_with_state` 真 batched GPU path（batched GEMV / paged

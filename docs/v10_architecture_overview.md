@@ -8,38 +8,87 @@ identifier 一律使用原始英文。
 
 ---
 
-## 1. 分层总览（Layer Stack）
+## 1. 执行路径与分层总览（Execution Paths & Layer Stack）
+
+**CUDALM 有三条 user-facing 执行 path**（三者最终都落到
+`Qwen35Model → CUDA kernels`，但中间经过的组件不同）：
 
 ```text
-Frontend            CLI (cudalm-generate / cudalm-chat) + HTTP (cudalm-server)
-      ↓
-Serving control     ServingController —— admission / quota / streaming /
-plane                       cancel / deadline / TTL / LRU（独立薄控制层）
-      ↓
-Scheduler           request 生命周期、continuous batching、batched decode 编排
-      ↓
-Session / state     SessionManager + Qwen35StateManager —— Session 与
-                      per-sequence 状态（Paged KV + Delta slot）
-      ↓
-Model runtime       Qwen35Model —— 24 层混合前向、状态更新
-      ↓
-CUDA kernels        W4A16/bf16 GEMV · paged attention · DeltaNet 递推 ·
-                    partial RoPE · RMSNorm · fused add+rmsnorm · batched 变体
-      ↓
-Artifacts           .cudalm v2（权重）+ .cudaltk（tokenizer）离线文件
+Path A — one-shot 生成（cudalm-generate）
+    cudalm-generate
+      → Qwen35Tokenizer
+      → Qwen35TextGenerator → Qwen35Generator
+            （host-side prefill + greedy/sampling decode）
+      → Qwen35Model（legacy model-owned state：
+                   model.reset_state / model.forward_token）
+      → CUDA kernels
+    （无 ServingController / Scheduler / SessionManager / StateManager）
+
+Path B — persistent session CLI（cudalm-chat）
+    cudalm-chat
+      → Qwen35Tokenizer
+      → Qwen35SessionTextGenerator（owns 自己的 Scheduler）
+      → Scheduler → SessionManager → Qwen35StateManager
+      → Qwen35Model
+      → CUDA kernels
+    （无 ServingController）
+
+Path C — HTTP serving（cudalm-server，v0.9 pinned serving chain）
+    cudalm-server
+      → HTTP handler（ServingHttpApi）
+      → ServingController
+      → Scheduler → SessionManager → Qwen35StateManager
+      → Qwen35Model
+      → CUDA kernels
 ```
 
-各层职责与边界：
+共享下层组件视图（Path B 与 C 共享 Scheduler 以下的 stateful 栈；
+Path A 直接驱动 model，state 由 model 持有）：
 
-| 层 | 职责（owns） | 明确不负责 |
-|---|---|---|
-| Frontend | 协议与参数解析；CLI 的 REPL；HTTP 的 Content-Type 合同、JSON/NDJSON 编码、状态码映射 | 推理、serving 策略 |
-| Tokenizer | encode / decode（raw text，自研 CUDLMTK1 格式） | 对话格式、chat template |
-| **Serving control plane** | **policy**：admission（session/request/context 限流、zero-mutation 拒绝）、streaming 事件 drain（commit-before-visible）、cancel / deadline、TTL 扫描、LRU-on-pressure 驱逐、quota 生命周期 | 模型数学、调度内部、kernel |
-| Scheduler | request 生命周期状态机（Waiting→Running→Finished/Cancelled/Failed）、动态到达、decode cohort 形成、驱动单 stream 上的 batched/单 forward | serving 策略、HTTP |
-| Session / state | Session 的 create / reset / destroy；per-sequence 状态（KV 页 + Delta slot）的分配、清零、释放 | 请求准入、流控 |
-| Model runtime + kernels | 24 层混合前向（B=1 与 B>1 两条 path）、KV / Delta 状态更新、采样（greedy/温度/top-k/top-p） | 并发、会话、网络 |
-| Artifacts | 离线转换产物（Python 只存在于生成它们的工具中） | —— |
+```text
+Qwen35Tokenizer（三条 path 共用，raw text，无 chat template）
+      ↓
+Generation / scheduler 层   Qwen35Generator（Path A）· Scheduler（B + C）
+                            —— host-side per-request 采样（greedy / 温度 /
+                               top-k / top-p / seed）
+      ↓
+Session / state             SessionManager + Qwen35StateManager（B + C）
+                            —— Paged KV + Delta slot（session-bound）
+      ↓
+Model runtime               Qwen35Model —— 24 层混合前向 → logits + 状态更新
+                            （不含采样）
+      ↓
+CUDA kernels                W4A16/bf16 GEMV · paged attention · DeltaNet 递推 ·
+                            partial RoPE · RMSNorm · fused add+rmsnorm · batched 变体
+      ↓
+Artifacts                   .cudalm v2（权重）+ .cudaltk（tokenizer）离线文件
+```
+
+**关键边界：ServingController 是 HTTP serving path 的策略边界，不是
+所有 CUDALM 执行模式的通用 frontend 层。** `cudalm-generate` 与
+`cudalm-chat` 都不经过它；它是 v0.9 在 Path C 上叠加的独立薄控制层。
+
+组件职责与边界：
+
+| 组件 | 职责（owns） | 出现于 | 明确不负责 |
+|---|---|---|---|
+| Frontend | CLI 的参数解析与 REPL（A/B）；HTTP 的协议、Content-Type 合同、JSON/NDJSON 编码、状态码映射（C） | A、B、C | 推理、serving 策略 |
+| Qwen35Tokenizer | encode / decode（raw text，自研 CUDLMTK1 格式） | A、B、C | 对话格式、chat template |
+| Qwen35TextGenerator → Qwen35Generator | one-shot 的 host-side prefill + 采样 decode；legacy model-owned state（`model.reset_state` / `model.forward_token`） | 仅 A | 会话、策略 |
+| Qwen35SessionTextGenerator | session CLI 的 text-in/text-out；**owns 自己的 Scheduler** | 仅 B | serving 策略、HTTP |
+| HTTP handler（ServingHttpApi） | 单线程 accept loop、路由、错误码 | 仅 C | 推理、策略 |
+| **ServingController** | **policy**：admission（session/request/context 限流、zero-mutation 拒绝）、streaming 事件 drain（commit-before-visible）、cancel / deadline、TTL 扫描、LRU-on-pressure 驱逐、quota 生命周期 | **仅 C** | 模型数学、调度内部、kernel |
+| Scheduler | request 生命周期状态机（Waiting→Running→Finished/Cancelled/Failed）、动态到达、decode cohort 形成、驱动单 stream 上的 batched/单 forward | B、C | serving 策略、HTTP |
+| Session / state（SessionManager + Qwen35StateManager） | Session 的 create / reset / destroy；per-sequence 状态（Paged KV 页 + Delta slot）的分配、清零、释放 | B、C | 请求准入、流控 |
+| Model runtime + kernels | 24 层混合前向（B=1 与 B>1 两条 path）→ logits；KV / Delta 状态更新 | A、B、C | 采样、并发、会话、网络 |
+| Artifacts | 离线转换产物（Python 只存在于生成它们的工具中） | —— | —— |
+
+**采样（sampling）是 host-side generation/control logic**：
+`Qwen35Model` / CUDA kernels 的职责到 logits + 状态更新为止；
+greedy / temperature / top-k / top-p / seed 的 token 选择由
+`Qwen35Generator`（Path A）或 Scheduler 的 per-request Sampler
+（Path B/C，forward 之后对 logits 逐行采样）在 host 上完成。CUDA
+kernel 不实现 top-k/top-p。
 
 **核心边界原则：inference/runtime layer owns inference
 correctness；serving/control layer owns policy。** serving 控制层是
@@ -71,6 +120,9 @@ head_dim 256、vocab 248320、eps 1e-6。
 
 ## 3. 混合状态管理（Hybrid State Management）
 
+本节描述 **session-bound path**（Path B / C：`cudalm-chat` /
+`cudalm-server`）的状态管理；legacy one-shot path 的状态模型见本节末。
+
 ```mermaid
 flowchart TD
     SID["SessionId"] --> SEQ["SequenceId（session 绑定的 sequence）"]
@@ -80,7 +132,7 @@ flowchart TD
     DS --> REC["recurrent state [16, 128, 128] FP32<br/>（delta-rule 递推的记忆）"]
 ```
 
-状态归属规则（`Qwen35StateManager` 统一持有）：
+状态归属规则（session-bound path 中由 `Qwen35StateManager` 统一持有）：
 
 - **allocation 在 admission**：session 创建时分配其 sequence 的全部
   状态（KV 页按用量增长 + Delta slot）；
@@ -95,8 +147,38 @@ flowchart TD
 
 Full Attention 与 DeltaNet 的状态在同一个 sequence 生命周期下统一
 管理，是 hybrid 架构 serving 的关键工程点：任何一层的状态泄漏或
-错位都会同时破坏两种 attention 的正确性，而 session 是唯一的
-生命周期单位，消除了"游离状态"。
+错位都会同时破坏两种 attention 的正确性；在 session-bound path 中，
+session 是该 path 唯一的状态生命周期边界，不存在游离于 session 之外
+的 stateful 状态。
+
+### 3.1 Legacy vs external state（两种状态模型）
+
+CUDALM 同时保留两种状态模型（工程上的重要分界）：
+
+```text
+Legacy one-shot path（Path A: cudalm-generate）
+Qwen35Model
+ ├─ owned KV state（model 内部持有）
+ └─ owned Delta state（model 内部持有）
+    API：model.reset_state() / model.forward_token()
+
+Session-bound path（Path B/C: cudalm-chat / cudalm-server）
+SessionId
+   ↓
+SequenceId
+   ├─ Paged KV pages（StateManager 持有）
+   └─ Delta state slot（StateManager 持有）
+    API：forward_token_with_state / forward_batch_with_state
+```
+
+两条 path 共享同一套冻结 kernel 与数学合同（同一 24 层前向、同一
+量化布局）。**external-state path 对 frozen legacy path 以 bit-exact
+parity 验证**（要求完全一致的位置：同一 token 流、同一冻结 kernel、
+同一 op 顺序 → 无容差，memcmp），保证 external state 的引入不改变
+任何数值行为。因此 Session **不是**整个引擎所有状态的唯一生命周期
+单位：legacy one-shot / request-scoped execution path（包括
+`Scheduler::admit()` 的 request-scoped path）仍然存在，其状态不挂在
+Session 之下。
 
 ## 4. 持久化多轮 Session（Multi-turn）
 
@@ -181,7 +263,9 @@ flowchart LR
 
 ## 7. Serving 控制平面（ServingController）
 
-v0.9 的独立薄控制层（API 与合同细节：`docs/v09_serving_hardening.md`）：
+v0.9 的独立薄控制层，**仅出现在 HTTP serving path（Path C）**——
+`cudalm-generate` / `cudalm-chat` 不经过它（API 与合同细节：
+`docs/v09_serving_hardening.md`）：
 
 - **ServingLimits**：`max_sessions` / `max_live_requests` /
   `max_context_length`（-1 = 不限）；
@@ -206,6 +290,9 @@ v0.9 的独立薄控制层（API 与合同细节：`docs/v09_serving_hardening.m
   socket 薄层，无 libcurl/Boost/Asio/httplib）；
 - 单 GPU、单 CUDA stream、prefill 串行；无 CUDA Graph / 无
   speculative decoding / 无 tensor parallel；
+- 两条 stateful 模型并存且均为 frozen 合同：legacy model-owned
+  state（one-shot path）与 external state（session-bound path），
+  后者对前者有 bit-exact parity 验证（§3.1）；
 - tokenizer 与 weight 是离线产物（`.cudaltk` / `.cudalm v2`），
   Python 只存在于生成它们的 `tools/` 转换脚本中；
 - 每阶段（v0.1 → v1.0）的 frozen 边界与证据 SHA 全部记录在
